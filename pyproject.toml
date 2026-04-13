@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "blt-lcm-marathi"
+version = "0.1.0"
+description = "BLT-LCM for Marathi Machine Translation Concept Extraction"
+authors = [{name = "Your Name"}]
+dependencies = [
+    "torch>=2.0.0",
+    "transformers>=4.0.0",
+    "huggingface-hub>=0.34.0",
+    "sentencepiece",
+    "tiktoken",
+    "sonar-space",
+    "datasets",
+    "numpy",
+    "tqdm",
+]
+
+[tool.setuptools]
+packages = ["."]
