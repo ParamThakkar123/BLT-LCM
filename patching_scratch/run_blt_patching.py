@@ -21,6 +21,7 @@ import math
 import os
 import sys
 import time
+from datasets import load_dataset
 
 # Fix Windows console encoding for Marathi/Devanagari output
 if sys.platform == "win32":
@@ -538,7 +539,6 @@ def main():
 
     # ---- Load dataset (streaming to avoid downloading entire 7.8GB) ----
     print("Loading BhashaSetu dataset from HuggingFace (streaming)...")
-    from datasets import load_dataset
 
     ds = load_dataset("ParamTh/BhashaSetu", split="train", streaming=True)
     marathi_texts = []
