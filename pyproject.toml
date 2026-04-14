@@ -3,11 +3,12 @@ requires = ["setuptools", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "blt-lcm-marathi"
-version = "0.1.0"
-description = "BLT-LCM for Marathi Machine Translation Concept Extraction"
-authors = [{name = "Your Name"}]
-dependencies = [
+    name = "blt-lcm-marathi"
+    version = "0.1.0"
+    description = "BLT-LCM for Marathi Machine Translation Concept Extraction"
+    authors = [{name = "Your Name"}]
+    requires-python = ">=3.8"
+    dependencies = [
     "torch>=2.0.0",
     "transformers>=4.0.0",
     "huggingface-hub>=0.34.0",
@@ -17,7 +18,11 @@ dependencies = [
     "datasets",
     "numpy",
     "tqdm",
+    "indic-nlp-library>=0.92",
+    "pynvml>=11.5.3",
+    "sacrebleu>=2.5.1",
+    "wandb>=0.24.2",
 ]
 
 [tool.setuptools]
-packages = ["."]
+packages = { find = { where = ["."], include = ["*"] } }

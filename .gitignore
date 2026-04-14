@@ -4,3 +4,6 @@ __pycache__/
 *.jsonl
 *.json
 .mypy_cache/
+uv.lock
+blt_lcm_marathi.egg-info/
+runs/
