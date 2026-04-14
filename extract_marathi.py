@@ -9,7 +9,7 @@ count = 0
 for sample in ds:
     marathi_sentences.append(sample["marathi"])
     count += 1
-    if count >= 10000:
+    if count >= 50000:
         break
 
 # Save to a file
