@@ -1,0 +1,189 @@
+# Lightweight evaluation metric wrappers (BLEU, chrF, METEOR, TER, COMET optional)
+import warnings
+from typing import List, Tuple, Dict, Optional
+
+try:
+    import sacrebleu
+
+    _HAS_SACREBLEU = True
+except Exception:
+    sacrebleu = None
+    _HAS_SACREBLEU = False
+
+try:
+    from nltk.translate import meteor_score
+
+    _HAS_NLTK = True
+except Exception:
+    meteor_score = None
+    _HAS_NLTK = False
+
+try:
+    # comet (unbabel-comet) is optional; if present we attempt to load utilities
+    import comet
+
+    try:
+        from comet import download_model
+    except Exception:
+        download_model = None
+    try:
+        from comet.models import load_from_checkpoint
+    except Exception:
+        load_from_checkpoint = None
+    _HAS_COMET = True
+except Exception:
+    comet = None
+    download_model = None
+    load_from_checkpoint = None
+    _HAS_COMET = False
+
+
+def _ensure_refs(refs: List[List[str]]):
+    # sacrebleu expects list of reference lists (one list per reference file)
+    # We accept refs as List[str] or List[List[str]]
+    if not refs:
+        return []
+    if isinstance(refs[0], str):
+        return [refs]
+    return refs
+
+
+def compute_bleu(hyps: List[str], refs: List[str]) -> float:
+    refs2 = _ensure_refs(refs)
+    if _HAS_SACREBLEU:
+        bleu = sacrebleu.corpus_bleu(hyps, refs2)
+        return float(bleu.score)
+    else:
+        warnings.warn("sacrebleu not installed; BLEU unavailable")
+        return float("nan")
+
+
+def compute_chrf(hyps: List[str], refs: List[str]) -> float:
+    refs2 = _ensure_refs(refs)
+    if _HAS_SACREBLEU:
+        chrf = sacrebleu.corpus_chrf(hyps, refs2)
+        return float(chrf.score)
+    else:
+        warnings.warn("sacrebleu not installed; chrF unavailable")
+        return float("nan")
+
+
+def compute_ter(hyps: List[str], refs: List[str]) -> float:
+    refs2 = _ensure_refs(refs)
+    if _HAS_SACREBLEU:
+        ter = sacrebleu.corpus_ter(hyps, refs2)
+        return float(ter.score)
+    else:
+        warnings.warn("sacrebleu not installed; TER unavailable")
+        return float("nan")
+
+
+def compute_meteor(hyps: List[str], refs: List[str]) -> float:
+    # NLTK meteor_score returns a single score per hypothesis against single reference
+    if not _HAS_NLTK:
+        warnings.warn("nltk not installed; METEOR unavailable")
+        return float("nan")
+    scores = []
+    for h, r in zip(hyps, refs):
+        # meteor_score expects references as list
+        try:
+            scores.append(meteor_score.single_meteor_score(r, h))
+        except Exception:
+            scores.append(0.0)
+    return float(100.0 * sum(scores) / max(1, len(scores)))
+
+
+def compute_comet(
+    hyps: List[str],
+    refs: List[str],
+    model_name: Optional[str] = None,
+    model_obj: Optional[object] = None,
+) -> float:
+    if not _HAS_COMET:
+        warnings.warn("comet not installed; COMET unavailable")
+        return float("nan")
+
+    model = None
+    if model_obj is not None:
+        model = model_obj
+    else:
+        if model_name is None:
+            warnings.warn("No COMET model name/path provided; skipping COMET")
+            return float("nan")
+        # try to download or load the model
+        try:
+            if download_model is not None:
+                model = download_model(model_name)
+        except Exception:
+            model = None
+        if model is None and load_from_checkpoint is not None:
+            try:
+                model = load_from_checkpoint(model_name)
+            except Exception:
+                model = None
+
+    if model is None:
+        warnings.warn("Failed to load COMET model; skipping COMET")
+        return float("nan")
+
+    try:
+        if hasattr(model, "predict"):
+            try:
+                res = model.predict(hyps, refs)
+            except Exception:
+                try:
+                    samples = [
+                        {"src": None, "ref": r, "hyp": h} for h, r in zip(hyps, refs)
+                    ]
+                    res = model.predict(samples)
+                except Exception:
+                    return float("nan")
+
+            if isinstance(res, dict) and "scores" in res:
+                scores = res["scores"]
+                return float(sum(scores) / len(scores))
+            if isinstance(res, list):
+                if len(res) == 0:
+                    return float("nan")
+                if isinstance(res[0], dict) and "score" in res[0]:
+                    vals = [float(r["score"]) for r in res]
+                    return float(sum(vals) / len(vals))
+                else:
+                    vals = [float(v) for v in res]
+                    return float(sum(vals) / len(vals))
+    except Exception:
+        warnings.warn("COMET model prediction failed")
+        return float("nan")
+
+    warnings.warn("COMET returned unexpected result format")
+    return float("nan")
+
+
+def compute_all(
+    hyps: List[str],
+    refs: List[str],
+    comet_model_name: Optional[str] = None,
+    comet_model_obj: Optional[object] = None,
+) -> Dict[str, float]:
+    # refs can be List[str] (single ref) or List[List[str]]
+    # expand refs to single list when computing metrics that expect parallel lists
+    if isinstance(refs[0], list):
+        # choose first reference for metrics that do not support multiple refs
+        refs_single = [r[0] for r in zip(*refs)] if refs else []
+    else:
+        refs_single = refs
+
+    out = {}
+    out["BLEU"] = compute_bleu(hyps, refs)
+    out["chrF++"] = compute_chrf(hyps, refs)
+    out["TER"] = compute_ter(hyps, refs)
+    out["METEOR"] = compute_meteor(hyps, refs_single)
+    # COMET skipped by default
+    out["COMET"] = compute_comet(
+        hyps, refs, model_name=comet_model_name, model_obj=comet_model_obj
+    )
+    return out
+
+
+if __name__ == "__main__":
+    print("eval_metrics module. Use compute_all(hyps, refs)")
