@@ -2,8 +2,6 @@ name: Build LaTeX PDFs
 
 on:
   push:
-    paths:
-      - 'neurips_paper/**'
   pull_request:
     paths:
       - 'neurips_paper/**'
