@@ -9,7 +9,6 @@ build-backend = "setuptools.build_meta"
     authors = [{name = "Your Name"}]
     requires-python = ">=3.8"
     dependencies = [
-    "torch>=2.0.0",
     "transformers>=4.0.0",
     "huggingface-hub>=0.34.0",
     "sentencepiece",
@@ -19,9 +18,10 @@ build-backend = "setuptools.build_meta"
     "numpy",
     "tqdm",
     "indic-nlp-library>=0.92",
-    "pynvml>=11.5.3",
     "sacrebleu>=2.5.1",
     "wandb>=0.24.2",
+    "tensorboard>=2.14.0",
+    "nvidia-ml-py>=13.595.45",
 ]
 
 [tool.setuptools]

@@ -44,12 +44,19 @@ class PostNet(nn.Module):
 
 class BaseLCM(nn.Module):
     def __init__(
-        self, embed_dim=1024, model_dim=2048, n_layers=24, n_heads=16, max_seq_len=128
+        self,
+        embed_dim=1024,
+        model_dim=2048,
+        n_layers=24,
+        n_heads=16,
+        max_seq_len=128,
+        checkpointing=False,
     ):
         super().__init__()
         self.embed_dim = embed_dim
         self.model_dim = model_dim
         self.max_seq_len = max_seq_len
+        self.checkpointing = checkpointing
 
         self.prenet = PreNet(embed_dim, model_dim)
         self.postnet = PostNet(model_dim, embed_dim)
@@ -57,17 +64,20 @@ class BaseLCM(nn.Module):
         # Position embeddings
         self.pos_emb = nn.Embedding(max_seq_len, model_dim)
 
-        # Transformer decoder layers
-        decoder_layer = TransformerDecoderLayer(
-            d_model=model_dim,
-            nhead=n_heads,
-            dim_feedforward=4 * model_dim,
-            dropout=0.1,
-            activation=F.gelu,
-            batch_first=True,
-            norm_first=True,
-        )
-        self.transformer = TransformerDecoder(decoder_layer, num_layers=n_layers)
+        # Transformer decoder layers (keep as ModuleList so we can optionally
+        # apply activation checkpointing per-layer to reduce memory)
+        self.layers = nn.ModuleList()
+        for _ in range(n_layers):
+            layer = TransformerDecoderLayer(
+                d_model=model_dim,
+                nhead=n_heads,
+                dim_feedforward=4 * model_dim,
+                dropout=0.1,
+                activation=F.gelu,
+                batch_first=True,
+                norm_first=True,
+            )
+            self.layers.append(layer)
 
         # End of text token
         self.eot_emb = nn.Parameter(torch.randn(embed_dim))
@@ -88,32 +98,69 @@ class BaseLCM(nn.Module):
 
         # For autoregressive prediction, target is the next embedding
         if tgt_embs is not None:
-            tgt = self.prenet(tgt_embs)  # [batch, 1, model_dim]
-            tgt_pos = torch.arange(seq_len, seq_len + 1, device=src.device).unsqueeze(0)
+            # Support both single-step targets of shape [B,1,E] and
+            # multi-step targets [B, L, E]. Running the decoder once for the
+            # full target sequence is much more efficient than looping per
+            # position in the training loop.
+            single_step = tgt_embs.dim() == 3 and tgt_embs.shape[1] == 1
+            tgt = self.prenet(tgt_embs)  # [batch, L, model_dim] or [batch,1,model_dim]
+            L = tgt.shape[1]
+            tgt_pos = torch.arange(seq_len, seq_len + L, device=src.device).unsqueeze(0)
             tgt = tgt + self.pos_emb(tgt_pos)
 
-            # Causal mask for decoder
+            # Causal mask for decoder: shape [L, L]
             tgt_mask = torch.triu(
-                torch.ones(1, 1, dtype=torch.bool, device=src.device), diagonal=1
+                torch.ones(L, L, dtype=torch.bool, device=src.device), diagonal=1
             )
 
-            # Decode
-            output = self.transformer(
-                tgt, src, tgt_mask=tgt_mask
-            )  # [batch, 1, model_dim]
+            # Decode in a single call for all target positions
+            # Run decoder layers sequentially; apply gradient checkpointing per
+            # layer if enabled to reduce activation memory.
+            output = tgt
+            from torch.utils.checkpoint import checkpoint as _cp
+
+            for layer in self.layers:
+                if self.checkpointing and self.training:
+                    # checkpoint requires positional args only
+                    output = _cp(
+                        lambda o, m, mask: layer(o, m, tgt_mask=mask),
+                        output,
+                        src,
+                        tgt_mask,
+                    )
+                else:
+                    output = layer(output, src, tgt_mask=tgt_mask)
 
             # PostNet
-            pred_emb = self.postnet(output.squeeze(1))  # [batch, embed_dim]
-            return pred_emb
+            pred = self.postnet(output)  # [batch, L, embed_dim]
+            if single_step:
+                return pred.squeeze(1)
+            return pred
         else:
-            # Inference: predict next
-            # For simplicity, assume single step
+            # Inference: predict next (autoregressively) without artificial dummies.
+            # Use the last source sentence representation as the initial real
+            # conditioning token rather than creating a synthetic zero tensor.
+            # src is already prenet-applied and position-embedded: [batch, seq_len, model_dim]
             batch_size = src.shape[0]
-            dummy_tgt = torch.zeros(batch_size, 1, self.model_dim, device=src.device)
+            # take most recent source token as starting target (real data)
+            output = src[:, -1:, :]
             tgt_mask = torch.triu(
                 torch.ones(1, 1, dtype=torch.bool, device=src.device), diagonal=1
             )
-            output = self.transformer(dummy_tgt, src, tgt_mask=tgt_mask)
+            from torch.utils.checkpoint import checkpoint as _cp
+
+            for layer in self.layers:
+                if self.checkpointing and self.training:
+                    # checkpoint requires positional args only
+                    output = _cp(
+                        lambda o, m, mask: layer(o, m, tgt_mask=mask),
+                        output,
+                        src,
+                        tgt_mask,
+                    )
+                else:
+                    output = layer(output, src, tgt_mask=tgt_mask)
+
             pred_emb = self.postnet(output.squeeze(1))
             return pred_emb
 
