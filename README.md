@@ -64,6 +64,20 @@ python lcm_scripts/train_sonar.py --num_samples 2000 --epochs 2 --batch_size 16 
 python lcm_scripts/train_lcm_sonar.py --num_docs 200 --epochs 2 --batch_size 8 --log_dir runs/lcm_sonar
 ```
 
+If your dataset contains one sentence per row (sentence-level corpus) the
+script will automatically group consecutive sentences into pseudo-documents.
+To disable this automatic grouping and keep strict per-row documents, pass:
+
+```bash
+# Disable grouping:
+python lcm_scripts/train_lcm_sonar.py --no_grouping --data_path path/to/your_dataset ...
+```
+
+To control the grouping behavior (group size), currently the code uses a
+heuristic group_size=4. If you want a different group size, set up your
+dataset as multi-sentence documents or open an issue/PR to add a
+`--group_size` argument.
+
 3) Train LCM on BLT embeddings (dev) — requires `patching_scratch/entropy_model_marathi.pt`:
 
 ```bash

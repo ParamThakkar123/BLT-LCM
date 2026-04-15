@@ -7,3 +7,5 @@ __pycache__/
 uv.lock
 blt_lcm_marathi.egg-info/
 runs/
+data/
+tea_debug.log
