@@ -34,6 +34,11 @@ from huggingface_hub import snapshot_download
 from datasets import load_dataset
 import os
 
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
 
 def prepare_data(num_docs=1000, max_sent_per_doc=20, text_col="marathi"):
     # deprecated: callers should pass data_path via CLI
@@ -403,6 +408,14 @@ def main():
             entity=args.wandb_entity,
             config={"project": "blt-lcm"},
         )
+
+    # Initialize lists for plotting
+    train_losses = []
+    step_losses = []
+    grad_norms = []
+    lrs = []
+    eval_metrics_history = []
+
     print("Preparing data...")
     # If user provided a data path via CLI, pass it to prepare_data via environment
     if args.data_path:
@@ -806,20 +819,24 @@ def main():
 
                 # per-step logging (loss is the scaled per-accum-step loss; report scaled back)
                 report_loss = (loss * accum_steps).detach()
+                lr = optim.param_groups[0]["lr"]
+                total_norm = 0.0
+                for p in model.parameters():
+                    if p.grad is not None:
+                        param_norm = p.grad.data.norm(2).item()
+                        total_norm += param_norm * param_norm
+                total_norm = total_norm**0.5
                 if writer is not None:
                     global_step += 1
                     writer.add_scalar(
                         "train/step_loss", report_loss.item(), global_step
                     )
-                    lr = optim.param_groups[0]["lr"]
                     writer.add_scalar("train/lr", lr, global_step)
-                    total_norm = 0.0
-                    for p in model.parameters():
-                        if p.grad is not None:
-                            param_norm = p.grad.data.norm(2).item()
-                            total_norm += param_norm * param_norm
-                    total_norm = total_norm**0.5
                     writer.add_scalar("train/grad_norm", total_norm, global_step)
+
+                step_losses.append(report_loss.item())
+                lrs.append(lr)
+                grad_norms.append(total_norm)
 
                 # Optimizer step (wrap to provide clearer guidance on OOM)
                 try:
@@ -846,6 +863,8 @@ def main():
 
         elapsed = time.time() - start
         print(f"Epoch {epoch + 1} avg loss: {total / n:.4f} time: {elapsed:.1f}s")
+        train_losses.append(total / n)
+        os.makedirs("lcm_models", exist_ok=True)
         torch.save(model.state_dict(), f"lcm_models/lcm_sonar_epoch{epoch + 1}.pth")
 
         # Log epoch-level training loss
@@ -868,6 +887,7 @@ def main():
             with open(args.eval_ref, encoding="utf-8") as f:
                 refs = [l.strip() for l in f if l.strip()]
             metrics = compute_all(hyps, refs, comet_model_name=args.comet_model)
+            eval_metrics_history.append(metrics.copy())
             for k, v in metrics.items():
                 if writer is not None:
                     writer.add_scalar(f"eval/{k}", v, epoch + 1)
@@ -899,6 +919,7 @@ def main():
                 best_path = f"lcm_models/lcm_sonar_best.pth"
                 prev_best = getattr(main, "_best_score", None)
                 if prev_best is None or monitor_score > prev_best:
+                    os.makedirs("lcm_models", exist_ok=True)
                     torch.save(model.state_dict(), best_path)
                     setattr(main, "_best_score", monitor_score)
                     # upload model artifact to W&B
@@ -943,8 +964,69 @@ def main():
             best_path = f"lcm_models/lcm_sonar_best.pth"
             prev_best = getattr(main, "_best_score", None)
             if prev_best is None or monitor_score > prev_best:
+                os.makedirs("lcm_models", exist_ok=True)
                 torch.save(model.state_dict(), best_path)
                 setattr(main, "_best_score", monitor_score)
+
+    # Generate and save plots for paper
+    if train_losses:
+        fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+
+        # Plot 1: Training loss per epoch
+        axes[0, 0].plot(range(1, len(train_losses) + 1), train_losses, marker="o")
+        axes[0, 0].set_title("Training Loss per Epoch")
+        axes[0, 0].set_xlabel("Epoch")
+        axes[0, 0].set_ylabel("Loss")
+
+        # Plot 2: Step losses
+        if step_losses:
+            axes[0, 1].plot(step_losses)
+            axes[0, 1].set_title("Step Loss")
+            axes[0, 1].set_xlabel("Step")
+            axes[0, 1].set_ylabel("Loss")
+
+        # Plot 3: Learning rate
+        if lrs:
+            axes[1, 0].plot(lrs)
+            axes[1, 0].set_title("Learning Rate")
+            axes[1, 0].set_xlabel("Step")
+            axes[1, 0].set_ylabel("LR")
+
+        # Plot 4: Gradient norm
+        if grad_norms:
+            axes[1, 1].plot(grad_norms)
+            axes[1, 1].set_title("Gradient Norm")
+            axes[1, 1].set_xlabel("Step")
+            axes[1, 1].set_ylabel("Norm")
+
+        plt.tight_layout()
+        save_dir = args.log_dir if args.log_dir else "."
+        os.makedirs(save_dir, exist_ok=True)
+        plt.savefig(
+            os.path.join(save_dir, "training_curves.png"), dpi=300, bbox_inches="tight"
+        )
+        plt.savefig(os.path.join(save_dir, "training_curves.pdf"), bbox_inches="tight")
+        plt.close()
+
+        # If eval metrics
+        if eval_metrics_history:
+            keys = list(eval_metrics_history[0].keys())
+            fig, ax = plt.subplots(figsize=(8, 6))
+            for key in keys:
+                values = [m.get(key, float("nan")) for m in eval_metrics_history]
+                ax.plot(range(1, len(values) + 1), values, marker="o", label=key)
+            ax.set_title("Evaluation Metrics")
+            ax.set_xlabel("Epoch")
+            ax.set_ylabel("Value")
+            ax.legend()
+            plt.tight_layout()
+            save_dir = args.log_dir if args.log_dir else "."
+            os.makedirs(save_dir, exist_ok=True)
+            plt.savefig(
+                os.path.join(save_dir, "eval_metrics.png"), dpi=300, bbox_inches="tight"
+            )
+            plt.savefig(os.path.join(save_dir, "eval_metrics.pdf"), bbox_inches="tight")
+            plt.close()
 
 
 if __name__ == "__main__":
