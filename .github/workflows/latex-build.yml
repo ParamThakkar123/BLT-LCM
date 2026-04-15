@@ -23,7 +23,7 @@ jobs:
 
       - name: Upload generated PDF artifact
         if: always()
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: neurips-checklist-pdf
           path: neurips_paper/*.pdf
