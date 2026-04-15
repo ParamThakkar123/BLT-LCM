@@ -14,10 +14,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Build checklist.tex with LaTeX
+      - name: Build main paper with LaTeX
         uses: xu-cheng/latex-action@v2
         with:
-          root_file: neurips_paper/checklist.tex
+          # Compile the main document that includes the checklist
+          root_file: neurips_paper/neurips_2026.tex
           # latexmk flags: produce pdf, nonstopmode, halt on error
           latexmk_flags: -pdf -interaction=nonstopmode -halt-on-error
 
