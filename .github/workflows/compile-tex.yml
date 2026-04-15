@@ -3,10 +3,10 @@ name: Compile LaTeX and publish PDF
 on:
   push:
     paths:
-      - 'neurips_paper/**/*.tex'
+      - 'neurips_paper/**'
   pull_request:
     paths:
-      - 'neurips_paper/**/*.tex'
+      - 'neurips_paper/**'
 
 jobs:
   build:
