@@ -32,7 +32,17 @@ pip install sacrebleu nltk wandb
 pip install comet-ml
 ```
 
-Note: If you use W&B, run `wandb login` in your environment before enabling `--wandb`.
+## Testing
+
+Install test dependencies:
+```bash
+pip install -e ".[test]"
+```
+
+Run tests:
+```bash
+pytest tests/
+```
 
 ## Dataset
 
@@ -79,12 +89,26 @@ dataset as multi-sentence documents or open an issue/PR to add a
 `--group_size` argument.
 
 3) Train LCM on BLT embeddings (dev) — requires `patching_scratch/entropy_model_marathi.pt`:
-
 ```bash
 python lcm_scripts/train_lcm_blt.py --entropy_model patching_scratch/entropy_model_marathi.pt --num_docs 200 --epochs 2 --batch_size 8 --log_dir runs/lcm_blt
 ```
 
-4) Run evaluation (generate hypothesis/reference files first, one sentence per line):
+4) Fine-tune LCM on BLT embeddings — requires a pre-trained checkpoint:
+```bash
+python lcm_scripts/finetune_lcm.py --checkpoint lcm_models/lcm_blt_best.pth --entropy_model patching_scratch/entropy_model_marathi.pt --num_docs 100 --epochs 3 --lr 1e-5 --log_dir runs/lcm_finetune
+```
+Options for fine-tuning:
+- `--freeze_prenet`: Freeze the input projection layers
+- `--freeze_postnet`: Freeze the output projection layers  
+- `--freeze_layers N`: Freeze the first N transformer layers
+- `--lr`: Set a lower learning rate (default 1e-5 for fine-tuning)
+- `--lora`: Enable LoRA fine-tuning for parameter efficiency
+- `--qlora`: Enable QLoRA (4-bit quantization + LoRA) for memory efficiency
+- `--lora_rank`: LoRA rank (default 8)
+- `--lora_alpha`: LoRA alpha (default 32)
+- `--target_modules`: Modules to apply LoRA (default ["linear"] for all Linear layers)
+
+5) Run evaluation (generate hypothesis/reference files first, one sentence per line):
 
 ```bash
 python lcm_scripts/eval_runner.py --hyp_file outputs/hyp.txt --ref_file outputs/ref.txt --out_csv results/eval_results.csv --seeds 42 43 44 --noisy_probs 0.0 0.1 0.2
