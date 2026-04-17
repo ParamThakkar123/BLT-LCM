@@ -10,18 +10,14 @@ import sys
 
 sys.path.append(os.path.dirname(__file__))
 
-import argparse
-import time
-import torch
-from torch.utils.data import DataLoader
-from tqdm import tqdm
-from datasets import load_dataset
+import multiprocessing
 
 from blt_loader import BLTLoader
 from base_lcm import BaseLCM
 from eval_metrics import compute_all
 from experiment_config import setup_logging
 import os
+import torch
 
 
 def prepare_data(num_docs=500, max_sent_per_doc=20, fraction=1.0):
@@ -104,6 +100,12 @@ def main():
     parser.add_argument(
         "--fraction", type=float, default=1.0, help="Fraction of dataset to use"
     )
+    parser.add_argument(
+        "--embed_cache",
+        type=str,
+        default="blt_embeddings_cache.pth",
+        help="Path to load/save precomputed embeddings (torch.save format)",
+    )
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -128,31 +130,54 @@ def main():
     blt = BLTLoader(entropy_model_path=args.entropy_model, device=str(device))
 
     print("Encoding with BLT (this may take a while)...")
-    flat_sents = []
-    doc_indices = []
-    for i, sents in enumerate(docs):
-        for sent in sents:
-            flat_sents.append(sent)
-            doc_indices.append(i)
-    print(f"Encoding {len(flat_sents)} sentences from {len(docs)} documents")
-    embed_list = []
-    batch_size = 64
-    for i in tqdm(range(0, len(flat_sents), batch_size), desc="encoding batches"):
-        batch = flat_sents[i : i + batch_size]
-        emb_batch = blt.encode_sentences_batch(batch)
-        embed_list.extend([e.cpu() for e in emb_batch])
+    # Option: load precomputed embeddings to skip encoding step
+    if args.embed_cache and os.path.exists(args.embed_cache):
+        try:
+            print(f"Loading precomputed embeddings from {args.embed_cache}")
+            embeddings_seqs = torch.load(args.embed_cache)
+        except Exception as e:
+            print(f"Failed to load embed cache {args.embed_cache}: {e}. Recomputing.")
+            embeddings_seqs = None
+    else:
+        embeddings_seqs = None
 
-    # Reconstruct per-document sequences
-    embeddings_seqs = [[] for _ in range(len(docs))]
-    for emb, didx in zip(embed_list, doc_indices):
-        embeddings_seqs[didx].append(emb)
+    if embeddings_seqs is None:
+        flat_sents = []
+        doc_indices = []
+        for i, sents in enumerate(docs):
+            for sent in sents:
+                flat_sents.append(sent)
+                doc_indices.append(i)
+        print(f"Encoding {len(flat_sents)} sentences from {len(docs)} documents")
+        embed_list = []
+        batch_size = 64
+        for i in tqdm(range(0, len(flat_sents), batch_size), desc="encoding batches"):
+            batch = flat_sents[i : i + batch_size]
+            emb_batch = blt.encode_sentences_batch(batch)
+            embed_list.extend([e.cpu() for e in emb_batch])
 
-    # stack per-document tensors
-    for i in range(len(embeddings_seqs)):
-        if len(embeddings_seqs[i]) == 0:
-            embeddings_seqs[i] = torch.empty((0, blt.model.dim))
-        else:
-            embeddings_seqs[i] = torch.stack(embeddings_seqs[i], dim=0)
+        # Reconstruct per-document sequences
+        embeddings_seqs = [[] for _ in range(len(docs))]
+        for emb, didx in zip(embed_list, doc_indices):
+            embeddings_seqs[didx].append(emb)
+
+        # stack per-document tensors
+        for i in range(len(embeddings_seqs)):
+            if len(embeddings_seqs[i]) == 0:
+                embeddings_seqs[i] = torch.empty((0, blt.model.dim))
+            else:
+                embeddings_seqs[i] = torch.stack(embeddings_seqs[i], dim=0)
+
+        # Optionally save cache
+        if args.embed_cache:
+            try:
+                cache_dir = os.path.dirname(args.embed_cache)
+                if cache_dir:
+                    os.makedirs(cache_dir, exist_ok=True)
+                torch.save(embeddings_seqs, args.embed_cache)
+                print(f"Saved embeddings to {args.embed_cache}")
+            except Exception as e:
+                print(f"Failed to save embeddings cache: {e}")
 
     dataset = EmbeddingDataset(embeddings_seqs)
     dataloader = DataLoader(
@@ -191,8 +216,8 @@ def main():
             optim.step()
             total += loss.item()
             n += 1
+            global_step += 1
             if writer is not None:
-                global_step += 1
                 writer.add_scalar("train/step_loss", loss.item(), global_step)
                 try:
                     lr = optim.param_groups[0]["lr"]
@@ -207,6 +232,26 @@ def main():
                             total_norm += param_norm * param_norm
                     total_norm = total_norm**0.5
                     writer.add_scalar("train/grad_norm", total_norm, global_step)
+                except Exception:
+                    pass
+
+            if wandb_module is not None:
+                try:
+                    lr = optim.param_groups[0]["lr"]
+                    total_norm = 0.0
+                    for p in model.parameters():
+                        if p.grad is not None:
+                            param_norm = p.grad.data.norm(2).item()
+                            total_norm += param_norm * param_norm
+                    total_norm = total_norm**0.5
+                    wandb_module.log(
+                        {
+                            "train/step_loss": loss.item(),
+                            "train/lr": lr,
+                            "train/grad_norm": total_norm,
+                        },
+                        step=global_step,
+                    )
                 except Exception:
                     pass
 

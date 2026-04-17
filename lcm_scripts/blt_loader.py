@@ -25,7 +25,9 @@ class BLTLoader:
     ):
         self.device = device
         # Load the entropy model
-        checkpoint = torch.load(entropy_model_path, map_location=device)
+        checkpoint = torch.load(
+            entropy_model_path, map_location=device, weights_only=False
+        )
         from run_blt_patching import ByteEntropyModel
 
         cfg = checkpoint.get("config", {})
@@ -39,12 +41,15 @@ class BLTLoader:
         ).to(device)
         self.model.load_state_dict(checkpoint["model_state_dict"])
         self.model.eval()
+        # Compile model for faster inference
+        self.model = torch.compile(self.model)
+        # Cache for tokenized sentences
+        self.token_cache = {}
 
-    def encode_sentences_batch(self, sentences_batch, threshold=1.335):
-        """Encode a batch of sentences to BLT patch embeddings"""
+    def encode_tokens_batch(self, tokens_batch, threshold=1.335):
+        """Encode a batch of tokenized sentences to BLT patch embeddings"""
         all_embeddings = []
-        for sent in sentences_batch:
-            tokens = text_to_byte_tokens(sent)
+        for tokens in tokens_batch:
             if len(tokens) == 0:
                 all_embeddings.append(torch.zeros(self.model.dim, device=self.device))
                 continue
