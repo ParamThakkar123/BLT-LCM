@@ -129,5 +129,5 @@ print(avg)
 
 - The repository provides a SONAR-lite implementation (in `lcm_scripts/sonar_module.py`) because the original SONAR package may not be available in all environments.
 - COMET metric requires a COMET model name or local checkpoint and the `comet` package; if not available COMET scores will be NaN and a warning is printed.
-- W&B integration is implemented: call training scripts with `--wandb` and set `--wandb_project`/`--wandb_name`/`--wandb_entity` as needed. You must run `wandb login` before uploading artifacts.
+- W&B integration is implemented: call training scripts with `--wandb` and set `--wandb_project`/`--wandb_name`/`--wandb_entity` as needed (defaults to team workspace "fyp-team-2513"). You must run `wandb login` before uploading artifacts.
 - The sentence splitting in the training scripts is simple and may be suboptimal for publication-grade experiments; replace it with a more robust sentence splitter if needed.
