@@ -33,16 +33,19 @@ def prepare_data(num_docs=500, max_sent_per_doc=20):
 
     ds = load_dataset("ParamTh/BhashaSetu", split="train", streaming=True)
     docs = []
-    cur = 0
-    for row in tqdm(ds, total=num_docs, desc="Loading docs"):
+    buf = []
+    for row in tqdm(ds, total=num_docs * max_sent_per_doc, desc="Loading docs"):
         text = row.get("marathi", "")
         if text and len(text.strip()) > 5:
             sents = [s.strip() for s in text.replace("\n", " ").split(".") if s.strip()]
-            if len(sents) > 1:
-                docs.append(sents[:max_sent_per_doc])
-                cur += 1
-        if cur >= num_docs:
-            break
+            buf.extend(sents)
+            while len(buf) >= max_sent_per_doc:
+                docs.append(buf[:max_sent_per_doc])
+                buf = buf[max_sent_per_doc:]
+                if len(docs) >= num_docs:
+                    return docs
+    if buf and len(docs) < num_docs:
+        docs.append(buf)
     return docs
 
 
