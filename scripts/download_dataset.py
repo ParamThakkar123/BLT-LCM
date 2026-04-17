@@ -13,11 +13,11 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from huggingface_hub import snapshot_download
+from datasets import load_dataset
 
 repo_id = "ParamTh/BhashaSetu"
 hf_home = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
 
 print(f"Downloading {repo_id} to {hf_home} ...")
-path = snapshot_download(repo_id=repo_id, repo_type="dataset")
-print(f"Done. Dataset cached at: {path}")
+ds = load_dataset(repo_id, split="train")
+print(f"Done. {len(ds)} rows cached at: {hf_home}")
