@@ -40,12 +40,13 @@ class BLTLoader:
         self.model.load_state_dict(checkpoint["model_state_dict"])
         self.model.eval()
 
-    def encode_sentences(self, sentences, threshold=1.335):
-        """Encode sentences to BLT patch embeddings"""
+    def encode_sentences_batch(self, sentences_batch, threshold=1.335):
+        """Encode a batch of sentences to BLT patch embeddings"""
         all_embeddings = []
-        for sent in sentences:
+        for sent in sentences_batch:
             tokens = text_to_byte_tokens(sent)
             if len(tokens) == 0:
+                all_embeddings.append(torch.zeros(self.model.dim, device=self.device))
                 continue
             tokens_tensor = torch.tensor([tokens], dtype=torch.long).to(self.device)
             entropies = compute_entropies_for_tokens(
@@ -77,11 +78,7 @@ class BLTLoader:
                 sent_emb = torch.zeros(self.model.dim, device=self.device)
             all_embeddings.append(sent_emb)
 
-        return (
-            torch.stack(all_embeddings)
-            if all_embeddings
-            else torch.empty(0, self.model.dim, device=self.device)
-        )
+        return all_embeddings
 
     def decode_embeddings(self, embeddings, target_lang="mar_Deva"):
         """Not implemented"""
