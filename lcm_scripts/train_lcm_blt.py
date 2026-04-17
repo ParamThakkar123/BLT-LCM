@@ -26,11 +26,12 @@ import os
 
 def prepare_data(num_docs=500, max_sent_per_doc=20):
     from datasets import load_dataset
+    from tqdm import tqdm
 
     ds = load_dataset("ParamTh/BhashaSetu", split="train", streaming=True)
     docs = []
     cur = 0
-    for row in ds:
+    for row in tqdm(ds, total=num_docs, desc="Loading docs"):
         text = row.get("marathi", "")
         if text and len(text.strip()) > 5:
             sents = [s.strip() for s in text.replace("\n", " ").split(".") if s.strip()]
@@ -82,7 +83,7 @@ def main():
     )
     parser.add_argument("--wandb_project", type=str, default=None)
     parser.add_argument("--wandb_name", type=str, default=None)
-    parser.add_argument("--wandb_entity", type=str, default=None)
+    parser.add_argument("--wandb_entity", type=str, default="fyp-team-2513")
     parser.add_argument(
         "--eval_hyp",
         type=str,

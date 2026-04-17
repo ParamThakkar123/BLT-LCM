@@ -361,7 +361,7 @@ def main():
     )
     parser.add_argument("--wandb_project", type=str, default=None)
     parser.add_argument("--wandb_name", type=str, default=None)
-    parser.add_argument("--wandb_entity", type=str, default=None)
+    parser.add_argument("--wandb_entity", type=str, default="fyp-team-2513")
     parser.add_argument(
         "--data_path",
         type=str,
