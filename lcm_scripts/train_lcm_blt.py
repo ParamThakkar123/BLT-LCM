@@ -24,22 +24,21 @@ from experiment_config import setup_logging
 import os
 
 
-def prepare_data(num_docs=500, max_sent_per_doc=20):
+def prepare_data(num_docs=500, max_sent_per_doc=20, fraction=1.0):
     from datasets import load_dataset
     from tqdm import tqdm
 
-    ds = load_dataset("ParamTh/BhashaSetu", split="train", streaming=True)
+    ds = load_dataset("ParamTh/BhashaSetu", split="train")
+    total = len(ds)
+    num_to_select = int(total * fraction)
+    ds = ds.shuffle(seed=42).select(range(num_to_select))
     docs = []
-    cur = 0
-    for row in tqdm(ds, total=num_docs, desc="Loading docs"):
+    for row in tqdm(ds, desc="Loading docs"):
         text = row.get("marathi", "")
-        if text and len(text.strip()) > 5:
+        if text and len(text.strip()) > 0:
             sents = [s.strip() for s in text.replace("\n", " ").split(".") if s.strip()]
-            if len(sents) > 1:
+            if len(sents) >= 1:
                 docs.append(sents[:max_sent_per_doc])
-                cur += 1
-        if cur >= num_docs:
-            break
     return docs
 
 
@@ -102,6 +101,9 @@ def main():
         default=None,
         help="Optional COMET model name or checkpoint path",
     )
+    parser.add_argument(
+        "--fraction", type=float, default=1.0, help="Fraction of dataset to use"
+    )
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -120,7 +122,7 @@ def main():
             config={},
         )
     print("Preparing data list...")
-    docs = prepare_data(args.num_docs)
+    docs = prepare_data(args.num_docs, fraction=args.fraction)
 
     print("Loading BLT loader...")
     blt = BLTLoader(entropy_model_path=args.entropy_model, device=str(device))
