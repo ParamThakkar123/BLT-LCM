@@ -27,16 +27,19 @@ from experiment_config import setup_logging
 import os
 
 
-def prepare_data(num_docs=500, max_sent_per_doc=20):
+def prepare_data(num_docs=500, max_sent_per_doc=20, fraction=1.0):
     from datasets import load_dataset
     from tqdm import tqdm
 
-    ds = load_dataset("ParamTh/BhashaSetu", split="train", streaming=True)
+    ds = load_dataset("ParamTh/BhashaSetu", split="train")
+    total = len(ds)
+    num_to_select = int(total * fraction)
+    ds = ds.shuffle(seed=42).select(range(num_to_select))
     docs = []
     buf = []
-    for row in tqdm(ds, total=num_docs * max_sent_per_doc, desc="Loading docs"):
+    for row in tqdm(ds, desc="Loading docs"):
         text = row.get("marathi", "")
-        if text and len(text.strip()) > 5:
+        if text and len(text.strip()) > 0:
             sents = [s.strip() for s in text.replace("\n", " ").split(".") if s.strip()]
             buf.extend(sents)
             while len(buf) >= max_sent_per_doc:
@@ -108,6 +111,9 @@ def main():
         default=None,
         help="Optional COMET model name or checkpoint path",
     )
+    parser.add_argument(
+        "--fraction", type=float, default=1.0, help="Fraction of dataset to use"
+    )
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -126,16 +132,37 @@ def main():
             config={},
         )
     print("Preparing data list...")
-    docs = prepare_data(args.num_docs)
+    docs = prepare_data(args.num_docs, fraction=args.fraction)
 
     print("Loading BLT loader...")
     blt = BLTLoader(entropy_model_path=args.entropy_model, device=str(device))
 
     print("Encoding with BLT (this may take a while)...")
-    embeddings_seqs = []
-    for sents in tqdm(docs):
-        emb = blt.encode_sentences(sents)
-        embeddings_seqs.append(emb.cpu())
+    flat_sents = []
+    doc_indices = []
+    for i, sents in enumerate(docs):
+        for sent in sents:
+            flat_sents.append(sent)
+            doc_indices.append(i)
+    print(f"Encoding {len(flat_sents)} sentences from {len(docs)} documents")
+    embed_list = []
+    batch_size = 64
+    for i in tqdm(range(0, len(flat_sents), batch_size), desc="encoding batches"):
+        batch = flat_sents[i : i + batch_size]
+        emb_batch = blt.encode_sentences_batch(batch)
+        embed_list.extend([e.cpu() for e in emb_batch])
+
+    # Reconstruct per-document sequences
+    embeddings_seqs = [[] for _ in range(len(docs))]
+    for emb, didx in zip(embed_list, doc_indices):
+        embeddings_seqs[didx].append(emb)
+
+    # stack per-document tensors
+    for i in range(len(embeddings_seqs)):
+        if len(embeddings_seqs[i]) == 0:
+            embeddings_seqs[i] = torch.empty((0, blt.model.dim))
+        else:
+            embeddings_seqs[i] = torch.stack(embeddings_seqs[i], dim=0)
 
     dataset = EmbeddingDataset(embeddings_seqs)
     dataloader = DataLoader(

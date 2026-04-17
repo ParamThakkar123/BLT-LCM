@@ -43,7 +43,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
-def prepare_data(num_docs=1000, max_sent_per_doc=20, text_col="marathi"):
+def prepare_data(num_docs=1000, max_sent_per_doc=20, text_col="marathi", fraction=1.0):
     # deprecated: callers should pass data_path via CLI
     # load Marathi sentences from ParamTh/BhashaSetu
 
@@ -96,31 +96,31 @@ def prepare_data(num_docs=1000, max_sent_per_doc=20, text_col="marathi"):
                                 "csv",
                                 data_files=data_path,
                                 split="train",
-                                streaming=True,
+                                streaming=False,
                             )
                         elif lp.endswith(".jsonl") or lp.endswith(".json"):
                             ds = load_dataset(
                                 "json",
                                 data_files=data_path,
                                 split="train",
-                                streaming=True,
+                                streaming=False,
                             )
                         elif lp.endswith(".parquet") or lp.endswith(".arrow"):
                             ds = load_dataset(
                                 "parquet",
                                 data_files=data_path,
                                 split="train",
-                                streaming=True,
+                                streaming=False,
                             )
                         elif lp.endswith(".py"):
                             # dataset script
-                            ds = load_dataset(data_path, split="train", streaming=True)
+                            ds = load_dataset(data_path, split="train", streaming=False)
                         else:
                             # fallback: let datasets try to infer
-                            ds = load_dataset(data_path, split="train", streaming=True)
+                            ds = load_dataset(data_path, split="train", streaming=False)
                     else:
                         # directory: may be a dataset snapshot or dataset script; let datasets handle it
-                        ds = load_dataset(data_path, split="train", streaming=True)
+                        ds = load_dataset(data_path, split="train", streaming=False)
                 except Exception as e:
                     print(
                         f"Failed to load dataset from explicit path {data_path}: {e}. Falling back to local candidates / Hugging Face Hub."
@@ -160,22 +160,22 @@ def prepare_data(num_docs=1000, max_sent_per_doc=20, text_col="marathi"):
                 lp = p.lower()
                 if lp.endswith(".csv"):
                     ds = load_dataset(
-                        "csv", data_files=p, split="train", streaming=True
+                        "csv", data_files=p, split="train", streaming=False
                     )
                 elif lp.endswith(".jsonl") or lp.endswith(".json"):
                     ds = load_dataset(
-                        "json", data_files=p, split="train", streaming=True
+                        "json", data_files=p, split="train", streaming=False
                     )
                 elif lp.endswith(".parquet") or lp.endswith(".arrow"):
                     ds = load_dataset(
-                        "parquet", data_files=p, split="train", streaming=True
+                        "parquet", data_files=p, split="train", streaming=False
                     )
                 elif lp.endswith(".py"):
-                    ds = load_dataset(p, split="train", streaming=True)
+                    ds = load_dataset(p, split="train", streaming=False)
                 else:
-                    ds = load_dataset(p, split="train", streaming=True)
+                    ds = load_dataset(p, split="train", streaming=False)
             else:
-                ds = load_dataset(p, split="train", streaming=True)
+                ds = load_dataset(p, split="train", streaming=False)
         except Exception as e:
             print(
                 f"Failed to load dataset from local path {p}: {e}. Trying next candidate."
@@ -205,22 +205,25 @@ def prepare_data(num_docs=1000, max_sent_per_doc=20, text_col="marathi"):
                 f"Snapshot downloaded to: {repo_path}. Loading dataset from local snapshot..."
             )
             # load from local snapshot path (non-streaming) so dataset files are read from disk
-            ds = load_dataset(repo_path, split="train", streaming=True)
+            ds = load_dataset(repo_path, split="train", streaming=False)
         except Exception as e:
             print(
                 f"snapshot_download failed or huggingface_hub unavailable: {e}. Falling back to streaming load from Hub."
             )
             try:
-                print(f"Loading dataset from Hugging Face Hub (streaming): {hf_repo}")
-                ds = load_dataset(hf_repo, split="train", streaming=True)
+                print(
+                    f"Loading dataset from Hugging Face Hub (non-streaming): {hf_repo}"
+                )
+                ds = load_dataset(hf_repo, split="train", streaming=False)
             except Exception as e2:
                 print(f"Failed to load dataset from Hugging Face Hub: {e2}")
                 raise
+    total = len(ds)
+    num_to_select = int(total * fraction)
+    ds = ds.shuffle(seed=42).select(range(num_to_select))
     docs = []
-    cur = 0
-    # Iterate with a progress bar so the user sees loading progress
     iterator = ds
-    # datasets streaming iterators are lazy; wrap with tqdm to show progress
+    # datasets iterators are lazy; wrap with tqdm to show progress
     iterator = tqdm(ds, desc="loading dataset", unit="rows")
 
     for row in iterator:
@@ -284,9 +287,6 @@ def prepare_data(num_docs=1000, max_sent_per_doc=20, text_col="marathi"):
             # discarded which made auto-grouping impossible.
             if len(sents) >= 1:
                 docs.append(sents[:max_sent_per_doc])
-                cur += 1
-        if cur >= num_docs:
-            break
     return docs
 
 
@@ -390,9 +390,7 @@ def main():
         help="Optional COMET model name or checkpoint path",
     )
     parser.add_argument(
-        "--no_grouping",
-        action="store_true",
-        help="Disable automatic grouping of sentence-level datasets into pseudo-documents",
+        "--fraction", type=float, default=1.0, help="Fraction of dataset to use"
     )
     args = parser.parse_args()
 
@@ -423,7 +421,7 @@ def main():
     # If user provided a data path via CLI, pass it to prepare_data via environment
     if args.data_path:
         os.environ["DATA_PATH_OVERRIDE"] = args.data_path
-    docs = prepare_data(num_docs=args.num_docs)
+    docs = prepare_data(num_docs=args.num_docs, fraction=args.fraction)
 
     # Fallback: some datasets (e.g. sentence-level corpora) provide one sentence
     # per row. The training pipeline expects at least one document with >=2

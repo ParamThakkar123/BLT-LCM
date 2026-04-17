@@ -86,38 +86,38 @@ pytest tests/
 
 ## Training on Dataset Subsets
 
-To train on specific percentages of the full dataset (2,170,000 sentences from `ParamTh/BhashaSetu`), use the following commands. These set `--num_docs` to the appropriate subset size and `--epochs 1` for a single epoch approximation of max_steps.
+To train on specific percentages of the full dataset (~2.78M rows from `ParamTh/BhashaSetu`), use the following commands. These use `--fraction` to select the subset and `--epochs 1` for a single epoch approximation of max_steps.
 
 Note: If your dataset contains one sentence per row (sentence-level corpus) the script will automatically group consecutive sentences into pseudo-documents. To disable this automatic grouping and keep strict per-row documents, pass `--no_grouping`. The default group size is 4.
 
-### 25% Subset (542,500 sentences)
+### 25% Subset
 - LCM on SONAR embeddings:
   ```bash
-  uv run lcm_scripts/train_lcm_sonar.py --num_docs 542500 --epochs 1 --batch_size 8 --log_dir runs/lcm_sonar_25 --wandb --wandb_project "BLT-LCM" --wandb_name "lcm_sonar_25"
+  uv run lcm_scripts/train_lcm_sonar.py --fraction 0.25 --epochs 1 --batch_size 8 --log_dir runs/lcm_sonar_25 --wandb --wandb_project "BLT-LCM" --wandb_name "lcm_sonar_25"
   ```
 - LCM on BLT embeddings:
   ```bash
-  uv run lcm_scripts/train_lcm_blt.py --entropy_model patching_scratch/entropy_model_marathi.pt --num_docs 542500 --epochs 1 --batch_size 8 --log_dir runs/lcm_blt_25 --wandb --wandb_project "BLT-LCM" --wandb_name "lcm_blt_25"
+  uv run lcm_scripts/train_lcm_blt.py --entropy_model patching_scratch/entropy_model_marathi.pt --fraction 0.25 --epochs 1 --batch_size 8 --log_dir runs/lcm_blt_25 --wandb --wandb_project "BLT-LCM" --wandb_name "lcm_blt_25"
   ```
 
-### 50% Subset (1,085,000 sentences)
+### 50% Subset
 - LCM on SONAR embeddings:
   ```bash
-  uv run lcm_scripts/train_lcm_sonar.py --num_docs 1085000 --epochs 1 --batch_size 8 --log_dir runs/lcm_sonar_50 --wandb --wandb_project "BLT-LCM" --wandb_name "lcm_sonar_50"
+  uv run lcm_scripts/train_lcm_sonar.py --fraction 0.5 --epochs 1 --batch_size 8 --log_dir runs/lcm_sonar_50 --wandb --wandb_project "BLT-LCM" --wandb_name "lcm_sonar_50"
   ```
 - LCM on BLT embeddings:
   ```bash
-  uv run lcm_scripts/train_lcm_blt.py --entropy_model patching_scratch/entropy_model_marathi.pt --num_docs 1085000 --epochs 1 --batch_size 8 --log_dir runs/lcm_blt_50 --wandb --wandb_project "BLT-LCM" --wandb_name "lcm_blt_50"
+  uv run lcm_scripts/train_lcm_blt.py --entropy_model patching_scratch/entropy_model_marathi.pt --fraction 0.5 --epochs 1 --batch_size 8 --log_dir runs/lcm_blt_50 --wandb --wandb_project "BLT-LCM" --wandb_name "lcm_blt_50"
   ```
 
-### 80% Subset (1,736,000 sentences)
+### 80% Subset
 - LCM on SONAR embeddings:
   ```bash
-  uv run lcm_scripts/train_lcm_sonar.py --num_docs 1736000 --epochs 1 --batch_size 8 --log_dir runs/lcm_sonar_80 --wandb --wandb_project "BLT-LCM" --wandb_name "lcm_sonar_80"
+  uv run lcm_scripts/train_lcm_sonar.py --fraction 0.8 --epochs 1 --batch_size 8 --log_dir runs/lcm_sonar_80 --wandb --wandb_project "BLT-LCM" --wandb_name "lcm_sonar_80"
   ```
 - LCM on BLT embeddings:
   ```bash
-  uv run lcm_scripts/train_lcm_blt.py --entropy_model patching_scratch/entropy_model_marathi.pt --num_docs 1736000 --epochs 1 --batch_size 8 --log_dir runs/lcm_blt_80 --wandb --wandb_project "BLT-LCM" --wandb_name "lcm_blt_80"
+  uv run lcm_scripts/train_lcm_blt.py --entropy_model patching_scratch/entropy_model_marathi.pt --fraction 0.8 --epochs 1 --batch_size 8 --log_dir runs/lcm_blt_80 --wandb --wandb_project "BLT-LCM" --wandb_name "lcm_blt_80"
   ```
 
 4) Fine-tune LCM on BLT embeddings — requires a pre-trained checkpoint:
