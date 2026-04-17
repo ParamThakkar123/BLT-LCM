@@ -22,6 +22,7 @@ import os
 import sys
 import time
 from datasets import load_dataset
+from tqdm import tqdm
 
 # Fix Windows console encoding for Marathi/Devanagari output
 if sys.platform == "win32":
@@ -542,7 +543,7 @@ def main():
 
     ds = load_dataset("ParamTh/BhashaSetu", split="train", streaming=True)
     marathi_texts = []
-    for row in ds:
+    for row in tqdm(ds, desc="Loading dataset", unit="rows", total=args.num_sentences):
         text = row.get("marathi", "")
         if text and len(text.strip()) > 5:
             marathi_texts.append(text)
