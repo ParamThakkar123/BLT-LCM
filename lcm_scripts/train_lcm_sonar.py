@@ -364,11 +364,7 @@ def main():
     )
     parser.add_argument("--wandb_project", type=str, default=None)
     parser.add_argument("--wandb_name", type=str, default=None)
-<<<<<<< HEAD
     parser.add_argument("--wandb_entity", type=str, default=os.environ.get("WANDB_ENTITY"))
-=======
-    parser.add_argument("--wandb_entity", type=str, default="fyp-team-2513")
->>>>>>> origin/main
     parser.add_argument(
         "--data_path",
         type=str,
