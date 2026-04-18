@@ -61,7 +61,8 @@ def compute_bleu(hyps: List[str], refs: List[str]) -> float:
 def compute_chrf(hyps: List[str], refs: List[str]) -> float:
     refs2 = _ensure_refs(refs)
     if _HAS_SACREBLEU:
-        chrf = sacrebleu.corpus_chrf(hyps, refs2)
+        # chrF++ corresponds to enabling word n-grams (word_order=2).
+        chrf = sacrebleu.corpus_chrf(hyps, refs2, word_order=2)
         return float(chrf.score)
     else:
         warnings.warn("sacrebleu not installed; chrF unavailable")
