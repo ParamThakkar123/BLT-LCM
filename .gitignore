@@ -1,5 +1,6 @@
 __pycache__/
 .ruff_cache/
+lcm_models/
 .mypy_cache/
 *.jsonl
 *.json

@@ -7,7 +7,7 @@ import argparse
 import csv
 import random
 import os
-from typing import List
+from typing import List, Optional
 
 from eval_metrics import compute_all
 
@@ -34,6 +34,7 @@ def run_eval(
     out_csv: str,
     seeds: List[int],
     noisy_probs: List[float],
+    comet_model_name: Optional[str] = None,
 ):
     rows = []
     for seed in seeds:
@@ -41,7 +42,9 @@ def run_eval(
         for p in noisy_probs:
             hyps_noisy = [corrupt_text(h, p) for h in hyps]
             refs_noisy = refs  # don't corrupt references
-            metrics = compute_all(hyps_noisy, refs_noisy)
+            metrics = compute_all(
+                hyps_noisy, refs_noisy, comet_model_name=comet_model_name
+            )
             row = {"seed": seed, "noise_prob": p}
             row.update(metrics)
             rows.append(row)
@@ -63,7 +66,8 @@ if __name__ == "__main__":
     parser.add_argument("--ref_file", required=True)
     parser.add_argument("--out_csv", default="results/eval_results.csv")
     parser.add_argument("--seeds", type=int, nargs="+", default=[42, 43, 44])
-    parser.add_argument("--noisy_probs", type=float, nargs="+", default=[0.0, 0.1, 0.2])
+    parser.add_argument("--noisy_probs", type=float, nargs="+", default=[0.0])
+    parser.add_argument("--comet_model", help="COMET model name (e.g., wmt22-comet-da)")
     args = parser.parse_args()
 
     with open(args.hyp_file, encoding="utf-8") as f:
@@ -71,4 +75,4 @@ if __name__ == "__main__":
     with open(args.ref_file, encoding="utf-8") as f:
         refs = [l.strip() for l in f if l.strip()]
 
-    run_eval(hyps, refs, args.out_csv, args.seeds, args.noisy_probs)
+    run_eval(hyps, refs, args.out_csv, args.seeds, args.noisy_probs, args.comet_model)
