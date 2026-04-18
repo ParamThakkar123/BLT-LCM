@@ -66,6 +66,7 @@ if __name__ == "__main__":
     parser.add_argument("--ref_file", required=True)
     parser.add_argument("--out_csv", default="results/eval_results.csv")
     parser.add_argument("--seeds", type=int, nargs="+", default=[42, 43, 44])
+    parser.add_argument("--noisy_probs", type=float, nargs="+", default=[0.0])
     parser.add_argument("--comet_model", help="COMET model name (e.g., wmt22-comet-da)")
     args = parser.parse_args()
 
