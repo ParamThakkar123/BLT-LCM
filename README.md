@@ -86,6 +86,24 @@ Note: If your dataset contains one sentence per row (sentence-level corpus) the 
   python lcm_scripts/train_lcm_blt.py --entropy_model ../patching_scratch/entropy_model_marathi.pt --fraction 0.5 --epochs 1 --batch_size 8 --log_dir runs/lcm_blt_50 --wandb --wandb_project "BLT-LCM" --wandb_name "lcm_blt_50"
   ```
 
+## Quick Start: BLT LCM Full Training Command
+
+Use this command to run a full training job with periodic autosave and checkpoint cleanup. It sets a model output directory, saves periodic checkpoints every 1000 steps and keeps the 5 most recent periodic checkpoints:
+
+Single-line example:
+
+```bash
+python lcm_scripts/train_lcm_blt.py --entropy_model patching_scratch/entropy_model_marathi.pt --fraction 0.5 --epochs 15 --batch_size 32 --log_dir runs/lcm_blt_50 --wandb --wandb_project "BLT-LCM" --wandb_name "lcm_blt_50" --model_dir lcm_models --save_interval_steps 1000 --max_checkpoints 5
+```
+
+Notes:
+- `--model_dir` controls where per-epoch/best and periodic checkpoints are saved (default `lcm_models`).
+- `--save_interval_steps` (default 1000) enables periodic autosaves; set to `0` to disable.
+- `--max_checkpoints` (default 5) limits how many periodic `lcm_blt_step*.pth` files are kept.
+- If you see errors about temporary directories (`No usable temporary directory found`), set a writable temp directory before running, e.g. `export TMPDIR=~/tmp && mkdir -p $TMPDIR`.
+
+If you want numeric-sorted cleanup, save-on-interrupt behavior, compression, or sharded checkpoints, check the script or ask to enable those options.
+
 ### 80% Subset
 - LCM on SONAR embeddings:
   ```bash
