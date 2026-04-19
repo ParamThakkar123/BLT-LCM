@@ -7,8 +7,14 @@ Usage:
 
 import os
 import sys
+<<<<<<< HEAD
 import argparse
 import re
+=======
+
+sys.path.append(os.path.dirname(__file__))
+
+>>>>>>> 06d3419d0499fad8295cc36332cd55e1ba5a0348
 import multiprocessing
 
 from blt_loader import BLTLoader
@@ -17,12 +23,15 @@ from eval_metrics import compute_all
 from experiment_config import setup_logging
 import os
 import torch
+<<<<<<< HEAD
 from tqdm import tqdm
 import time
 from torch.utils.data import DataLoader
 
 from run_blt_patching import text_to_byte_tokens
 from datasets import load_dataset
+=======
+>>>>>>> 06d3419d0499fad8295cc36332cd55e1ba5a0348
 
 
 def prepare_data(num_docs=500, max_sent_per_doc=20, fraction=1.0):
@@ -109,6 +118,7 @@ def main():
         default="blt_embeddings_cache.pth",
         help="Path to load/save precomputed embeddings (torch.save format)",
     )
+<<<<<<< HEAD
     parser.add_argument(
         "--model_dir",
         type=str,
@@ -127,6 +137,8 @@ def main():
         default=5,
         help="Maximum number of periodic checkpoints to keep (older removed)",
     )
+=======
+>>>>>>> 06d3419d0499fad8295cc36332cd55e1ba5a0348
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -151,14 +163,18 @@ def main():
     blt = BLTLoader(entropy_model_path=args.entropy_model, device=str(device))
 
     print("Encoding with BLT (this may take a while)...")
+<<<<<<< HEAD
     torch.set_float32_matmul_precision(
         "high"
     )  # Enable TensorFloat32 for better performance
+=======
+>>>>>>> 06d3419d0499fad8295cc36332cd55e1ba5a0348
     # Option: load precomputed embeddings to skip encoding step
     if args.embed_cache and os.path.exists(args.embed_cache):
         try:
             print(f"Loading precomputed embeddings from {args.embed_cache}")
             embeddings_seqs = torch.load(args.embed_cache)
+<<<<<<< HEAD
 
             # validate cache: must contain at least one doc with >=2 sentence embeddings
             def _count_valid(seqs):
@@ -180,6 +196,8 @@ def main():
                     f"Embed cache {args.embed_cache} contains no usable sequences (found {valid}). Recomputing."
                 )
                 embeddings_seqs = None
+=======
+>>>>>>> 06d3419d0499fad8295cc36332cd55e1ba5a0348
         except Exception as e:
             print(f"Failed to load embed cache {args.embed_cache}: {e}. Recomputing.")
             embeddings_seqs = None
@@ -195,11 +213,18 @@ def main():
                 doc_indices.append(i)
         print(f"Encoding {len(flat_sents)} sentences from {len(docs)} documents")
         embed_list = []
+<<<<<<< HEAD
         batch_size = 256  # Increased from 64 to 256 for faster processing
         for i in tqdm(range(0, len(flat_sents), batch_size), desc="encoding batches"):
             batch = flat_sents[i : i + batch_size]
             tokenized_batch = [text_to_byte_tokens(sent) for sent in batch]
             emb_batch = blt.encode_tokens_batch(tokenized_batch)
+=======
+        batch_size = 64
+        for i in tqdm(range(0, len(flat_sents), batch_size), desc="encoding batches"):
+            batch = flat_sents[i : i + batch_size]
+            emb_batch = blt.encode_sentences_batch(batch)
+>>>>>>> 06d3419d0499fad8295cc36332cd55e1ba5a0348
             embed_list.extend([e.cpu() for e in emb_batch])
 
         # Reconstruct per-document sequences
@@ -267,6 +292,7 @@ def main():
             total += loss.item()
             n += 1
             global_step += 1
+<<<<<<< HEAD
 
             # periodic autosave: save intermediate checkpoint and cleanup old ones
             if (
@@ -295,6 +321,8 @@ def main():
                                     pass
                 except Exception as e:
                     print(f"Failed to save periodic checkpoint {ckpt_name}: {e}")
+=======
+>>>>>>> 06d3419d0499fad8295cc36332cd55e1ba5a0348
             if writer is not None:
                 writer.add_scalar("train/step_loss", loss.item(), global_step)
                 try:
