@@ -3,6 +3,7 @@
 !.env.example
 __pycache__/
 .ruff_cache/
+lcm_models/
 .mypy_cache/
 *.jsonl
 *.json
@@ -12,3 +13,7 @@ blt_lcm_marathi.egg-info/
 runs/
 data/
 tea_debug.log
+blt_embeddings_cache.pth
+evaluation_results.txt
+outputs/
+results/mt_eval_results.csv
