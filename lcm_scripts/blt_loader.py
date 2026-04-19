@@ -25,14 +25,20 @@ class BLTLoader:
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
     ):
         self.device = device
+        # Resolve path relative to the repo root when not absolute
+        if not os.path.isabs(entropy_model_path) and not os.path.exists(
+            entropy_model_path
+        ):
+            repo_root = os.path.join(os.path.dirname(__file__), "..")
+            candidate = os.path.join(
+                repo_root, "patching_scratch", os.path.basename(entropy_model_path)
+            )
+            if os.path.exists(candidate):
+                entropy_model_path = candidate
         # Load the entropy model
         checkpoint = torch.load(
             entropy_model_path, map_location=device, weights_only=False
         )
-<<<<<<< HEAD
-=======
-        from run_blt_patching import ByteEntropyModel
->>>>>>> 06d3419d0499fad8295cc36332cd55e1ba5a0348
 
         cfg = checkpoint.get("config", {})
         self.model = ByteEntropyModel(
@@ -45,25 +51,18 @@ class BLTLoader:
         ).to(device)
         self.model.load_state_dict(checkpoint["model_state_dict"])
         self.model.eval()
-        # Compile model for faster inference
-        self.model = torch.compile(self.model)
-        # Cache for tokenized sentences
+        if sys.platform != "win32":
+            self.model = torch.compile(self.model)
         self.token_cache = {}
+        self._decoder = None
 
     def encode_tokens_batch(self, tokens_batch, threshold=1.335):
         """Encode a batch of tokenized sentences to BLT patch embeddings"""
-<<<<<<< HEAD
         all_patch_tokens = []
         sentence_patch_counts = []
         for tokens in tokens_batch:
             if len(tokens) == 0:
                 sentence_patch_counts.append(0)
-=======
-        all_embeddings = []
-        for tokens in tokens_batch:
-            if len(tokens) == 0:
-                all_embeddings.append(torch.zeros(self.model.dim, device=self.device))
->>>>>>> 06d3419d0499fad8295cc36332cd55e1ba5a0348
                 continue
             tokens_tensor = torch.tensor([tokens], dtype=torch.long).to(self.device)
             entropies = compute_entropies_for_tokens(
@@ -89,14 +88,13 @@ class BLTLoader:
             padded_patches = []
             for p in all_patch_tokens:
                 pad_len = max_len - len(p)
-                padded_patches.append(
-                    p + [0] * pad_len
-                )  # Pad with 0 (assuming 0 is padding token)
+                padded_patches.append(p + [0] * pad_len)  # Pad with 0 (padding token)
             batch_tensor = torch.tensor(padded_patches, dtype=torch.long).to(
                 self.device
             )  # [num_patches, max_len]
             with torch.no_grad():
                 if "cuda" in str(self.device):
+                    # use autocast on CUDA for fp16 speedup
                     with torch.amp.autocast("cuda", dtype=torch.float16):
                         outputs = self.model(
                             batch_tensor
@@ -121,6 +119,26 @@ class BLTLoader:
 
         return all_embeddings
 
+    def encode_sentences_batch(self, sentences, threshold=1.335):
+        """Encode a batch of raw text sentences to BLT patch embeddings."""
+        tokens_batch = [text_to_byte_tokens(s) for s in sentences]
+        return self.encode_tokens_batch(tokens_batch, threshold)
+
     def decode_embeddings(self, embeddings, target_lang="mar_Deva"):
-        """Not implemented"""
-        return ["<decoded>" for _ in embeddings]
+        """Decode BLT embeddings back to text using a trained BLTDecoder.
+
+        Requires a trained decoder checkpoint at lcm_models/blt_decoder.pth.
+        Falls back to placeholder if no decoder is available.
+        """
+        if self._decoder is None:
+            return ["<decoded: no decoder loaded>" for _ in embeddings]
+        if isinstance(embeddings, list):
+            embeddings = torch.stack(embeddings)
+        embeddings = embeddings.to(self.device)
+        return self._decoder.decode(embeddings)
+
+    def load_decoder(self, checkpoint_path: str = "lcm_models/blt_decoder.pth"):
+        """Load a trained BLTDecoder checkpoint."""
+        from blt_decoder import load_decoder
+
+        self._decoder = load_decoder(checkpoint_path, device=self.device)

@@ -61,7 +61,8 @@ def compute_bleu(hyps: List[str], refs: List[str]) -> float:
 def compute_chrf(hyps: List[str], refs: List[str]) -> float:
     refs2 = _ensure_refs(refs)
     if _HAS_SACREBLEU:
-        chrf = sacrebleu.corpus_chrf(hyps, refs2)
+        # chrF++ corresponds to enabling word n-grams (word_order=2).
+        chrf = sacrebleu.corpus_chrf(hyps, refs2, word_order=2)
         return float(chrf.score)
     else:
         warnings.warn("sacrebleu not installed; chrF unavailable")
@@ -79,15 +80,13 @@ def compute_ter(hyps: List[str], refs: List[str]) -> float:
 
 
 def compute_meteor(hyps: List[str], refs: List[str]) -> float:
-    # NLTK meteor_score returns a single score per hypothesis against single reference
     if not _HAS_NLTK:
         warnings.warn("nltk not installed; METEOR unavailable")
         return float("nan")
     scores = []
     for h, r in zip(hyps, refs):
-        # meteor_score expects references as list
         try:
-            scores.append(meteor_score.single_meteor_score(r, h))
+            scores.append(meteor_score.single_meteor_score(r.split(), h.split()))
         except Exception:
             scores.append(0.0)
     return float(100.0 * sum(scores) / max(1, len(scores)))
@@ -110,10 +109,11 @@ def compute_comet(
         if model_name is None:
             warnings.warn("No COMET model name/path provided; skipping COMET")
             return float("nan")
-        # try to download or load the model
+        # download_model returns a *path*, then load_from_checkpoint loads it
         try:
-            if download_model is not None:
-                model = download_model(model_name)
+            if download_model is not None and load_from_checkpoint is not None:
+                model_path = download_model(model_name)
+                model = load_from_checkpoint(model_path)
         except Exception:
             model = None
         if model is None and load_from_checkpoint is not None:
@@ -127,32 +127,21 @@ def compute_comet(
         return float("nan")
 
     try:
-        if hasattr(model, "predict"):
-            try:
-                res = model.predict(hyps, refs)
-            except Exception:
-                try:
-                    samples = [
-                        {"src": None, "ref": r, "hyp": h} for h, r in zip(hyps, refs)
-                    ]
-                    res = model.predict(samples)
-                except Exception:
-                    return float("nan")
+        samples = [
+            {"src": "", "mt": h, "ref": r} for h, r in zip(hyps, refs)
+        ]
+        res = model.predict(samples, batch_size=32, gpus=0)
 
-            if isinstance(res, dict) and "scores" in res:
-                scores = res["scores"]
-                return float(sum(scores) / len(scores))
-            if isinstance(res, list):
-                if len(res) == 0:
-                    return float("nan")
-                if isinstance(res[0], dict) and "score" in res[0]:
-                    vals = [float(r["score"]) for r in res]
-                    return float(sum(vals) / len(vals))
-                else:
-                    vals = [float(v) for v in res]
-                    return float(sum(vals) / len(vals))
-    except Exception:
-        warnings.warn("COMET model prediction failed")
+        if isinstance(res, tuple):
+            # comet returns (scores_list, system_score)
+            return float(res[1]) if len(res) > 1 else float("nan")
+        if isinstance(res, dict) and "system_score" in res:
+            return float(res["system_score"])
+        if isinstance(res, dict) and "scores" in res:
+            scores = res["scores"]
+            return float(sum(scores) / len(scores))
+    except Exception as e:
+        warnings.warn(f"COMET prediction failed: {e}")
         return float("nan")
 
     warnings.warn("COMET returned unexpected result format")

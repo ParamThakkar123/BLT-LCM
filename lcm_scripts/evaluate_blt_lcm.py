@@ -60,7 +60,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Load BLT loader
-    entropy_model_path = "../patching_scratch/entropy_model_marathi.pt"
+    entropy_model_path = "patching_scratch/entropy_model_marathi.pt"
     blt = BLTLoader(entropy_model_path=entropy_model_path, device=str(device))
 
     # Prepare training data for closest sentence lookup (use 10% to save time)

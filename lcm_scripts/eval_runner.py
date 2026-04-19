@@ -34,7 +34,7 @@ def run_eval(
     out_csv: str,
     seeds: List[int],
     noisy_probs: List[float],
-    comet_model: Optional[str] = None,
+    comet_model_name: Optional[str] = None,
 ):
     rows = []
     for seed in seeds:
@@ -42,7 +42,9 @@ def run_eval(
         for p in noisy_probs:
             hyps_noisy = [corrupt_text(h, p) for h in hyps]
             refs_noisy = refs  # don't corrupt references
-            metrics = compute_all(hyps_noisy, refs_noisy, comet_model_name=comet_model)
+            metrics = compute_all(
+                hyps_noisy, refs_noisy, comet_model_name=comet_model_name
+            )
             row = {"seed": seed, "noise_prob": p}
             row.update(metrics)
             rows.append(row)
@@ -84,5 +86,5 @@ if __name__ == "__main__":
         args.out_csv,
         args.seeds,
         args.noisy_probs,
-        comet_model=args.comet_model,
+        comet_model_name=args.comet_model,
     )
