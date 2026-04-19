@@ -24,9 +24,9 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_PATH = os.path.join(SCRIPT_DIR, "all_sentences_scores.jsonl")
 
 MODEL_NAMES = [
-    "Phase 1: Augmented Tokenizer",
-    "Phase 1: Retrained Tokenizer",
-    "Phase 2: BLT-LCM",
+    "Augmented Tokenizer",
+    "Retrained Tokenizer",
+    "BLT-LCM",
 ]
 COLORS = ["#3498db", "#2ecc71", "#e74c3c"]
 
@@ -139,7 +139,7 @@ for bar, m in zip(bars, means):
     ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.02,
             f"{m:.4f}", ha="center", va="bottom", fontweight="bold", fontsize=12)
 ax.set_ylabel("Mean Fertility (tokens or patches per word)")
-ax.set_title("Mean Fertility: Phase 1 Augmented vs Phase 1 Retrained vs Phase 2 BLT-LCM")
+ax.set_title("Mean Fertility: Augmented Tokenizer vs Retrained Tokenizer vs BLT-LCM")
 ax.set_ylim(0, max(means) + max(stds) + 0.15)
 ax.spines["top"].set_visible(False)
 ax.spines["right"].set_visible(False)
@@ -161,7 +161,7 @@ ax.axvline(fert_ret.mean(), color=COLORS[1], linestyle="--", linewidth=1.5)
 ax.axvline(fert_blt.mean(), color=COLORS[2], linestyle="--", linewidth=1.5)
 ax.set_xlabel("Fertility (tokens or patches per word)")
 ax.set_ylabel("Density")
-ax.set_title("Fertility Distribution: Phase 1 Augmented vs Phase 1 Retrained vs Phase 2 BLT-LCM")
+ax.set_title("Fertility Distribution: Augmented Tokenizer vs Retrained Tokenizer vs BLT-LCM")
 ax.legend(frameon=False)
 ax.spines["top"].set_visible(False)
 ax.spines["right"].set_visible(False)
@@ -195,7 +195,7 @@ ax.set_xticks(x)
 ax.set_xticklabels(bucket_labels)
 ax.set_xlabel("Sentence Length (words)")
 ax.set_ylabel("Mean Fertility")
-ax.set_title("Mean Fertility by Sentence Length: Phase 1 Augmented vs Phase 1 Retrained vs Phase 2 BLT-LCM")
+ax.set_title("Mean Fertility by Sentence Length: Augmented Tokenizer vs Retrained Tokenizer vs BLT-LCM")
 ax.legend(frameon=False)
 ax.spines["top"].set_visible(False)
 ax.spines["right"].set_visible(False)
@@ -207,28 +207,30 @@ print("Saved cmp3_fertility_by_length.png")
 # =====================================================================
 # FIGURE 4: Win/Tie/Loss Matrix (which model is best per sentence)
 # =====================================================================
-fig, ax = plt.subplots(figsize=(8, 5))
+fig, ax = plt.subplots(figsize=(10, 6))
 
 best_aug = ((fert_aug < fert_ret) & (fert_aug < fert_blt)).sum()
 best_ret = ((fert_ret < fert_aug) & (fert_ret < fert_blt)).sum()
 best_blt = ((fert_blt < fert_aug) & (fert_blt < fert_ret)).sum()
 tied = N - best_aug - best_ret - best_blt
 
-labels_pie = [
-    f"{MODEL_NAMES[0]}\n({best_aug:,} = {100*best_aug/N:.1f}%)",
-    f"{MODEL_NAMES[1]}\n({best_ret:,} = {100*best_ret/N:.1f}%)",
-    f"{MODEL_NAMES[2]}\n({best_blt:,} = {100*best_blt/N:.1f}%)",
-    f"Tied\n({tied:,} = {100*tied/N:.1f}%)",
+sizes = [best_blt, best_ret, best_aug, tied]
+colors_pie = [COLORS[2], COLORS[1], COLORS[0], "#bdc3c7"]
+legend_labels = [
+    f"BLT-LCM  ({best_blt:,} = {100*best_blt/N:.1f}%)",
+    f"Retrained Tokenizer  ({best_ret:,} = {100*best_ret/N:.1f}%)",
+    f"Augmented Tokenizer  ({best_aug:,} = {100*best_aug/N:.1f}%)",
+    f"Tied  ({tied:,} = {100*tied/N:.1f}%)",
 ]
-sizes = [best_aug, best_ret, best_blt, tied]
-colors_pie = COLORS + ["#bdc3c7"]
-explode = (0, 0, 0.05, 0)
-wedges, texts, autotexts = ax.pie(sizes, labels=labels_pie, colors=colors_pie,
-                                   explode=explode, autopct="", startangle=140,
-                                   textprops={"fontsize": 10})
-ax.set_title("Per-Sentence Winner: Which Model Achieves Lowest Fertility?")
+wedges, _ = ax.pie(sizes, colors=colors_pie, startangle=140,
+                    wedgeprops=dict(edgecolor="white", linewidth=1.5))
+ax.legend(wedges, legend_labels, title="Winner", loc="center left",
+          bbox_to_anchor=(1.0, 0.5), fontsize=11, title_fontsize=12,
+          frameon=False)
+ax.set_title("Per-Sentence Winner: Which Model Achieves Lowest Fertility?",
+             fontsize=14, pad=15)
 plt.tight_layout()
-plt.savefig(os.path.join(SCRIPT_DIR, "cmp4_winner_pie.png"))
+plt.savefig(os.path.join(SCRIPT_DIR, "cmp4_winner_pie.png"), bbox_inches="tight")
 plt.close()
 print("Saved cmp4_winner_pie.png")
 
@@ -242,7 +244,7 @@ for fert, name, color in zip([fert_aug, fert_ret, fert_blt], MODEL_NAMES, COLORS
     ax.plot(sorted_f, cdf, color=color, linewidth=2, label=name)
 ax.set_xlabel("Fertility (tokens or patches per word)")
 ax.set_ylabel("Cumulative Proportion of Sentences")
-ax.set_title("Cumulative Distribution: Phase 1 Augmented vs Phase 1 Retrained vs Phase 2 BLT-LCM")
+ax.set_title("Cumulative Distribution: Augmented Tokenizer vs Retrained Tokenizer vs BLT-LCM")
 ax.set_xlim(0.8, 3.0)
 ax.legend(frameon=False)
 ax.grid(alpha=0.2)
@@ -269,15 +271,15 @@ for ax, fert_p1, name, color in zip(axes, [fert_aug, fert_ret],
     ax.set_xlim(lims)
     ax.set_ylim(lims)
     ax.set_xlabel(f"{name}\nFertility")
-    ax.set_ylabel("Phase 2: BLT-LCM Fertility")
+    ax.set_ylabel("BLT-LCM Fertility")
     blt_wins = (fert_blt[subsample] < fert_p1[subsample]).sum()
     p1_wins = (fert_p1[subsample] < fert_blt[subsample]).sum()
     ties = len(subsample) - blt_wins - p1_wins
-    ax.set_title(f"BLT-LCM vs {name.split(': ')[1]}\nBLT wins: {blt_wins} | {name.split(': ')[1]} wins: {p1_wins} | Tied: {ties}")
+    ax.set_title(f"BLT-LCM vs {name}\nBLT wins: {blt_wins} | {name} wins: {p1_wins} | Tied: {ties}")
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
 
-plt.suptitle("Pairwise Fertility Comparison: Phase 2 BLT-LCM vs Phase 1 Tokenizers",
+plt.suptitle("Pairwise Fertility Comparison: BLT-LCM vs Tokenizers",
              fontsize=14, fontweight="bold", y=1.02)
 plt.tight_layout()
 plt.savefig(os.path.join(SCRIPT_DIR, "cmp6_pairwise_scatter.png"), bbox_inches="tight")
@@ -298,7 +300,7 @@ for bar, m in zip(bars, means_eff):
     ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.002,
             f"{m:.4f}", ha="center", va="bottom", fontweight="bold", fontsize=12)
 ax.set_ylabel("Tokens (or Patches) per Byte")
-ax.set_title("Compression Efficiency: Phase 1 Augmented vs Phase 1 Retrained vs Phase 2 BLT-LCM\n(lower = more compressed)")
+ax.set_title("Compression Efficiency: Augmented Tokenizer vs Retrained Tokenizer vs BLT-LCM\n(lower = more compressed)")
 ax.spines["top"].set_visible(False)
 ax.spines["right"].set_visible(False)
 plt.tight_layout()
@@ -330,7 +332,7 @@ ax.text(0.98, 0.97, stats_text, transform=ax.transAxes, fontsize=9,
         va="top", ha="right", family="monospace",
         bbox=dict(boxstyle="round,pad=0.4", facecolor="lightyellow", alpha=0.8))
 ax.set_ylabel("Fertility (tokens or patches per word)")
-ax.set_title("Fertility Distribution: Phase 1 Augmented vs Phase 1 Retrained vs Phase 2 BLT-LCM")
+ax.set_title("Fertility Distribution: Augmented Tokenizer vs Retrained Tokenizer vs BLT-LCM")
 ax.spines["top"].set_visible(False)
 ax.spines["right"].set_visible(False)
 plt.tight_layout()
