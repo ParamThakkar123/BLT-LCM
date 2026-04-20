@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
     version = "0.1.0"
     description = "BLT-LCM for Marathi Machine Translation Concept Extraction"
     authors = [{name = "Your Name"}]
-    requires-python = ">=3.8"
+    requires-python = ">=3.10"
     dependencies = [
     "transformers>=4.0.0",
     "huggingface-hub>=0.34.0",
