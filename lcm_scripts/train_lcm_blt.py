@@ -7,18 +7,31 @@ Usage:
 
 import os
 import sys
+import os
+import sys
 
 sys.path.append(os.path.dirname(__file__))
 
 from dotenv import load_dotenv
-load_dotenv()
 
+load_dotenv()
 import argparse
 import re
 import multiprocessing
 import time
 
 from tqdm import tqdm
+from blt_loader import BLTLoader
+from base_lcm import BaseLCM
+from eval_metrics import compute_all
+from experiment_config import setup_logging
+import torch
+from tqdm import tqdm
+import time
+from torch.utils.data import DataLoader
+
+from run_blt_patching import text_to_byte_tokens
+from datasets import load_dataset
 from blt_loader import BLTLoader
 from base_lcm import BaseLCM
 from eval_metrics import compute_all
@@ -42,7 +55,11 @@ def prepare_data(num_docs=500, max_sent_per_doc=20, fraction=1.0):
     for row in tqdm(ds, desc="Loading docs"):
         text = row.get("marathi", "")
         if text and len(text.strip()) > 0:
-            sents = [s.strip() for s in re.split(r"[.।]", text.replace("\n", " ")) if s.strip()]
+            sents = [
+                s.strip()
+                for s in re.split(r"[.।]", text.replace("\n", " "))
+                if s.strip()
+            ]
             buf.extend(sents)
             while len(buf) >= max_sent_per_doc:
                 docs.append(buf[:max_sent_per_doc])
@@ -94,7 +111,9 @@ def main():
     )
     parser.add_argument("--wandb_project", type=str, default=None)
     parser.add_argument("--wandb_name", type=str, default=None)
-    parser.add_argument("--wandb_entity", type=str, default=os.environ.get("WANDB_ENTITY"))
+    parser.add_argument(
+        "--wandb_entity", type=str, default=os.environ.get("WANDB_ENTITY")
+    )
     parser.add_argument(
         "--eval_hyp",
         type=str,
