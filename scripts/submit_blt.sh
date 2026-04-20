@@ -34,7 +34,7 @@ uv run lcm_scripts/train_lcm_blt.py \
     --entropy_model patching_scratch/entropy_model_marathi.pt \
     --fraction "$FRACTION" \
     --epochs 1 \
-    --batch_size 8 \
+    --batch_size 32 \
     --embed_cache "embeddings/${CACHE_NAME}" \
     --log_dir "runs/${RUN_NAME}" \
     --wandb \

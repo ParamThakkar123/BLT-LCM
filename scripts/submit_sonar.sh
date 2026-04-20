@@ -32,7 +32,7 @@ START=$(date +%s)
 uv run lcm_scripts/train_lcm_sonar.py \
     --fraction "$FRACTION" \
     --epochs 1 \
-    --batch_size 8 \
+    --batch_size 32 \
     --log_dir "runs/${RUN_NAME}" \
     --wandb \
     --wandb_project "BLT-LCM" \
