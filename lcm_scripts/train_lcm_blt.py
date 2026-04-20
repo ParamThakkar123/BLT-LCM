@@ -12,6 +12,9 @@ import sys
 
 sys.path.append(os.path.dirname(__file__))
 
+from dotenv import load_dotenv
+
+load_dotenv()
 import argparse
 import re
 import multiprocessing

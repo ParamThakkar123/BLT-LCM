@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
     version = "0.1.0"
     description = "BLT-LCM for Marathi Machine Translation Concept Extraction"
     authors = [{name = "Your Name"}]
-    requires-python = ">=3.8"
+    requires-python = ">=3.10"
     dependencies = [
     "transformers>=4.0.0",
     "huggingface-hub>=0.34.0",
@@ -15,7 +15,7 @@ build-backend = "setuptools.build_meta"
     "tiktoken",
     "sonar-space",
     "datasets",
-    "numpy",
+    "numpy>=1.26.0",
     "tqdm",
     "indic-nlp-library>=0.92",
     "sacrebleu>=2.5.1",
@@ -25,6 +25,7 @@ build-backend = "setuptools.build_meta"
     "peft>=0.4.0",
     "bitsandbytes>=0.41.0",
     "python-dotenv>=1.0.0",
+    "setuptools<81",
     "matplotlib>=3.7.0",
     "unbabel-comet>=2.2.7",
     "nltk>=3.9.1",
