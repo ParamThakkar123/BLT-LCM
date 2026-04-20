@@ -18,6 +18,7 @@
 
 FRACTION=${1:-0.25}
 RUN_NAME=${2:-"lcm_blt_$(echo $FRACTION | tr -d '.')"}
+CACHE_NAME="blt_embeddings_frac$(echo $FRACTION | tr -d '.').pth"
 
 REPO_DIR=/mnt/lustre/home/gehler/gfh098/dev/BLT-LCM
 cd "$REPO_DIR"
@@ -34,6 +35,7 @@ uv run lcm_scripts/train_lcm_blt.py \
     --fraction "$FRACTION" \
     --epochs 1 \
     --batch_size 8 \
+    --embed_cache "embeddings/${CACHE_NAME}" \
     --log_dir "runs/${RUN_NAME}" \
     --wandb \
     --wandb_project "BLT-LCM" \

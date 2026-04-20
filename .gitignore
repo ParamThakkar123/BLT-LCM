@@ -14,6 +14,7 @@ runs/
 data/
 tea_debug.log
 blt_embeddings_cache.pth
+embeddings/
 evaluation_results.txt
 outputs/
 results/mt_eval_results.csv
