@@ -25,6 +25,7 @@ build-backend = "setuptools.build_meta"
     "peft>=0.4.0",
     "bitsandbytes>=0.41.0",
     "python-dotenv>=1.0.0",
+    "setuptools<81",
     "matplotlib>=3.7.0",
     "unbabel-comet>=2.2.7",
     "nltk>=3.9.1",
