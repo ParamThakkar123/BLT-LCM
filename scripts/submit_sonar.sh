@@ -4,15 +4,17 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --nodes=1
 #SBATCH --partition=a100-galvani
-#SBATCH --time=2-00:00
+#SBATCH --time=${3:-11:00:00}
 #SBATCH --gres=gpu:1
-#SBATCH --mem=50G
+#SBATCH --mem=16G
 #SBATCH --output=/mnt/lustre/home/gehler/gfh098/dev/BLT-LCM/logs/sonar_%j.out
 #SBATCH --error=/mnt/lustre/home/gehler/gfh098/dev/BLT-LCM/logs/sonar_%j.err
 
 # Usage:
-#   sbatch scripts/submit_sonar.sh [fraction] [run_name]
-#   sbatch scripts/submit_sonar.sh 0.25 lcm_sonar_25
+#   sbatch scripts/submit_sonar.sh [fraction] [run_name] [time_limit]
+#   sbatch scripts/submit_sonar.sh 0.25 lcm_sonar_25 11:00:00
+#   sbatch scripts/submit_sonar.sh 0.50 lcm_sonar_50 21:00:00
+#   sbatch scripts/submit_sonar.sh 0.80 lcm_sonar_80 1-09:00
 
 FRACTION=${1:-0.25}
 RUN_NAME=${2:-"lcm_sonar_$(echo $FRACTION | tr -d '.')"}
