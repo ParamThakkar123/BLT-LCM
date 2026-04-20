@@ -2,7 +2,7 @@
 Train BLT-LCM: use BLT-derived embeddings (from BLTLoader) to train same LCM architecture.
 
 Usage:
-  python lcm_scripts/train_lcm_blt.py --entropy_model ../patching_scratch/entropy_model_marathi.pt
+  python lcm_scripts/train_lcm_blt.py --entropy_model patching_scratch/entropy_model_marathi.pt
 """
 
 import os
@@ -12,10 +12,13 @@ sys.path.append(os.path.dirname(__file__))
 
 from dotenv import load_dotenv
 load_dotenv()
+
 import argparse
 import re
 import multiprocessing
+import time
 
+from tqdm import tqdm
 from blt_loader import BLTLoader
 from base_lcm import BaseLCM
 from eval_metrics import compute_all
