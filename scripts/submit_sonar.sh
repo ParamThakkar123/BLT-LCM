@@ -26,6 +26,9 @@ mkdir -p logs
 
 set -a && source .env && set +a
 
+echo "Job started:  $(date)"
+START=$(date +%s)
+
 uv run lcm_scripts/train_lcm_sonar.py \
     --fraction "$FRACTION" \
     --epochs 1 \
@@ -34,3 +37,6 @@ uv run lcm_scripts/train_lcm_sonar.py \
     --wandb \
     --wandb_project "BLT-LCM" \
     --wandb_name "$RUN_NAME"
+
+echo "Job finished: $(date)"
+echo "Total elapsed: $(( $(date +%s) - START ))s"

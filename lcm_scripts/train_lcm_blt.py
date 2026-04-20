@@ -160,12 +160,15 @@ def main():
             entity=args.wandb_entity,
             config={},
         )
+    t0 = time.time()
     print("Preparing data list...")
     docs = prepare_data(args.num_docs, fraction=args.fraction)
+    print(f"Data loading: {time.time() - t0:.1f}s  ({len(docs)} docs)")
 
     print("Loading BLT loader...")
     blt = BLTLoader(entropy_model_path=args.entropy_model, device=str(device))
 
+    t1 = time.time()
     print("Encoding with BLT (this may take a while)...")
     torch.set_float32_matmul_precision(
         "high"
@@ -231,6 +234,11 @@ def main():
                 embeddings_seqs[i] = torch.stack(embeddings_seqs[i], dim=0)
 
         # Optionally save cache
+        print(f"Encoding: {time.time() - t1:.1f}s")
+        if device.type == "cuda":
+            peak_vram = torch.cuda.max_memory_allocated(device) / 1024**3
+            print(f"Peak VRAM after encoding: {peak_vram:.2f} GB")
+            torch.cuda.reset_peak_memory_stats(device)
         if args.embed_cache:
             try:
                 cache_dir = os.path.dirname(args.embed_cache)
@@ -351,6 +359,10 @@ def main():
 
         elapsed = time.time() - start
         print(f"Epoch {epoch + 1} avg loss: {total / n:.4f} time: {elapsed:.1f}s")
+        if device.type == "cuda":
+            peak_vram = torch.cuda.max_memory_allocated(device) / 1024**3
+            print(f"Peak VRAM epoch {epoch + 1}: {peak_vram:.2f} GB")
+            torch.cuda.reset_peak_memory_stats(device)
         os.makedirs(args.model_dir, exist_ok=True)
         torch.save(model.state_dict(), f"{args.model_dir}/lcm_blt_epoch{epoch + 1}.pth")
 
