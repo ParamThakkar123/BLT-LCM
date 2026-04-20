@@ -6,7 +6,7 @@
 #SBATCH --partition=a100-galvani
 #SBATCH --time=10:00:00
 #SBATCH --gres=gpu:1
-#SBATCH --mem=16G
+#SBATCH --mem=48G
 #SBATCH --output=/mnt/lustre/home/gehler/gfh098/dev/BLT-LCM/logs/encode_%j.out
 #SBATCH --error=/mnt/lustre/home/gehler/gfh098/dev/BLT-LCM/logs/encode_%j.err
 
