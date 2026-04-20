@@ -4,7 +4,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --nodes=1
 #SBATCH --partition=a100-galvani
-#SBATCH --time=${3:-11:00:00}
+#SBATCH --time=11:00:00
 #SBATCH --gres=gpu:1
 #SBATCH --mem=16G
 #SBATCH --output=/mnt/lustre/home/gehler/gfh098/dev/BLT-LCM/logs/sonar_%j.out
