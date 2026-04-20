@@ -8,6 +8,9 @@ Usage:
 """
 
 import os
+from dotenv import load_dotenv
+load_dotenv()
+
 import argparse
 import time
 import torch
@@ -329,7 +332,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--wandb_project", type=str, default=None)
     parser.add_argument("--wandb_name", type=str, default=None)
-    parser.add_argument("--wandb_entity", type=str, default="fyp-team-2513")
+    parser.add_argument("--wandb_entity", type=str, default=os.environ.get("WANDB_ENTITY"))
     parser.add_argument(
         "--parallel_dataset",
         type=str,

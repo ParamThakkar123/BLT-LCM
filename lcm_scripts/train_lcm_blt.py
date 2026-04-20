@@ -7,15 +7,16 @@ Usage:
 
 import os
 import sys
-<<<<<<< Updated upstream
-import argparse
-import re
-=======
+import os
+import sys
 
 sys.path.append(os.path.dirname(__file__))
 
+from dotenv import load_dotenv
+
+load_dotenv()
 import argparse
->>>>>>> Stashed changes
+import re
 import multiprocessing
 import time
 
@@ -24,7 +25,17 @@ from blt_loader import BLTLoader
 from base_lcm import BaseLCM
 from eval_metrics import compute_all
 from experiment_config import setup_logging
-import os
+import torch
+from tqdm import tqdm
+import time
+from torch.utils.data import DataLoader
+
+from run_blt_patching import text_to_byte_tokens
+from datasets import load_dataset
+from blt_loader import BLTLoader
+from base_lcm import BaseLCM
+from eval_metrics import compute_all
+from experiment_config import setup_logging
 import torch
 from tqdm import tqdm
 import time
@@ -40,13 +51,23 @@ def prepare_data(num_docs=500, max_sent_per_doc=20, fraction=1.0):
     num_to_select = int(total * fraction)
     ds = ds.shuffle(seed=42).select(range(num_to_select))
     docs = []
+    buf = []
     for row in tqdm(ds, desc="Loading docs"):
         text = row.get("marathi", "")
         if text and len(text.strip()) > 0:
-            sents = [s.strip() for s in re.split(r"[.।]", text) if s.strip()]
-            # require at least two sentences per document so we can form src/tgt pairs
-            if len(sents) >= 2:
-                docs.append(sents[:max_sent_per_doc])
+            sents = [
+                s.strip()
+                for s in re.split(r"[.।]", text.replace("\n", " "))
+                if s.strip()
+            ]
+            buf.extend(sents)
+            while len(buf) >= max_sent_per_doc:
+                docs.append(buf[:max_sent_per_doc])
+                buf = buf[max_sent_per_doc:]
+                if len(docs) >= num_docs:
+                    return docs
+    if buf and len(docs) < num_docs:
+        docs.append(buf)
     return docs
 
 
@@ -90,7 +111,9 @@ def main():
     )
     parser.add_argument("--wandb_project", type=str, default=None)
     parser.add_argument("--wandb_name", type=str, default=None)
-    parser.add_argument("--wandb_entity", type=str, default="fyp-team-2513")
+    parser.add_argument(
+        "--wandb_entity", type=str, default=os.environ.get("WANDB_ENTITY")
+    )
     parser.add_argument(
         "--eval_hyp",
         type=str,

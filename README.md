@@ -16,39 +16,63 @@ git clone <repo-url>
 cd BLT-LCM
 ```
 
-2. Create a Python environment and install the package (editable):
+2. Install with [uv](https://github.com/astral-sh/uv) (recommended):
+
+```bash
+uv venv
+source .venv/bin/activate
+uv pip install -e .
+```
+
+Or with plain pip:
 
 ```bash
 python -m venv .venv
-# Activate: source .venv/bin/activate (Linux/macOS) or .venv\Scripts\activate (Windows)
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
 pip install -e .
 ```
 
-3. Optional dependencies for full evaluation and logging:
+## Environment setup
+
+Copy the template and fill in your credentials:
 
 ```bash
-pip install sacrebleu nltk wandb
-# COMET is optional and only required if you want COMET scores
-pip install comet-ml
+cp .env.example .env
 ```
 
-## Testing
+Required variables in `.env`:
 
-Install test dependencies:
-```bash
-pip install -e ".[test]"
-```
+| Variable | Description |
+|---|---|
+| `WANDB_API_KEY` | Your W&B API key |
+| `HF_TOKEN` | Your Hugging Face token (for higher rate limits) |
+| `WANDB_ENTITY` | Your W&B team or username (e.g. `fyp-team-2513`) |
+| `HF_HOME` | HuggingFace cache directory (use a shared path on HPC, e.g. `$SCRATCH/.cache/huggingface`) |
+| `HF_DATASETS_OFFLINE` | Set to `1` on compute nodes without internet, `0` on login nodes |
 
-Run tests:
-```bash
-pytest tests/
-```
+All training scripts load `.env` automatically at startup.
 
 ## Dataset
 
-The training scripts stream Marathi text from the Hugging Face dataset `ParamTh/BhashaSetu` (train split) and read the `marathi` column. Sentence splitting is a simple period/newline split performed inside the scripts. See `lcm_scripts/train_sonar.py` and `lcm_scripts/train_lcm_*.py` for details.
+The training scripts use the Hugging Face dataset `ParamTh/BhashaSetu` (2,170,000 Marathi sentences, train split).
 
-If you want to use your own data, supply files and update the scripts or modify the dataset loading logic.
+**On HPC clusters** (compute nodes typically have no internet access): download the dataset once from a login node, then run training offline.
+
+```bash
+# On the login node (internet access required):
+uv run scripts/download_dataset.py
+
+# Then set HF_DATASETS_OFFLINE=1 in your .env before running on compute nodes.
+```
+
+If you want to use your own data, pass `--data_path` to the training scripts.
+
+## Testing
+
+```bash
+uv pip install -e ".[test]"
+pytest tests/
+```
 
 ## Important files / scripts
 
@@ -69,36 +93,36 @@ Note: If your dataset contains one sentence per row (sentence-level corpus) the 
 ### 25% Subset
 - LCM on SONAR embeddings:
   ```bash
-  python lcm_scripts/train_lcm_sonar.py --fraction 0.25 --epochs 1 --batch_size 8 --log_dir runs/lcm_sonar_25 --wandb --wandb_project "BLT-LCM" --wandb_name "lcm_sonar_25"
+  uv run lcm_scripts/train_lcm_sonar.py --fraction 0.25 --epochs 1 --batch_size 8 --log_dir runs/lcm_sonar_25 --wandb --wandb_project "BLT-LCM" --wandb_name "lcm_sonar_25"
   ```
 - LCM on BLT embeddings:
   ```bash
-  python lcm_scripts/train_lcm_blt.py --entropy_model ../patching_scratch/entropy_model_marathi.pt --fraction 0.25 --epochs 1 --batch_size 8 --log_dir runs/lcm_blt_25 --wandb --wandb_project "BLT-LCM" --wandb_name "lcm_blt_25"
+  uv run lcm_scripts/train_lcm_blt.py --entropy_model patching_scratch/entropy_model_marathi.pt --fraction 0.25 --epochs 1 --batch_size 8 --log_dir runs/lcm_blt_25 --wandb --wandb_project "BLT-LCM" --wandb_name "lcm_blt_25"
   ```
 
 ### 50% Subset
 - LCM on SONAR embeddings:
   ```bash
-  python lcm_scripts/train_lcm_sonar.py --fraction 0.5 --epochs 1 --batch_size 8 --log_dir runs/lcm_sonar_50 --wandb --wandb_project "BLT-LCM" --wandb_name "lcm_sonar_50"
+  uv run lcm_scripts/train_lcm_sonar.py --fraction 0.5 --epochs 1 --batch_size 8 --log_dir runs/lcm_sonar_50 --wandb --wandb_project "BLT-LCM" --wandb_name "lcm_sonar_50"
   ```
 - LCM on BLT embeddings:
   ```bash
-  python lcm_scripts/train_lcm_blt.py --entropy_model ../patching_scratch/entropy_model_marathi.pt --fraction 0.5 --epochs 1 --batch_size 8 --log_dir runs/lcm_blt_50 --wandb --wandb_project "BLT-LCM" --wandb_name "lcm_blt_50"
+  uv run lcm_scripts/train_lcm_blt.py --entropy_model patching_scratch/entropy_model_marathi.pt --fraction 0.5 --epochs 1 --batch_size 8 --log_dir runs/lcm_blt_50 --wandb --wandb_project "BLT-LCM" --wandb_name "lcm_blt_50"
   ```
 
 ### 80% Subset
 - LCM on SONAR embeddings:
   ```bash
-  python lcm_scripts/train_lcm_sonar.py --fraction 0.8 --epochs 1 --batch_size 8 --log_dir runs/lcm_sonar_80 --wandb --wandb_project "BLT-LCM" --wandb_name "lcm_sonar_80"
+  uv run lcm_scripts/train_lcm_sonar.py --fraction 0.8 --epochs 1 --batch_size 8 --log_dir runs/lcm_sonar_80 --wandb --wandb_project "BLT-LCM" --wandb_name "lcm_sonar_80"
   ```
 - LCM on BLT embeddings:
   ```bash
-  python lcm_scripts/train_lcm_blt.py --entropy_model ../patching_scratch/entropy_model_marathi.pt --fraction 0.8 --epochs 1 --batch_size 8 --log_dir runs/lcm_blt_80 --wandb --wandb_project "BLT-LCM" --wandb_name "lcm_blt_80"
+  uv run lcm_scripts/train_lcm_blt.py --entropy_model patching_scratch/entropy_model_marathi.pt --fraction 0.8 --epochs 1 --batch_size 8 --log_dir runs/lcm_blt_80 --wandb --wandb_project "BLT-LCM" --wandb_name "lcm_blt_80"
   ```
 
 4) Fine-tune LCM on BLT embeddings — requires a pre-trained checkpoint:
 ```bash
-python lcm_scripts/finetune_lcm.py --checkpoint lcm_models/lcm_blt_best.pth --entropy_model patching_scratch/entropy_model_marathi.pt --num_docs 100 --epochs 3 --lr 1e-5 --log_dir runs/lcm_finetune
+uv run lcm_scripts/finetune_lcm.py --checkpoint lcm_models/lcm_blt_best.pth --entropy_model patching_scratch/entropy_model_marathi.pt --num_docs 100 --epochs 3 --lr 1e-5 --log_dir runs/lcm_finetune
 ```
 Options for fine-tuning:
 - `--freeze_prenet`: Freeze the input projection layers
@@ -114,7 +138,7 @@ Options for fine-tuning:
 5) Run evaluation (generate hypothesis/reference files first, one sentence per line):
 
 ```bash
-python lcm_scripts/eval_runner.py --hyp_file outputs/hyp.txt --ref_file outputs/ref.txt --out_csv results/eval_results.csv --seeds 42 43 44 --noisy_probs 0.0 0.1 0.2
+uv run lcm_scripts/eval_runner.py --hyp_file outputs/hyp.txt --ref_file outputs/ref.txt --out_csv results/eval_results.csv --seeds 42 43 44 --noisy_probs 0.0 0.1 0.2
 ```
 
 5) Fertility audit (example interactive usage):
@@ -129,5 +153,5 @@ print(avg)
 
 - The repository provides a SONAR-lite implementation (in `lcm_scripts/sonar_module.py`) because the original SONAR package may not be available in all environments.
 - COMET metric requires a COMET model name or local checkpoint and the `comet` package; if not available COMET scores will be NaN and a warning is printed.
-- W&B integration is implemented: call training scripts with `--wandb` and set `--wandb_project`/`--wandb_name`/`--wandb_entity` as needed (defaults to team workspace "fyp-team-2513"). You must run `wandb login` before uploading artifacts.
+- W&B integration is implemented: call training scripts with `--wandb` and set `--wandb_project`/`--wandb_name` as needed. `--wandb_entity` defaults to the `WANDB_ENTITY` environment variable (set it in `.env`). No need to run `wandb login` separately if `WANDB_API_KEY` is in `.env`.
 - The sentence splitting in the training scripts is simple and may be suboptimal for publication-grade experiments; replace it with a more robust sentence splitter if needed.
