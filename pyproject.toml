@@ -15,7 +15,7 @@ build-backend = "setuptools.build_meta"
     "tiktoken",
     "sonar-space",
     "datasets",
-    "numpy",
+    "numpy>=1.26.0",
     "tqdm",
     "indic-nlp-library>=0.92",
     "sacrebleu>=2.5.1",
