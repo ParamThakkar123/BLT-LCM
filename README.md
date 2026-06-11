@@ -155,3 +155,58 @@ print(avg)
 - COMET metric requires a COMET model name or local checkpoint and the `comet` package; if not available COMET scores will be NaN and a warning is printed.
 - W&B integration is implemented: call training scripts with `--wandb` and set `--wandb_project`/`--wandb_name` as needed. `--wandb_entity` defaults to the `WANDB_ENTITY` environment variable (set it in `.env`). No need to run `wandb login` separately if `WANDB_API_KEY` is in `.env`.
 - The sentence splitting in the training scripts is simple and may be suboptimal for publication-grade experiments; replace it with a more robust sentence splitter if needed.
+
+## BhashaSetu baseline training and noisy benchmarking
+
+The repository now includes end-to-end scripts for the requested BhashaSetu subset experiments. Each script trains on a deterministic shuffled fraction of `ParamTh/BhashaSetu` and writes BLEU, chrF++ and TER results for clean, 10% noisy and 20% noisy inputs.
+
+### One-command benchmark sweep
+
+Run all three baselines on 25%, 50% and 80% of the dataset:
+
+```bash
+uv run lcm_scripts/benchmark_bhashasetu_models.py \
+  --models bpe_transformer bpe_llama8b sonar_lcm \
+  --fractions 0.25 0.50 0.80 \
+  --noise_levels 0.0 0.10 0.20 \
+  --epochs 1 \
+  --out_dir runs/bhashasetu_benchmarks
+```
+
+The orchestrator creates one metrics CSV per model/fraction and a combined `runs/bhashasetu_benchmarks/summary_metrics.csv` with columns `model`, `fraction`, `noise`, `BLEU`, `chrF++` and `TER`.
+
+### Individual baselines
+
+- **BPE + Transformer** trains a SentencePiece BPE tokenizer and a PyTorch encoder-decoder Transformer from scratch:
+
+  ```bash
+  uv run lcm_scripts/train_bpe_transformer.py \
+    --fraction 0.25 \
+    --epochs 3 \
+    --noise_levels 0.0 0.10 0.20 \
+    --out_dir runs/bpe_transformer_25
+  ```
+
+- **BPE + Llama 8B** fine-tunes a Llama-family 8B causal LM with LoRA/QLoRA and evaluates generated translations:
+
+  ```bash
+  uv run lcm_scripts/train_bpe_llama8b.py \
+    --model_name meta-llama/Meta-Llama-3-8B-Instruct \
+    --fraction 0.25 \
+    --qlora \
+    --epochs 1 \
+    --noise_levels 0.0 0.10 0.20 \
+    --out_dir runs/bpe_llama8b_25
+  ```
+
+- **SONAR embedding + LCM baseline** encodes Marathi sentence documents with the SONAR-like loader, trains `BaseLCM`, decodes with nearest-neighbor retrieval and computes the same metrics:
+
+  ```bash
+  uv run lcm_scripts/train_lcm_sonar.py \
+    --fraction 0.25 \
+    --epochs 2 \
+    --noise_levels 0.0 0.10 0.20 \
+    --out_dir runs/lcm_sonar_25
+  ```
+
+If your local BhashaSetu export uses non-default parallel column names, pass `--src_col` and `--tgt_col` to the BPE scripts or the benchmark orchestrator.
