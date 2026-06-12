@@ -115,10 +115,11 @@
 - [ ]  **Noisy input evaluation on BLT-LCM** *(Anushka)*
     - [ ]  Run Day 4 noisy test set through Phase 2 model
     - [ ]  Plot Phase 1 vs. Phase 2 degradation curves on same graph
-- [ ]  **Fertility vs. gain scatter plot** *(Anushka)*
-    - [ ]  X-axis: fertility λ per morpheme class (from Day 1)
-    - [ ]  Y-axis: Δ chrF++ (Phase 2 minus Phase 1) per morpheme class
-    - [ ]  If high-fertility classes show larger gains → theoretical bound is empirically validated
+- [x]  **Fertility vs. gain scatter plot** *(Anushka)*
+    - [x]  X-axis: fertility λ per morpheme class (from Day 1)
+    - [x]  Y-axis: Δ chrF++ (Phase 2 minus Phase 1) per morpheme class
+    - [x]  If high-fertility classes show larger gains → theoretical bound is empirically validated
+    - [x]  Implemented via `lcm_scripts/fertility_chrf_scatter.py`, which joins `fertility_by_class_detail.jsonl` sentence classes to BPE/BLT hypothesis files, writes `results/fertility_chrf_delta_by_class.csv`, plots `results/fertility_chrf_delta_scatter.png`, and reports the empirical bound diagnostic `E(BLT) ≤ λ^-α·E(BPE)`.
 - [ ]  **Inference latency comparison** *(Param)*
     - [ ]  Time 500 inference calls on Phase 1 model → sentences/sec + peak VRAM
     - [ ]  Time 500 inference calls on Phase 2 model → sentences/sec + peak VRAM

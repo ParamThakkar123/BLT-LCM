@@ -159,13 +159,36 @@ Options for fine-tuning:
 uv run lcm_scripts/eval_runner.py --hyp_file outputs/hyp.txt --ref_file outputs/ref.txt --out_csv results/eval_results.csv --seeds 42 43 44 --noisy_probs 0.0 0.1 0.2
 ```
 
-5) Fertility audit (example interactive usage):
+5) Fertility audit and fertility-vs-Δ chrF++ scatter plot
 
-```py
-from lcm_scripts.fertility_audit import compute_fertility
-avg, counts = compute_fertility(open('data/sentences.txt').read().splitlines())
-print(avg)
+Run the fertility audit first to create the per-class fertility summary and word-level sentence/class detail files:
+
+```bash
+uv run lcm_scripts/fertility_audit.py
 ```
+
+Then generate the Day 6 fertility-vs-gain table and scatter plot. The BPE-LCM, BLT-LCM, and reference files must be aligned one sentence per line, and their line order must match the sentence IDs in `results/fertility_by_class_detail.jsonl`.
+
+```bash
+uv run lcm_scripts/fertility_chrf_scatter.py \
+  --fertility_json results/fertility_by_class.json \
+  --fertility_detail_jsonl results/fertility_by_class_detail.jsonl \
+  --bpe_hyp_file outputs/bpe_lcm.hyp.txt \
+  --blt_hyp_file outputs/blt_lcm.hyp.txt \
+  --ref_file outputs/ref.txt \
+  --out_csv results/fertility_chrf_delta_by_class.csv \
+  --out_plot results/fertility_chrf_delta_scatter.png
+```
+
+This writes:
+
+- `results/fertility_chrf_delta_by_class.csv` — per morpheme class λ, BPE-LCM chrF++, BLT-LCM chrF++, Δ chrF++, chrF error ratio, and the empirical bound diagnostic.
+- `results/fertility_chrf_delta_scatter.png` — scatter plot with λ on the x-axis and BLT-LCM minus BPE-LCM Δ chrF++ on the y-axis.
+
+Optional flags:
+
+- `--include_other` adds the catch-all `other` morpheme class to the CSV and plot.
+- `--bound_exponent 0.5` changes α in the bound diagnostic `E(BLT) ≤ λ^-α · E(BPE)`; the default is `1.0`.
 
 ## Notes and caveats
 
