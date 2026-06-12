@@ -21,6 +21,7 @@ matplotlib.rcParams.update({
 })
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
 DATA_PATH = os.path.join(SCRIPT_DIR, "all_sentences_scores.jsonl")
 
 MODEL_NAMES = [
@@ -49,7 +50,6 @@ if not os.path.exists(DATA_PATH):
         compute_entropies_for_tokens, entropy_patch_sentence, DEFAULT_THRESHOLD,
     )
 
-    PROJECT_ROOT = os.path.join(SCRIPT_DIR, "..")
     REPO_ROOT = os.path.join(PROJECT_ROOT, "..")
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -340,6 +340,50 @@ plt.savefig(os.path.join(SCRIPT_DIR, "cmp8_fertility_boxplot.png"))
 plt.close()
 print("Saved cmp8_fertility_boxplot.png")
 
+# =====================================================================
+# FIGURE 9: Patch Compression Ratio by Morpheme Class
+# =====================================================================
+morpheme_detail_path = os.path.join(PROJECT_ROOT, "results", "fertility_by_class_detail.jsonl")
+if os.path.exists(morpheme_detail_path):
+    if PROJECT_ROOT not in sys.path:
+        sys.path.insert(0, PROJECT_ROOT)
+
+    from tokenization_statistics.patch_compression_by_morpheme_class import (
+        build_analysis,
+        load_sentence_classes,
+        plot_class_comparison,
+        write_sentence_csv,
+    )
+
+    score_records = {
+        int(r["idx"]): {
+            "sentence_id": int(r["idx"]),
+            "text": r.get("marathi_text", ""),
+            "blt_patches": int(r["patches_blt"]),
+            "bpe_tokens": int(r["tok_ret"]),
+            "num_bytes": int(r["n_bytes"]),
+        }
+        for r in records
+    }
+    sentence_classes = load_sentence_classes(morpheme_detail_path)
+    sentence_rows, class_summary = build_analysis(score_records, sentence_classes)
+    class_summary["inputs"] = {
+        "blt_or_scores_source": DATA_PATH,
+        "bpe_source": f"{DATA_PATH}:tok_ret",
+        "morpheme_detail": morpheme_detail_path,
+    }
+
+    cmp9_csv = os.path.join(SCRIPT_DIR, "cmp9_patch_bpe_sentence_comparison.csv")
+    cmp9_json = os.path.join(SCRIPT_DIR, "cmp9_patch_compression_by_morpheme_class.json")
+    cmp9_png = os.path.join(SCRIPT_DIR, "cmp9_patch_compression_by_morpheme_class.png")
+    write_sentence_csv(sentence_rows, cmp9_csv)
+    with open(cmp9_json, "w", encoding="utf-8") as f:
+        json.dump(class_summary, f, indent=2, ensure_ascii=False)
+    plot_class_comparison(class_summary, cmp9_png)
+    print("Saved cmp9_patch_compression_by_morpheme_class.png")
+else:
+    print(f"Skipping Figure 9: morpheme detail file not found at {morpheme_detail_path}")
+
 # ── Print summary table ──────────────────────────────────────
 print("\n" + "=" * 70)
 print("MODEL COMPARISON SUMMARY (50K sentences)")
@@ -354,4 +398,4 @@ print(f"{'% sentences fertility ≤ 1.0':<30} {100*(fert_aug<=1.0).mean():>11.1f
 print(f"{'Best on N sentences':<30} {best_aug:>12,} {best_ret:>12,} {best_blt:>12,}")
 print(f"{'Tied':<30} {tied:>12,}")
 print("=" * 70)
-print("\nAll 8 comparison figures saved.")
+print("\nAll comparison figures saved.")
