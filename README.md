@@ -74,6 +74,31 @@ uv pip install -e ".[test]"
 pytest tests/
 ```
 
+
+## Tokenization and Statistics
+
+### Patch compression ratio by morpheme class
+
+Use `tokenization_statistics/patch_compression_by_morpheme_class.py` to compare per-sentence BLT patch counts with BPE token counts, then aggregate the comparison by morpheme class from the fertility audit detail file. The script writes a per-sentence CSV, a summary JSON, and a publication-ready PNG.
+
+With a BLT patch JSONL and tokenizer file:
+
+```bash
+python tokenization_statistics/patch_compression_by_morpheme_class.py \
+  --blt-jsonl blt_marathi_patched.jsonl \
+  --morpheme-detail results/fertility_by_class_detail.jsonl \
+  --bpe-tokenizer ../Tokeniser_Retrained/tokenizer.json
+```
+
+With the existing model-comparison scores file:
+
+```bash
+python tokenization_statistics/patch_compression_by_morpheme_class.py \
+  --scores-jsonl error_analysis/all_sentences_scores.jsonl \
+  --morpheme-detail results/fertility_by_class_detail.jsonl \
+  --bpe-column tok_ret
+```
+
 ## Important files / scripts
 
 - `lcm_scripts/train_sonar.py` — pretrain SONAR-lite (denoising AE + MSE bottleneck distillation). Supports `--wandb` logging. Streams sentences from `ParamTh/BhashaSetu` by default.
