@@ -67,6 +67,29 @@ uv run scripts/download_dataset.py
 
 If you want to use your own data, pass `--data_path` to the training scripts.
 
+### Cross-script sanity-check dataset
+
+For the 100-sentence second-script sanity check, extract a small Hindi corpus (Devanagari, non-Latin) from Hugging Face:
+
+```bash
+python scripts/extract_cross_script_dataset.py \
+  --language hindi \
+  --limit 100 \
+  --output data/cross_script/hindi_sentences_100.json
+```
+
+A checked-in 100-sentence seed file is available at `data/cross_script/hindi_sentences_100.json` for offline runs. The script streams `cfilt/iitb-english-hindi` by default and writes a compact JSON list suitable for rerunning entropy patching as a cross-script smoke test. It also supports Tamil if a Tamil dataset/config and column are supplied. To re-copy or filter the checked-in seed file without network access, pass `--source-file data/cross_script/hindi_sentences_100.json --text-column text`.
+
+Run the Hindi entropy-boundary alignment sanity check and compare its best F1 to the documented Marathi reference (tau=1.0, F1=0.6341):
+
+```bash
+python scripts/run_cross_script_alignment.py \
+  --input data/cross_script/hindi_sentences_100.json \
+  --output results/cross_script_hindi_alignment_results.json
+```
+
+The current checked-in result is `results/cross_script_hindi_alignment_results.json`: Hindi best F1 is 0.7625 at tau=1.5, compared with the documented Marathi reference F1 of 0.6341. It should be described as a cross-script sanity check only because Hindi boundaries are generated with a deterministic word/suffix heuristic, not a manually annotated Hindi morpheme benchmark.
+
 ## Testing
 
 ```bash

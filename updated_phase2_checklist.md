@@ -61,6 +61,13 @@
 
 ---
 
+
+- [x]  **Cross-script sanity-check dataset for Hindi** *(Param)*
+    - [x]  Added `scripts/extract_cross_script_dataset.py` to stream 100 Hindi sentences from `cfilt/iitb-english-hindi`.
+    - [x]  Default output: `data/cross_script/hindi_sentences_100.json`, suitable for rerunning entropy patching on a second non-Latin script.
+    - [x]  Ran entropy patching/alignment on the extracted Hindi corpus with `scripts/run_cross_script_alignment.py` and saved `results/cross_script_hindi_alignment_results.json`.
+    - [x]  Compared Hindi best F1 against the documented Marathi reference (tau=1.0, F1=0.6341); keep language as cross-script sanity evidence, not a full script-agnostic claim, until real Hindi morpheme annotations are available.
+
 ## 🔴 Day 4 — Monitor Training + Run Ablations
 
 > Owner focus: Param (training) · Anushka (ablation + noisy test)
