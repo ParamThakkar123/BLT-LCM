@@ -56,6 +56,34 @@ Required variables in `.env`:
 
 All training scripts load `.env` automatically at startup.
 
+Scripts that use Indic NLP morphology (for example `lcm_scripts/fertility_audit.py`) also require the external Indic NLP resource files. Download the resources once and set `INDIC_RESOURCES_PATH` before running those scripts.
+
+On Linux/macOS or Git Bash, from the repository root:
+
+```bash
+git clone https://github.com/anoopkunchukuttan/indic_nlp_resources.git
+export INDIC_RESOURCES_PATH="$PWD/indic_nlp_resources"
+uv run lcm_scripts/fertility_audit.py
+```
+
+On Windows PowerShell, from the repository root:
+
+```powershell
+git clone https://github.com/anoopkunchukuttan/indic_nlp_resources.git
+$env:INDIC_RESOURCES_PATH = "$PWD\indic_nlp_resources"
+uv run lcm_scripts/fertility_audit.py
+```
+
+After the variable is set, the other morphology scripts can be run the same way:
+
+```bash
+uv run morpheme_alignment/morpheme_boundary_alignment.py
+uv run fixed_chunk_ablation/fixed_chunk_ablation.py
+uv run sweep_threshold/sweep_entropy_threshold.py
+```
+
+If `INDIC_RESOURCES_PATH` is not set, these scripts look for `./indic_nlp_resources`, `./resources/indic_nlp_resources`, and `~/indic_nlp_resources` before trying the legacy `D:/phase2/indic_nlp_resources` path.
+
 ## Dataset
 
 The training scripts use the Hugging Face dataset `ParamTh/BhashaSetu` (2,170,000 Marathi sentences, train split).
