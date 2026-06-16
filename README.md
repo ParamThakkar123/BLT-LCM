@@ -19,7 +19,7 @@ cd BLT-LCM
 2. Install with [uv](https://github.com/astral-sh/uv) (recommended):
 
 ```bash
-uv venv
+uv venv --python 3.12
 source .venv/bin/activate
 uv pip install -e .
 ```
@@ -27,10 +27,14 @@ uv pip install -e .
 Or with plain pip:
 
 ```bash
-python -m venv .venv
+python3.12 -m venv .venv
 source .venv/bin/activate  # Windows: .venv\Scripts\activate
 pip install -e .
 ```
+
+This project currently supports Python 3.10 through 3.12. On Windows,
+using Python 3.13 can force some dependencies such as NumPy 1.x to build
+from source and fail if the Microsoft C++ build tools are not available.
 
 ## Environment setup
 
