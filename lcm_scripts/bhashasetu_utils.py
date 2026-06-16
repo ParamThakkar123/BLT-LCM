@@ -169,12 +169,11 @@ def load_bhashasetu_documents(
     dataset_name: str = DEFAULT_DATASET,
     split: str = "train",
     fraction: float = 1.0,
-    num_docs: int = 500,
     max_sent_per_doc: int = 20,
     text_col: str = "marathi",
     seed: int = 42,
 ) -> list[list[str]]:
-    """Load Marathi sentence documents for SONAR/LCM next-sentence training."""
+    """Load a deterministic fraction of Marathi sentence documents for LCM training."""
 
     from datasets import load_dataset
 
@@ -192,9 +191,7 @@ def load_bhashasetu_documents(
         while len(buf) >= max_sent_per_doc:
             docs.append(buf[:max_sent_per_doc])
             buf = buf[max_sent_per_doc:]
-            if len(docs) >= num_docs:
-                return docs
-    if len(buf) >= 2 and len(docs) < num_docs:
+    if len(buf) >= 2:
         docs.append(buf[:max_sent_per_doc])
     return docs
 
@@ -206,3 +203,15 @@ def write_parallel_text(pairs: Sequence[ParallelExample], src_path: str, tgt_pat
         for ex in pairs:
             src_f.write(ex.source.replace("\n", " ") + "\n")
             tgt_f.write(ex.target.replace("\n", " ") + "\n")
+
+
+def split_train_eval_documents(
+    docs: list[list[str]], eval_docs: int
+) -> tuple[list[list[str]], list[list[str]]]:
+    """Split fraction-selected documents into training and evaluation sets."""
+
+    if eval_docs <= 0 or len(docs) <= eval_docs:
+        return docs, docs
+    train_docs = docs[:-eval_docs]
+    eval_split = docs[-eval_docs:]
+    return train_docs, eval_split

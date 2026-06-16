@@ -43,7 +43,6 @@ def main():
     p.add_argument("--out_dir", default="runs/bhashasetu_benchmarks")
     p.add_argument("--max_examples", type=int, default=None)
     p.add_argument("--eval_examples", type=int, default=1000)
-    p.add_argument("--num_docs", type=int, default=500)
     p.add_argument("--eval_docs", type=int, default=100)
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--src_col", default=None)
@@ -79,7 +78,7 @@ def main():
 
         if "bpe_lcm" in args.models:
             run_dir = out_dir / f"bpe_lcm_{frac_tag}"
-            cmd = [py, str(SCRIPT_DIR / "train_lcm_bpe.py"), "--fraction", str(frac), "--epochs", str(args.epochs), "--num_docs", str(args.num_docs), "--eval_docs", str(args.eval_docs), "--out_dir", str(run_dir), "--noise_levels", *common_noise, *device_cols]
+            cmd = [py, str(SCRIPT_DIR / "train_lcm_bpe.py"), "--fraction", str(frac), "--epochs", str(args.epochs), "--eval_docs", str(args.eval_docs), "--out_dir", str(run_dir), "--noise_levels", *common_noise, *device_cols]
             run(cmd, args.dry_run)
             all_rows.extend(read_metrics(run_dir / f"metrics_fraction{frac}.csv"))
 
@@ -93,7 +92,7 @@ def main():
 
         if "sonar_lcm" in args.models:
             run_dir = out_dir / f"sonar_lcm_{frac_tag}"
-            cmd = [py, str(SCRIPT_DIR / "train_lcm_sonar.py"), "--fraction", str(frac), "--epochs", str(args.epochs), "--num_docs", str(args.num_docs), "--eval_docs", str(args.eval_docs), "--out_dir", str(run_dir), "--noise_levels", *common_noise, *device_cols]
+            cmd = [py, str(SCRIPT_DIR / "train_lcm_sonar.py"), "--fraction", str(frac), "--epochs", str(args.epochs), "--eval_docs", str(args.eval_docs), "--out_dir", str(run_dir), "--noise_levels", *common_noise, *device_cols]
             run(cmd, args.dry_run)
             all_rows.extend(read_metrics(run_dir / f"metrics_fraction{frac}.csv"))
 

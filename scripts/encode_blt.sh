@@ -34,7 +34,6 @@ START=$(date +%s)
 uv run lcm_scripts/train_lcm_blt.py \
     --entropy_model patching_scratch/entropy_model_marathi.pt \
     --fraction "$FRACTION" \
-    --num_docs 999999999 \
     --epochs 0 \
     --batch_size 8 \
     --embed_cache "embeddings/${CACHE_NAME}"
