@@ -1,0 +1,2 @@
+language,script,num_sentences,threshold,mean_precision_tol2,mean_recall_tol2,mean_f1_tol2,mean_patches_per_sentence,mean_proxy_boundaries_per_sentence
+Hindi,Devanagari,100,1.335442066192627,0.5480952380952381,0.2961616161616162,0.37767884076707603,4.8,9.6
