@@ -15,9 +15,10 @@ import csv
 from collections import defaultdict, Counter
 
 # For morpheme boundary evaluation on a small sample
-from indicnlp import common
-common.set_resources_path("D:/phase2/indic_nlp_resources")
+from lcm_scripts.indic_resources import configure_indic_resources
 from indicnlp import loader
+
+configure_indic_resources()
 loader.load()
 from indicnlp.tokenize.indic_tokenize import trivial_tokenize
 from indicnlp.morph.unsupervised_morph import UnsupervisedMorphAnalyzer

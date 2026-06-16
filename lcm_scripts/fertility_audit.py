@@ -29,9 +29,10 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 
 # ── Indic NLP setup ──────────────────────────────────────────────────────────
 
-from indicnlp import common
-common.set_resources_path("D:/phase2/indic_nlp_resources")
+from lcm_scripts.indic_resources import configure_indic_resources
 from indicnlp import loader
+
+configure_indic_resources()
 loader.load()
 from indicnlp.morph.unsupervised_morph import UnsupervisedMorphAnalyzer
 
