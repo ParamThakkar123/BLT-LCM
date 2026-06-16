@@ -12,6 +12,28 @@ Artifacts:
   proxy boundaries, and boundary precision/recall/F1 using a ±2 byte tolerance.
 - `hindi_entropy_sanity_summary.csv` — aggregate metrics for the 100-sentence run.
 
+
+## How to run
+
+From the repository root, run:
+
+```bash
+python cross_script_sanity/hindi_entropy_sanity.py --num_sentences 100 --device cpu
+```
+
+The script defaults to `patching_scratch/entropy_model_marathi.pt`, the BLT default entropy threshold, and `cross_script_sanity/` as the output directory. If CUDA is available, you can omit `--device cpu` or pass `--device cuda` for a faster run. To write outputs elsewhere or use a different checkpoint, run:
+
+```bash
+python cross_script_sanity/hindi_entropy_sanity.py \
+  --model patching_scratch/entropy_model_marathi.pt \
+  --threshold 1.335442066192627 \
+  --num_sentences 100 \
+  --output_dir cross_script_sanity \
+  --device cpu
+```
+
+Expected outputs are `hindi_entropy_sanity.jsonl` and `hindi_entropy_sanity_summary.csv` in the chosen output directory.
+
 Current 100-sentence result with `patching_scratch/entropy_model_marathi.pt` and
 BLT default threshold `1.335442066192627`:
 
