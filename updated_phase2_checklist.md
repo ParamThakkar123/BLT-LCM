@@ -40,6 +40,11 @@
     - [x]  Implement sweep for τ ∈ {0.5, 1.0, 1.5, 2.0, 2.5}
     - [x]  Verify script runs end-to-end without errors
     - [x]  Record number of patches produced per sentence at each τ
+- [x]  **Cross-script sanity check on a second non-Latin script** *(Param)*
+    - [x]  Ran the Marathi-trained entropy patcher on 100 Hindi (Devanagari) sentences via `cross_script_sanity/hindi_entropy_sanity.py`
+    - [x]  Saved per-sentence patch boundaries and proxy boundary F1 to `cross_script_sanity/hindi_entropy_sanity.jsonl`
+    - [x]  Recorded summary evidence in `cross_script_sanity/hindi_entropy_sanity_summary.csv`: mean boundary F1@±2 bytes = 0.378, precision = 0.548, recall = 0.296
+    - *Interpretation: preliminary second-script evidence supports a cautious script-agnostic sanity claim, but the proxy Hindi boundaries are lightweight and should not be framed as full gold morphological evaluation.*
 
 ---
 
