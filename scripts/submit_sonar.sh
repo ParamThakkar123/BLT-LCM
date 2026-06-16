@@ -18,6 +18,10 @@
 
 FRACTION=${1:-0.25}
 RUN_NAME=${2:-"lcm_sonar_$(echo $FRACTION | tr -d '.')"}
+TIME_LIMIT=${3:-""}
+if [ -n "$TIME_LIMIT" ]; then
+    echo "Requested time limit argument: $TIME_LIMIT (set #SBATCH --time before submission if your scheduler does not allow runtime changes)."
+fi
 
 REPO_DIR=/mnt/lustre/home/gehler/gfh098/dev/BLT-LCM
 cd "$REPO_DIR"

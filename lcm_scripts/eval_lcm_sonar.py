@@ -1,0 +1,143 @@
+"""Evaluate an existing SONAR-embedding + BaseLCM checkpoint on BhashaSetu.
+
+This script fills the gap where a SONAR-LCM training run produced checkpoints or
+TensorBoard logs but no metrics CSV. It rebuilds the deterministic BhashaSetu
+document split used by ``train_lcm_sonar.py``, loads one checkpoint, decodes next
+sentence predictions by nearest-neighbor retrieval, and writes BLEU, chrF++ and
+TER for the requested clean/noisy settings.
+
+Example:
+  uv run lcm_scripts/eval_lcm_sonar.py \
+    --checkpoint runs/lcm_sonar/lcm_sonar_fraction0.25_epoch2.pth \
+    --fraction 0.25 \
+    --num_docs 500 \
+    --eval_docs 100 \
+    --noise_levels 0.0 0.10 0.20 \
+    --out_csv runs/lcm_sonar/metrics_fraction0.25.csv
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import os
+import sys
+from pathlib import Path
+
+sys.path.append(os.path.dirname(__file__))
+
+import torch
+from tqdm import tqdm
+
+from base_lcm import BaseLCM
+from bhashasetu_utils import (
+    DEFAULT_DATASET,
+    DEFAULT_NOISE_LEVELS,
+    add_character_noise,
+    load_bhashasetu_documents,
+)
+from embedding_retriever import EmbeddingRetriever
+from eval_metrics import compute_bleu, compute_chrf, compute_ter
+from sonar_loader import SonarLoader
+from train_lcm_sonar import encode_docs
+
+
+def evaluate(model, docs, encoder, retriever, args, noise: float, device) -> dict[str, float | int]:
+    hyps, refs = [], []
+    model.eval()
+    for doc_idx, doc in enumerate(tqdm(docs, desc=f"eval noise={noise:.2f}")):
+        if len(doc) < args.min_prefix + 1:
+            continue
+        noisy_doc = (
+            [add_character_noise(s, noise, seed=doc_idx * 1000 + i) for i, s in enumerate(doc)]
+            if noise
+            else doc
+        )
+        embs = encoder.encode_sentences(noisy_doc).detach().cpu()
+        for i in range(args.min_prefix, len(doc)):
+            with torch.no_grad():
+                pred = model(embs[:i].unsqueeze(0).to(device))
+            if pred.dim() == 1:
+                pred = pred.unsqueeze(0)
+            hyps.append(retriever.retrieve(pred)[0])
+            refs.append(doc[i])
+    return {
+        "num_predictions": len(hyps),
+        "BLEU": compute_bleu(hyps, refs),
+        "chrF++": compute_chrf(hyps, refs),
+        "TER": compute_ter(hyps, refs),
+    }
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="Evaluate an existing SONAR-LCM checkpoint")
+    p.add_argument("--checkpoint", required=True, help="Path to lcm_sonar_*.pth checkpoint")
+    p.add_argument("--dataset", default=DEFAULT_DATASET)
+    p.add_argument("--split", default="train")
+    p.add_argument("--fraction", type=float, required=True)
+    p.add_argument("--num_docs", type=int, default=500)
+    p.add_argument("--eval_docs", type=int, default=100)
+    p.add_argument("--max_sent_per_doc", type=int, default=20)
+    p.add_argument("--text_col", default="marathi")
+    p.add_argument("--encode_batch_size", type=int, default=64)
+    p.add_argument("--model_dim", type=int, default=2048)
+    p.add_argument("--n_layers", type=int, default=12)
+    p.add_argument("--n_heads", type=int, default=16)
+    p.add_argument("--min_prefix", type=int, default=2)
+    p.add_argument("--noise_levels", type=float, nargs="+", default=list(DEFAULT_NOISE_LEVELS))
+    p.add_argument("--out_csv", default=None)
+    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    args = p.parse_args()
+
+    device = torch.device(args.device)
+    docs = load_bhashasetu_documents(
+        args.dataset,
+        args.split,
+        args.fraction,
+        args.num_docs + args.eval_docs,
+        args.max_sent_per_doc,
+        args.text_col,
+    )
+    train_docs = docs[: args.num_docs]
+    eval_docs = docs[args.num_docs : args.num_docs + args.eval_docs] or train_docs[: min(args.eval_docs, len(train_docs))]
+    if not train_docs or not eval_docs:
+        raise RuntimeError("No BhashaSetu documents available for SONAR-LCM evaluation")
+
+    encoder = SonarLoader(device=str(device))
+    train_seqs = encode_docs(train_docs, encoder, args.encode_batch_size)
+    flat_sents = [s for doc in train_docs for s in doc]
+    flat_embs = torch.cat([s for s in train_seqs if s.shape[0] > 0], dim=0)
+    retriever = EmbeddingRetriever(flat_sents, flat_embs)
+
+    embed_dim = train_seqs[0].shape[1]
+    model = BaseLCM(embed_dim=embed_dim, model_dim=args.model_dim, n_layers=args.n_layers, n_heads=args.n_heads).to(device)
+    state = torch.load(args.checkpoint, map_location=device)
+    model.load_state_dict(state)
+
+    rows = []
+    for noise in args.noise_levels:
+        metrics = evaluate(model, eval_docs, encoder, retriever, args, noise, device)
+        row = {
+            "model": "sonar_lcm",
+            "fraction": args.fraction,
+            "noise": noise,
+            "checkpoint": os.path.basename(args.checkpoint),
+            **metrics,
+        }
+        rows.append(row)
+        print(row)
+
+    out_csv = args.out_csv or str(Path(args.checkpoint).with_name(f"metrics_fraction{args.fraction}.csv"))
+    os.makedirs(os.path.dirname(out_csv) or ".", exist_ok=True)
+    with open(out_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=["model", "fraction", "noise", "checkpoint", "num_predictions", "BLEU", "chrF++", "TER"],
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"Wrote {out_csv}")
+
+
+if __name__ == "__main__":
+    main()

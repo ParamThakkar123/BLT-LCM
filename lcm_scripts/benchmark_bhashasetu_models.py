@@ -36,8 +36,8 @@ def read_metrics(path: Path) -> list[dict[str, str]]:
 
 
 def main():
-    p = argparse.ArgumentParser(description="Benchmark BPE Transformer, BPE Llama-8B and SONAR-LCM on BhashaSetu")
-    p.add_argument("--models", nargs="+", default=["bpe_transformer", "bpe_llama8b", "sonar_lcm"], choices=["bpe_transformer", "bpe_llama8b", "sonar_lcm"])
+    p = argparse.ArgumentParser(description="Benchmark BPE Transformer, BPE-LCM, BPE Llama-8B and SONAR-LCM on BhashaSetu")
+    p.add_argument("--models", nargs="+", default=["bpe_transformer", "bpe_lcm", "bpe_llama8b", "sonar_lcm"], choices=["bpe_transformer", "bpe_lcm", "bpe_llama8b", "sonar_lcm"])
     p.add_argument("--fractions", type=float, nargs="+", default=list(DEFAULT_FRACTIONS))
     p.add_argument("--noise_levels", type=float, nargs="+", default=list(DEFAULT_NOISE_LEVELS))
     p.add_argument("--out_dir", default="runs/bhashasetu_benchmarks")
@@ -74,6 +74,12 @@ def main():
         if "bpe_transformer" in args.models:
             run_dir = out_dir / f"bpe_transformer_{frac_tag}"
             cmd = [py, str(SCRIPT_DIR / "train_bpe_transformer.py"), "--fraction", str(frac), "--epochs", str(args.epochs), "--eval_examples", str(args.eval_examples), "--out_dir", str(run_dir), "--noise_levels", *common_noise, *data_cols, *device_cols]
+            run(cmd, args.dry_run)
+            all_rows.extend(read_metrics(run_dir / f"metrics_fraction{frac}.csv"))
+
+        if "bpe_lcm" in args.models:
+            run_dir = out_dir / f"bpe_lcm_{frac_tag}"
+            cmd = [py, str(SCRIPT_DIR / "train_lcm_bpe.py"), "--fraction", str(frac), "--epochs", str(args.epochs), "--num_docs", str(args.num_docs), "--eval_docs", str(args.eval_docs), "--out_dir", str(run_dir), "--noise_levels", *common_noise, *device_cols]
             run(cmd, args.dry_run)
             all_rows.extend(read_metrics(run_dir / f"metrics_fraction{frac}.csv"))
 

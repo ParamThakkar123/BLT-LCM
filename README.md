@@ -260,11 +260,11 @@ The repository now includes end-to-end scripts for the requested BhashaSetu subs
 
 ### One-command benchmark sweep
 
-Run all three baselines on 25%, 50% and 80% of the dataset:
+Run the BPE Transformer, BPE-LCM, BPE Llama 8B, and SONAR-LCM baselines on 25%, 50% and 80% of the dataset:
 
 ```bash
 uv run lcm_scripts/benchmark_bhashasetu_models.py \
-  --models bpe_transformer bpe_llama8b sonar_lcm \
+  --models bpe_transformer bpe_lcm bpe_llama8b sonar_lcm \
   --fractions 0.25 0.50 0.80 \
   --noise_levels 0.0 0.10 0.20 \
   --epochs 1 \
@@ -283,6 +283,23 @@ The orchestrator creates one metrics CSV per model/fraction and a combined `runs
     --epochs 3 \
     --noise_levels 0.0 0.10 0.20 \
     --out_dir runs/bpe_transformer_25
+  ```
+
+
+- **BPE + LCM baseline** trains a SentencePiece BPE tokenizer, mean-pools learned BPE token embeddings into sentence vectors, trains `BaseLCM` for next-sentence embedding prediction, and decodes with nearest-neighbor retrieval:
+
+  ```bash
+  uv run lcm_scripts/train_lcm_bpe.py \
+    --fraction 0.25 \
+    --epochs 2 \
+    --noise_levels 0.0 0.10 0.20 \
+    --out_dir runs/lcm_bpe_25
+  ```
+
+  Slurm/W&B launcher:
+
+  ```bash
+  sbatch scripts/submit_bpe_lcm.sh 0.25 lcm_bpe_25
   ```
 
 - **BPE + Llama 8B** fine-tunes a Llama-family 8B causal LM with LoRA/QLoRA and evaluates generated translations:
@@ -307,4 +324,39 @@ The orchestrator creates one metrics CSV per model/fraction and a combined `runs
     --out_dir runs/lcm_sonar_25
   ```
 
-If your local BhashaSetu export uses non-default parallel column names, pass `--src_col` and `--tgt_col` to the BPE scripts or the benchmark orchestrator.
+If your local BhashaSetu export uses non-default parallel column names, pass `--src_col` and `--tgt_col` to the parallel-text BPE scripts or the benchmark orchestrator.
+
+### Recover SONAR-LCM baseline metrics from an existing checkpoint
+
+If a SONAR-LCM run produced checkpoints or TensorBoard event files but did not write a metrics CSV, evaluate the saved checkpoint directly. Use the same fraction, document counts and model dimensions that were used during training so the deterministic BhashaSetu split and `BaseLCM` shape match the checkpoint.
+
+```bash
+uv run lcm_scripts/eval_lcm_sonar.py \
+  --checkpoint runs/lcm_sonar/lcm_sonar_fraction0.25_epoch1.pth \
+  --fraction 0.25 \
+  --num_docs 500 \
+  --eval_docs 100 \
+  --noise_levels 0.0 0.10 0.20 \
+  --out_csv runs/lcm_sonar/metrics_fraction0.25.csv
+```
+
+The output CSV contains `model`, `fraction`, `noise`, `checkpoint`, `num_predictions`, `BLEU`, `chrF++` and `TER`, which makes the SONAR-LCM baseline comparable to the BPE and BLT-LCM CSVs at the same data fraction.
+
+### Three-way BLT-LCM vs BPE-LCM vs SONAR-LCM comparison
+
+After all per-model CSVs exist for the same fraction, combine just the headline metrics into one comparison table:
+
+```bash
+uv run lcm_scripts/compare_bhashasetu_metrics.py \
+  --inputs \
+    runs/blt_lcm_25/metrics_fraction0.25.csv \
+    runs/lcm_bpe_25/metrics_fraction0.25.csv \
+    runs/lcm_sonar/metrics_fraction0.25.csv \
+  --fraction 0.25 \
+  --models blt_lcm bpe_lcm sonar_lcm \
+  --metrics chrF++ BLEU \
+  --strict \
+  --out_csv results/three_way_lcm_fraction0.25_chrf_bleu.csv
+```
+
+Use `--strict` for the paper table: it fails if any requested model is missing for a noise level, preventing an accidental two-way comparison from being reported as a three-way comparison.

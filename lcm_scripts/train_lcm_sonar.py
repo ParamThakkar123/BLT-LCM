@@ -115,9 +115,33 @@ def main():
     p.add_argument("--n_heads", type=int, default=16)
     p.add_argument("--min_prefix", type=int, default=2)
     p.add_argument("--out_dir", default="runs/lcm_sonar")
+    p.add_argument("--log_dir", default=None, help="Alias for --out_dir used by Slurm/W&B launchers")
+    p.add_argument("--wandb", action="store_true")
+    p.add_argument("--wandb_project", default="BLT-LCM")
+    p.add_argument("--wandb_name", default=None)
+    p.add_argument("--wandb_entity", default=os.environ.get("WANDB_ENTITY"))
     p.add_argument("--noise_levels", type=float, nargs="+", default=list(DEFAULT_NOISE_LEVELS))
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = p.parse_args()
+
+    if args.log_dir and args.out_dir == "runs/lcm_sonar":
+        args.out_dir = args.log_dir
+    if args.log_dir is None:
+        args.log_dir = args.out_dir
+    if args.wandb_name is None:
+        args.wandb_name = os.path.basename(args.out_dir.rstrip(os.sep))
+
+    wandb_run = None
+    if args.wandb:
+        import wandb
+
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=args.wandb_name,
+            dir=args.log_dir,
+            config=vars(args),
+        )
 
     os.makedirs(args.out_dir, exist_ok=True)
     docs = load_bhashasetu_documents(args.dataset, args.split, args.fraction, args.num_docs + args.eval_docs, args.max_sent_per_doc, args.text_col)
@@ -140,6 +164,8 @@ def main():
     for epoch in range(args.epochs):
         loss = train_epoch(model, loader, optim, device)
         print(f"epoch={epoch + 1} train_loss={loss:.4f}")
+        if wandb_run:
+            wandb_run.log({"train/loss": loss, "epoch": epoch + 1})
         torch.save(model.state_dict(), os.path.join(args.out_dir, f"lcm_sonar_fraction{args.fraction}_epoch{epoch + 1}.pth"))
 
     rows = []
@@ -147,11 +173,15 @@ def main():
         metrics = evaluate(model, eval_docs, encoder, retriever, args, noise, device)
         row = {"model": "sonar_lcm", "fraction": args.fraction, "noise": noise, **metrics}
         rows.append(row); print(row)
+        if wandb_run:
+            wandb_run.log({f"eval/{k}_noise_{noise}": v for k, v in metrics.items()})
     out_csv = os.path.join(args.out_dir, f"metrics_fraction{args.fraction}.csv")
     with open(out_csv, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=["model", "fraction", "noise", "BLEU", "chrF++", "TER"])
         writer.writeheader(); writer.writerows(rows)
     print(f"Wrote {out_csv}")
+    if wandb_run:
+        wandb_run.finish()
 
 
 if __name__ == "__main__":
