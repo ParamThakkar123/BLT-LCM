@@ -197,7 +197,7 @@ If you want numeric-sorted cleanup, save-on-interrupt behavior, compression, or 
 
 4) Fine-tune LCM on BLT embeddings — requires a pre-trained checkpoint:
 ```bash
-uv run lcm_scripts/finetune_lcm.py --checkpoint lcm_models/lcm_blt_best.pth --entropy_model patching_scratch/entropy_model_marathi.pt --num_docs 100 --epochs 3 --lr 1e-5 --log_dir runs/lcm_finetune
+uv run lcm_scripts/finetune_lcm.py --checkpoint lcm_models/lcm_blt_best.pth --entropy_model patching_scratch/entropy_model_marathi.pt --fraction 0.25 --epochs 3 --lr 1e-5 --log_dir runs/lcm_finetune
 ```
 Options for fine-tuning:
 - `--freeze_prenet`: Freeze the input projection layers
@@ -328,13 +328,12 @@ If your local BhashaSetu export uses non-default parallel column names, pass `--
 
 ### Recover SONAR-LCM baseline metrics from an existing checkpoint
 
-If a SONAR-LCM run produced checkpoints or TensorBoard event files but did not write a metrics CSV, evaluate the saved checkpoint directly. Use the same fraction, document counts and model dimensions that were used during training so the deterministic BhashaSetu split and `BaseLCM` shape match the checkpoint.
+If a SONAR-LCM run produced checkpoints or TensorBoard event files but did not write a metrics CSV, evaluate the saved checkpoint directly. Use the same fraction and model dimensions that were used during training so the deterministic BhashaSetu split and `BaseLCM` shape match the checkpoint.
 
 ```bash
 uv run lcm_scripts/eval_lcm_sonar.py \
   --checkpoint runs/lcm_sonar/lcm_sonar_fraction0.25_epoch1.pth \
   --fraction 0.25 \
-  --num_docs 500 \
   --eval_docs 100 \
   --noise_levels 0.0 0.10 0.20 \
   --out_csv runs/lcm_sonar/metrics_fraction0.25.csv

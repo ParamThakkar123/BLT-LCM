@@ -10,7 +10,6 @@ Example:
   uv run lcm_scripts/eval_lcm_sonar.py \
     --checkpoint runs/lcm_sonar/lcm_sonar_fraction0.25_epoch2.pth \
     --fraction 0.25 \
-    --num_docs 500 \
     --eval_docs 100 \
     --noise_levels 0.0 0.10 0.20 \
     --out_csv runs/lcm_sonar/metrics_fraction0.25.csv
@@ -35,6 +34,7 @@ from bhashasetu_utils import (
     DEFAULT_NOISE_LEVELS,
     add_character_noise,
     load_bhashasetu_documents,
+    split_train_eval_documents,
 )
 from embedding_retriever import EmbeddingRetriever
 from eval_metrics import compute_bleu, compute_chrf, compute_ter
@@ -75,7 +75,6 @@ def main() -> None:
     p.add_argument("--dataset", default=DEFAULT_DATASET)
     p.add_argument("--split", default="train")
     p.add_argument("--fraction", type=float, required=True)
-    p.add_argument("--num_docs", type=int, default=500)
     p.add_argument("--eval_docs", type=int, default=100)
     p.add_argument("--max_sent_per_doc", type=int, default=20)
     p.add_argument("--text_col", default="marathi")
@@ -94,12 +93,10 @@ def main() -> None:
         args.dataset,
         args.split,
         args.fraction,
-        args.num_docs + args.eval_docs,
         args.max_sent_per_doc,
         args.text_col,
     )
-    train_docs = docs[: args.num_docs]
-    eval_docs = docs[args.num_docs : args.num_docs + args.eval_docs] or train_docs[: min(args.eval_docs, len(train_docs))]
+    train_docs, eval_docs = split_train_eval_documents(docs, args.eval_docs)
     if not train_docs or not eval_docs:
         raise RuntimeError("No BhashaSetu documents available for SONAR-LCM evaluation")
 

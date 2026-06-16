@@ -36,7 +36,6 @@ def main():
     parser.add_argument("--entropy_model", type=str, required=True)
     parser.add_argument("--embed_cache", type=str, default="blt_embeddings_cache.pth")
     parser.add_argument("--fraction", type=float, default=1.0)
-    parser.add_argument("--num_docs", type=int, default=500)
     parser.add_argument("--max_sent_per_doc", type=int, default=20)
     parser.add_argument("--min_prefix", type=int, default=2,
                         help="Minimum prefix sentences before predicting")
@@ -52,9 +51,14 @@ def main():
     device = torch.device(args.device)
 
     # --- Load data ---
-    from train_lcm_blt import prepare_data
+    from bhashasetu_utils import load_bhashasetu_documents
+
     print("Loading documents...")
-    docs = prepare_data(args.num_docs, args.max_sent_per_doc, fraction=args.fraction)
+    docs = load_bhashasetu_documents(
+        fraction=args.fraction,
+        max_sent_per_doc=args.max_sent_per_doc,
+        text_col="marathi",
+    )
     flat_sents = [s for doc in docs for s in doc]
     print(f"Loaded {len(docs)} docs, {len(flat_sents)} total sentences")
 

@@ -18,7 +18,6 @@ import time
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from datasets import load_dataset
 
 from blt_loader import BLTLoader
 from base_lcm import BaseLCM
@@ -27,24 +26,17 @@ from experiment_config import setup_logging
 
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
+PEFT_AVAILABLE = True
 
-def prepare_data(num_docs=500, max_sent_per_doc=20):
-    from datasets import load_dataset
 
-    ds = load_dataset("ParamTh/BhashaSetu", split="train", streaming=True)
-    docs = []
-    cur = 0
-    for row in ds:
-        text = row.get("marathi", "")
-        if text and len(text.strip()) > 5:
-            sents = [s.strip() for s in text.replace("\n", " ").split(".") if s.strip()]
-            if len(sents) > 1:
-                docs.append(sents[:max_sent_per_doc])
-                cur += 1
-        if cur >= num_docs:
-            break
-    return docs
+def prepare_data(fraction=1.0, max_sent_per_doc=20):
+    from bhashasetu_utils import load_bhashasetu_documents
 
+    return load_bhashasetu_documents(
+        fraction=fraction,
+        max_sent_per_doc=max_sent_per_doc,
+        text_col="marathi",
+    )
 
 class EmbeddingDataset(torch.utils.data.Dataset):
     def __init__(self, embeddings_seqs):
@@ -81,10 +73,10 @@ def main():
     )
     parser.add_argument("--entropy_model", type=str, required=True)
     parser.add_argument(
-        "--num_docs",
-        type=int,
-        default=200,
-        help="Number of documents for fine-tuning (smaller than training)",
+        "--fraction",
+        type=float,
+        default=1.0,
+        help="Fraction of BhashaSetu documents for fine-tuning",
     )
     parser.add_argument("--epochs", type=int, default=5, help="Fine-tuning epochs")
     parser.add_argument("--batch_size", type=int, default=8)
@@ -170,7 +162,7 @@ def main():
         )
 
     print("Preparing fine-tuning data list...")
-    docs = prepare_data(args.num_docs)
+    docs = prepare_data(args.fraction)
 
     print("Loading BLT loader...")
     blt = BLTLoader(entropy_model_path=args.entropy_model, device=str(device))
