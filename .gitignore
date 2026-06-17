@@ -19,4 +19,13 @@ evaluation_results.txt
 outputs/
 results/mt_eval_results.csv
 mt_eval_results_*.csv
+nul
+tokenization_statistics\patch_compression_by_morpheme_class.png
+tokenization_statistics\patch_compression_by_morpheme_class.csv
+tokenization_statistics/patch_bpe_sentence_comparison.csv
+Tokeniser_Augmented.zip
+Tokeniser_Retrained.zip
+indic_nlp_resources/
+logs/
+tokenization_statistics/patch_compression_by_morpheme_class.png
 neurips_paper/references.bib

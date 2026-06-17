@@ -22,16 +22,40 @@ import io
 import json
 import os
 import re
+import logging
+import time
+from datetime import datetime, timezone
 from collections import defaultdict
 
 # Fix Windows console encoding
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+
+# ── Logging setup ─────────────────────────────────────────────────────────────
+
+LOG_DIR = os.path.join(os.path.dirname(__file__), "..", "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+log_path = os.path.join(LOG_DIR, "fertility_audit.log")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[
+        logging.FileHandler(log_path, encoding="utf-8"),
+        logging.StreamHandler(sys.stdout),
+    ],
+)
+logger = logging.getLogger("fertility_audit")
+logger.info("=" * 60)
+logger.info("Fertility audit script started")
+logger.info("=" * 60)
 
 # ── Indic NLP setup ──────────────────────────────────────────────────────────
 
 from lcm_scripts.indic_resources import configure_indic_resources
 from indicnlp import loader
 
+logger.info("Configuring Indic NLP resources…")
 configure_indic_resources()
 loader.load()
 from indicnlp.morph.unsupervised_morph import UnsupervisedMorphAnalyzer
@@ -42,9 +66,11 @@ morph_analyzer = UnsupervisedMorphAnalyzer("mr")
 
 import stanza
 
-# Download model if not already present (no-op if cached)
+logger.info("Downloading Stanza model for Marathi (if needed)…")
 stanza.download("mr", verbose=False)
+logger.info("Loading Stanza pipeline (tokenize, pos, lemma)…")
 nlp = stanza.Pipeline("mr", processors="tokenize,pos,lemma", verbose=False)
+logger.info("Stanza pipeline ready")
 
 # ── Morpheme class definitions ───────────────────────────────────────────────
 
@@ -54,7 +80,7 @@ VERB_TAGS = {"VERB", "AUX"}
 POSTP_TAGS = {"ADP"}
 
 # Devanagari virama (halant) — used to detect conjunct clusters in compounds
-VIRAMA = "\u094D"
+VIRAMA = "\u094d"
 
 
 def classify_word(upos, text, morphemes):
@@ -101,26 +127,30 @@ CLASS_DISPLAY = {
 CORPUS_PATH = os.path.join(os.path.dirname(__file__), "..", "marathi_sentences.json")
 CORPUS_PATH = os.path.normpath(CORPUS_PATH)
 
+logger.info("Loading corpus from %s…", CORPUS_PATH)
 with open(CORPUS_PATH, "r", encoding="utf-8") as f:
     all_sentences = json.load(f)
+logger.info("Corpus loaded: %d sentences total", len(all_sentences))
 
 # Use a sample for efficiency — Stanza POS tagging is slower than byte-level ops.
 # 5000 sentences gives statistically robust estimates; increase if needed.
 SAMPLE_SIZE = min(5000, len(all_sentences))
 sentences = all_sentences[:SAMPLE_SIZE]
-print(f"Fertility audit: processing {SAMPLE_SIZE} / {len(all_sentences)} sentences")
+logger.info("Processing sample: %s / %s sentences", SAMPLE_SIZE, len(all_sentences))
 
 # ── Process sentences ────────────────────────────────────────────────────────
 
 # Accumulators per class
-class_morpheme_counts = defaultdict(list)   # class -> list of morpheme counts per word
-class_word_examples = defaultdict(list)     # class -> sample words (capped)
+class_morpheme_counts = defaultdict(list)  # class -> list of morpheme counts per word
+class_word_examples = defaultdict(list)  # class -> sample words (capped)
 
-detail_rows = []   # per-word JSONL records
+detail_rows = []  # per-word JSONL records
 total_words = 0
 total_morphemes = 0
 
-BATCH_SIZE = 50   # Stanza batch size for efficiency
+BATCH_SIZE = 50  # Stanza batch size for efficiency
+logger.info("Beginning sentence processing (batch size=%d)…", BATCH_SIZE)
+batch_t0 = time.time()
 
 for batch_start in range(0, len(sentences), BATCH_SIZE):
     batch = sentences[batch_start : batch_start + BATCH_SIZE]
@@ -136,7 +166,9 @@ for batch_start in range(0, len(sentences), BATCH_SIZE):
                 upos = word.upos if word.upos else "X"
 
                 # Skip punctuation and symbols
-                if upos in ("PUNCT", "SYM", "X") or not re.search(r"[\u0900-\u097F]", text):
+                if upos in ("PUNCT", "SYM", "X") or not re.search(
+                    r"[\u0900-\u097F]", text
+                ):
                     continue
 
                 # Morpheme segmentation via Indic NLP
@@ -154,30 +186,49 @@ for batch_start in range(0, len(sentences), BATCH_SIZE):
 
                 # Keep a few examples per class
                 if len(class_word_examples[cls]) < 20:
-                    class_word_examples[cls].append({
+                    class_word_examples[cls].append(
+                        {
+                            "word": text,
+                            "upos": upos,
+                            "morphemes": morphemes,
+                            "n_morphemes": n_morphemes,
+                        }
+                    )
+
+                detail_rows.append(
+                    {
+                        "sentence_id": sent_idx,
                         "word": text,
                         "upos": upos,
                         "morphemes": morphemes,
                         "n_morphemes": n_morphemes,
-                    })
-
-                detail_rows.append({
-                    "sentence_id": sent_idx,
-                    "word": text,
-                    "upos": upos,
-                    "morphemes": morphemes,
-                    "n_morphemes": n_morphemes,
-                    "class": cls,
-                })
+                        "class": cls,
+                    }
+                )
 
     # Progress
     processed = min(batch_start + BATCH_SIZE, len(sentences))
     if processed % 500 == 0 or processed == len(sentences):
-        print(f"  Processed {processed}/{len(sentences)} sentences "
-              f"({total_words} words so far)")
+        elapsed = time.time() - batch_t0
+        rate = processed / elapsed if elapsed > 0 else 0
+        logger.info(
+            "Processed %s/%s sentences (%s words, %.1f sent/s)",
+            processed,
+            len(sentences),
+            total_words,
+            rate,
+        )
+
+logger.info(
+    "Sentence processing complete (%d words in %.1fs)",
+    total_words,
+    time.time() - batch_t0,
+)
 
 # ── Compute fertility per class ──────────────────────────────────────────────
 
+logger.info("Computing fertility statistics per class…")
+compute_t0 = time.time()
 results = {
     "study": "Fertility audit by morpheme class",
     "corpus": "ParamTh/BhashaSetu (Marathi)",
@@ -199,7 +250,7 @@ for cls in CLASS_LABELS:
     else:
         avg = sum(counts) / n
         variance = sum((c - avg) ** 2 for c in counts) / n
-        std = variance ** 0.5
+        std = variance**0.5
         min_m = min(counts)
         max_m = max(counts)
 
@@ -214,6 +265,8 @@ for cls in CLASS_LABELS:
         "examples": class_word_examples.get(cls, [])[:5],
     }
 
+logger.info("Statistics computed in %.3fs", time.time() - compute_t0)
+
 # ── Save outputs ─────────────────────────────────────────────────────────────
 
 RESULTS_DIR = os.path.join(os.path.dirname(__file__), "..", "results")
@@ -222,32 +275,42 @@ os.makedirs(RESULTS_DIR, exist_ok=True)
 out_json = os.path.join(RESULTS_DIR, "fertility_by_class.json")
 with open(out_json, "w", encoding="utf-8") as f:
     json.dump(results, f, indent=2, ensure_ascii=False)
+logger.info("Saved JSON results to %s", out_json)
 
 out_jsonl = os.path.join(RESULTS_DIR, "fertility_by_class_detail.jsonl")
 with open(out_jsonl, "w", encoding="utf-8") as f:
     for row in detail_rows:
         f.write(json.dumps(row, ensure_ascii=False) + "\n")
+logger.info("Saved JSONL detail (%d rows) to %s", len(detail_rows), out_jsonl)
 
 # ── Print results table ──────────────────────────────────────────────────────
 
 print("\n" + "=" * 78)
 print("FERTILITY (λ) BY MORPHEME CLASS — Marathi (BhashaSetu)")
-print(f"{len(sentences):,} sentences | {total_words:,} words | "
-      f"global λ = {results['global_fertility']:.4f}")
+print(
+    f"{len(sentences):,} sentences | {total_words:,} words | "
+    f"global λ = {results['global_fertility']:.4f}"
+)
 print("=" * 78)
-print(f"{'Class':<28} | {'Words':>8} | {'λ (avg)':>8} | {'σ':>6} | "
-      f"{'Min':>4} | {'Max':>4}")
+print(
+    f"{'Class':<28} | {'Words':>8} | {'λ (avg)':>8} | {'σ':>6} | "
+    f"{'Min':>4} | {'Max':>4}"
+)
 print("-" * 78)
 
 for cls in CLASS_LABELS:
     d = results["classes"][cls]
-    print(f"{d['display_name']:<28} | {d['num_words']:>8,} | "
-          f"{d['fertility_lambda']:>8.4f} | {d['std']:>6.4f} | "
-          f"{d['min_morphemes']:>4} | {d['max_morphemes']:>4}")
+    print(
+        f"{d['display_name']:<28} | {d['num_words']:>8,} | "
+        f"{d['fertility_lambda']:>8.4f} | {d['std']:>6.4f} | "
+        f"{d['min_morphemes']:>4} | {d['max_morphemes']:>4}"
+    )
 
 print("-" * 78)
-print(f"{'GLOBAL':<28} | {total_words:>8,} | "
-      f"{results['global_fertility']:>8.4f} |        |      |")
+print(
+    f"{'GLOBAL':<28} | {total_words:>8,} | "
+    f"{results['global_fertility']:>8.4f} |        |      |"
+)
 print("=" * 78)
 
 # ── Print sample words per class ─────────────────────────────────────────────
@@ -259,8 +322,14 @@ for cls in CLASS_LABELS:
         print(f"\n  {CLASS_DISPLAY[cls]}:")
         for ex in examples:
             morph_str = " + ".join(ex["morphemes"])
-            print(f"    {ex['word']:<20} ({ex['upos']:<5}) → {morph_str}  "
-                  f"[λ={ex['n_morphemes']}]")
+            print(
+                f"    {ex['word']:<20} ({ex['upos']:<5}) → {morph_str}  "
+                f"[λ={ex['n_morphemes']}]"
+            )
 
-print(f"\nResults saved: {out_json}")
-print(f"Detail saved:  {out_jsonl}")
+logger.info("Results saved: %s", out_json)
+logger.info("Detail saved:  %s", out_jsonl)
+logger.info("Log file:      %s", log_path)
+logger.info("=" * 60)
+logger.info("Fertility audit script finished")
+logger.info("=" * 60)

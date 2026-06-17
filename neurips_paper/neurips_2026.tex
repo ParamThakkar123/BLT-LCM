@@ -1,7 +1,7 @@
 \documentclass{article}
 
 % if you need to pass options to natbib, use, e.g.:
-%     \PassOptionsToPackage{numbers, compress}{natbib}
+     \PassOptionsToPackage{numbers, compress}{natbib}
 % before loading neurips_2026
 
 % The authors should use one of these tracks.
@@ -252,7 +252,7 @@ The documentation for \verb+natbib+ may be found at
 Of note is the command \verb+\citet+, which produces citations appropriate for
 use in inline text.  For example,
 \begin{verbatim}
-   \citet{hasselmo} investigated\dots
+    \cite{hasselmo} investigated\dots
 \end{verbatim}
 produces
 \begin{quote}
@@ -456,25 +456,7 @@ Note that the Reference section does not count towards the page limit.
 \medskip
 
 
-{
-\small
-
-
-[1] Alexander, J.A.\ \& Mozer, M.C.\ (1995) Template-based algorithms for
-connectionist rule extraction. In G.\ Tesauro, D.S.\ Touretzky and T.K.\ Leen
-(eds.), {\it Advances in Neural Information Processing Systems 7},
-pp.\ 609--616. Cambridge, MA: MIT Press.
-
-
-[2] Bower, J.M.\ \& Beeman, D.\ (1995) {\it The Book of GENESIS: Exploring
-  Realistic Neural Models with the GEneral NEural SImulation System.}  New York:
-TELOS/Springer--Verlag.
-
-
-[3] Hasselmo, M.E., Schnell, E.\ \& Barkai, E.\ (1995) Dynamics of learning and
-recall at excitatory recurrent synapses and cholinergic modulation in rat
-hippocampal region CA3. {\it Journal of Neuroscience} {\bf 15}(7):5249-5262.
-}
+\bibliography{references}
 
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
