@@ -6,6 +6,7 @@ build-backend = "setuptools.build_meta"
     name = "blt-lcm-marathi"
     version = "0.1.0"
     description = "BLT-LCM for Marathi Machine Translation Concept Extraction"
+    license = {file = "LICENSE"}
     authors = [{name = "Your Name"}]
     requires-python = ">=3.10,<3.13"
     dependencies = [
