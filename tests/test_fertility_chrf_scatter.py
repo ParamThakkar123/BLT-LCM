@@ -2,6 +2,9 @@ import math
 
 from lcm_scripts.fertility_chrf_scatter import (
     compute_rows,
+    pearson_correlation,
+    spearman_correlation,
+    summarize_rows,
     theoretical_factor,
     validate_parallel_files,
 )
@@ -53,6 +56,36 @@ def test_theoretical_factor_is_monotone_inverse_lambda():
     assert theoretical_factor(1.0, 1.0) == 1.0
     assert theoretical_factor(2.0, 1.0) == 0.5
     assert math.isclose(theoretical_factor(4.0, 0.5), 0.5)
+
+
+def test_summary_reports_bound_rate_and_lambda_delta_correlation():
+    fertility = {
+        "noun_root": {"display_name": "Noun roots", "num_words": 4, "fertility_lambda": 1.0},
+        "compound": {"display_name": "Compound words", "num_words": 3, "fertility_lambda": 2.0},
+    }
+    rows = compute_rows(
+        fertility,
+        {"noun_root": {0, 1}, "compound": {1, 2}},
+        ["a", "x", "x"],
+        ["a", "b", "c"],
+        ["a", "b", "c"],
+        ["noun_root", "compound"],
+        metric_fn=toy_metric,
+    )
+
+    summary = summarize_rows(rows, bound_exponent=1.0)
+
+    assert summary["num_classes"] == 2
+    assert summary["bound_satisfied_count"] == 2
+    assert summary["bound_satisfied_fraction"] == 1.0
+    assert math.isclose(summary["pearson_lambda_delta_chrf"], 1.0)
+    assert math.isclose(summary["spearman_lambda_delta_chrf"], 1.0)
+
+
+def test_correlation_helpers_handle_ties_and_undefined_cases():
+    assert math.isclose(pearson_correlation([1.0, 2.0, 3.0], [2.0, 4.0, 6.0]), 1.0)
+    assert math.isclose(spearman_correlation([1.0, 2.0, 2.0], [1.0, 3.0, 2.0]), 0.8660254037844387)
+    assert math.isnan(pearson_correlation([1.0], [2.0]))
 
 
 def test_validate_parallel_files_rejects_mismatched_lengths():
