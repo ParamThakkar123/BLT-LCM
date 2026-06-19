@@ -40,21 +40,28 @@ def split_sentences(text: str) -> list[str]:
 def add_character_noise(text: str, noise_prob: float, seed: Optional[int] = None) -> str:
     """Corrupt a percentage of non-space characters for robustness benchmarks.
 
-    The corruption uses Devanagari substitutions for Indic characters and ASCII
-    substitutions otherwise. References remain clean; only source inputs or
-    hypotheses should be noised by callers.
+    The corruption uses missing-matra deletions and Devanagari substitutions
+    for Indic characters, plus ASCII substitutions otherwise. References remain
+    clean; only source inputs or hypotheses should be noised by callers.
     """
 
     if noise_prob <= 0:
         return text
     rng = random.Random(seed)
-    devanagari = "अआइईउऊएऐओऔकखगघचछजझटठडढतथदधनपफबभमयरलवशषसहािीुूेैोौंंः्"
+    # Independent noise operations used by the robustness benchmark:
+    # remove dependent vowel signs (missing matras) and substitute remaining
+    # characters with script-appropriate alternatives.
+    matras = "ािीुूृॄॅॆेैॉॊोौ्ॎॏंँः"
+    devanagari = "अआइईउऊएऐओऔकखगघचछजझटठडढतथदधनपफबभमयरलवशषसह" + matras
     ascii_chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
     out: list[str] = []
     for ch in text:
         if ch.isspace() or rng.random() >= noise_prob:
             out.append(ch)
         elif "\u0900" <= ch <= "\u097f":
+            if ch in matras and rng.random() < 0.5:
+                # Missing-matra corruption: delete the vowel/diacritic mark.
+                continue
             out.append(rng.choice(devanagari))
         else:
             out.append(rng.choice(ascii_chars))
