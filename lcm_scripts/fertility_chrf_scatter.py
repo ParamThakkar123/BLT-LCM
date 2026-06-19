@@ -226,6 +226,75 @@ def write_rows_csv(rows: Sequence[ClassChrfRow], path: str) -> None:
             writer.writerow(row.to_csv_row())
 
 
+def pearson_correlation(xs: Sequence[float], ys: Sequence[float]) -> float:
+    """Return Pearson r for paired values, or NaN if undefined."""
+
+    if len(xs) != len(ys):
+        raise ValueError("Correlation inputs must have identical lengths")
+    if len(xs) < 2:
+        return float("nan")
+
+    mean_x = sum(xs) / len(xs)
+    mean_y = sum(ys) / len(ys)
+    centered_x = [x - mean_x for x in xs]
+    centered_y = [y - mean_y for y in ys]
+    denom_x = math.sqrt(sum(x * x for x in centered_x))
+    denom_y = math.sqrt(sum(y * y for y in centered_y))
+    if denom_x == 0.0 or denom_y == 0.0:
+        return float("nan")
+    return sum(x * y for x, y in zip(centered_x, centered_y)) / (denom_x * denom_y)
+
+
+def rank_values(values: Sequence[float]) -> List[float]:
+    """Return average ranks for values, using 1-indexed ranks and tie averaging."""
+
+    indexed = sorted(enumerate(values), key=lambda item: item[1])
+    ranks = [0.0] * len(values)
+    i = 0
+    while i < len(indexed):
+        j = i + 1
+        while j < len(indexed) and indexed[j][1] == indexed[i][1]:
+            j += 1
+        avg_rank = (i + 1 + j) / 2.0
+        for original_idx, _ in indexed[i:j]:
+            ranks[original_idx] = avg_rank
+        i = j
+    return ranks
+
+
+def spearman_correlation(xs: Sequence[float], ys: Sequence[float]) -> float:
+    """Return Spearman ρ for paired values, or NaN if undefined."""
+
+    if len(xs) != len(ys):
+        raise ValueError("Correlation inputs must have identical lengths")
+    if len(xs) < 2:
+        return float("nan")
+    return pearson_correlation(rank_values(xs), rank_values(ys))
+
+
+def summarize_rows(rows: Sequence[ClassChrfRow], bound_exponent: float) -> Dict[str, object]:
+    """Build a compact empirical validation summary for the scatter analysis."""
+
+    lambdas = [row.fertility_lambda for row in rows]
+    deltas = [row.delta_chrf for row in rows]
+    bound_count = sum(1 for row in rows if row.bound_satisfied)
+    return {
+        "num_classes": len(rows),
+        "bound_exponent": bound_exponent,
+        "bound_satisfied_count": bound_count,
+        "bound_satisfied_fraction": bound_count / len(rows) if rows else float("nan"),
+        "pearson_lambda_delta_chrf": pearson_correlation(lambdas, deltas),
+        "spearman_lambda_delta_chrf": spearman_correlation(lambdas, deltas),
+        "classes": [row.to_csv_row() for row in rows],
+    }
+
+
+def write_summary_json(rows: Sequence[ClassChrfRow], path: str, bound_exponent: float) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(summarize_rows(rows, bound_exponent), f, indent=2, ensure_ascii=False)
+
+
 def plot_rows(rows: Sequence[ClassChrfRow], path: str, bound_exponent: float) -> None:
     if not rows:
         raise ValueError("No class rows available to plot")
@@ -268,12 +337,13 @@ def plot_rows(rows: Sequence[ClassChrfRow], path: str, bound_exponent: float) ->
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
 
-    bound_count = sum(1 for row in rows if row.bound_satisfied)
+    summary = summarize_rows(rows, bound_exponent)
     ax.text(
         0.02,
         0.98,
         f"Bound diagnostic: E(BLT) ≤ λ^-{bound_exponent:g} · E(BPE)\n"
-        f"Satisfied: {bound_count}/{len(rows)} classes",
+        f"Satisfied: {summary['bound_satisfied_count']}/{len(rows)} classes\n"
+        f"Pearson r(λ, ΔchrF++): {summary['pearson_lambda_delta_chrf']:.2f}",
         transform=ax.transAxes,
         va="top",
         ha="left",
@@ -295,6 +365,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--ref_file", required=True, help="Reference translations, one sentence per line")
     parser.add_argument("--out_csv", default="results/fertility_chrf_delta_by_class.csv")
     parser.add_argument("--out_plot", default="results/fertility_chrf_delta_scatter.png")
+    parser.add_argument("--out_summary", default="results/fertility_chrf_delta_summary.json")
     parser.add_argument("--include_other", action="store_true", help="Include the catch-all 'other' class in outputs")
     parser.add_argument(
         "--bound_exponent",
@@ -326,9 +397,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         bound_exponent=args.bound_exponent,
     )
     write_rows_csv(rows, args.out_csv)
+    write_summary_json(rows, args.out_summary, args.bound_exponent)
     plot_rows(rows, args.out_plot, args.bound_exponent)
 
     print(f"Wrote per-class Δ chrF++ table to: {args.out_csv}")
+    print(f"Wrote empirical validation summary to: {args.out_summary}")
     print(f"Wrote fertility/Δ chrF++ scatter plot to: {args.out_plot}")
     for row in rows:
         status = "satisfies" if row.bound_satisfied else "violates"

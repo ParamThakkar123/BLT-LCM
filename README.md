@@ -234,12 +234,14 @@ uv run lcm_scripts/fertility_chrf_scatter.py \
   --blt_hyp_file outputs/blt_lcm.hyp.txt \
   --ref_file outputs/ref.txt \
   --out_csv results/fertility_chrf_delta_by_class.csv \
+  --out_summary results/fertility_chrf_delta_summary.json \
   --out_plot results/fertility_chrf_delta_scatter.png
 ```
 
 This writes:
 
 - `results/fertility_chrf_delta_by_class.csv` — per morpheme class λ, BPE-LCM chrF++, BLT-LCM chrF++, Δ chrF++, chrF error ratio, and the empirical bound diagnostic.
+- `results/fertility_chrf_delta_summary.json` — empirical validation summary with bound-satisfaction rate plus Pearson/Spearman correlations between λ and Δ chrF++.
 - `results/fertility_chrf_delta_scatter.png` — scatter plot with λ on the x-axis and BLT-LCM minus BPE-LCM Δ chrF++ on the y-axis.
 
 Optional flags:
