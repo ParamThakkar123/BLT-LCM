@@ -1,42 +1,85 @@
 [build-system]
-requires = ["setuptools", "wheel"]
+requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-    name = "blt-lcm-marathi"
-    version = "0.1.0"
-    description = "BLT-LCM for Marathi Machine Translation Concept Extraction"
-    authors = [{name = "Your Name"}]
-    requires-python = ">=3.10,<3.13"
-    dependencies = [
-    "transformers>=4.0.0",
-    "huggingface-hub>=0.34.0",
-    "sentencepiece",
-    "tiktoken",
-    "sonar-space",
-    "datasets",
+name = "blt-lcm-marathi"
+version = "0.1.0"
+description = "BLT-LCM for Marathi Machine Translation Concept Extraction"
+authors = [
+    { name = "Param Thakkar" },
+    { name = "Anushka Yadav" },
+    { name = "Michael Tiemann" },
+]
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "datasets>=2.0.0",
     "numpy>=1.26.0,<2.0",
-    "tqdm",
-    "indic-nlp-library>=0.92",
-    "sacrebleu>=2.5.1",
-    "wandb>=0.24.2",
-    "tensorboard>=2.14.0",
-    "nvidia-ml-py>=13.595.45",
-    "peft>=0.4.0",
-    "bitsandbytes>=0.41.0",
     "python-dotenv>=1.0.0",
+    "sacrebleu>=2.5.1",
     "setuptools<81",
-    "matplotlib>=3.7.0",
-    "unbabel-comet>=2.2.7",
-    "nltk>=3.9.1",
-    "comet>=3.1.0",
-    "stanza>=1.12.2",
+    "torch>=2.0.0",
+    "tqdm>=4.0.0",
 ]
 
 [project.optional-dependencies]
+dev = [
+    "black>=24.0.0",
+    "mypy>=1.8.0",
+    "pytest>=7.0.0",
+    "ruff>=0.6.0",
+]
+eval = [
+    "comet>=3.1.0",
+    "matplotlib>=3.7.0",
+    "nltk>=3.9.1",
+    "stanza>=1.12.2",
+    "unbabel-comet>=2.2.7",
+]
+logging = [
+    "tensorboard>=2.14.0",
+    "wandb>=0.24.2",
+]
+peft = [
+    "bitsandbytes>=0.41.0",
+    "peft>=0.4.0",
+]
+sonar = [
+    "huggingface-hub>=0.34.0",
+    "indic-nlp-library>=0.92",
+    "nvidia-ml-py>=13.595.45",
+    "sentencepiece",
+    "sonar-space",
+    "tiktoken",
+    "transformers>=4.0.0",
+]
 test = [
     "pytest>=7.0.0",
 ]
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["lcm_scripts*", "patching_scratch*"]
+exclude = ["tests*", "docs*", "results*", "neurips_paper*"]
 
-[tool.setuptools]
-packages = { find = { where = ["."], include = ["*"] } }
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-ra"
+
+[tool.black]
+line-length = 88
+target-version = ["py310"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = []
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+warn_unused_configs = true
+no_implicit_optional = true
