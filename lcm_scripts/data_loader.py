@@ -3,10 +3,43 @@ Data loader for LCM training
 Loads pre-segmented sentences and encodes them
 """
 
-import torch
-from torch.utils.data import Dataset, DataLoader
-from sonar_loader import SonarLoader
 import json
+
+import torch
+from torch.utils.data import Dataset
+
+
+class EmbeddingDataset(Dataset):
+    """Dataset for next-embedding prediction over precomputed embedding sequences."""
+
+    def __init__(self, embeddings_seqs, min_seq_len=2):
+        self.data = [seq for seq in embeddings_seqs if len(seq) >= min_seq_len]
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        seq = self.data[idx]
+        return seq[:-1], seq[1:]
+
+
+def collate_embeddings(batch):
+    src_batch, tgt_batch = zip(*batch)
+    max_len = max(src.shape[0] for src in src_batch)
+    embed_dim = src_batch[0].shape[1]
+
+    padded_src = torch.zeros(len(src_batch), max_len, embed_dim)
+    padded_tgt = torch.zeros(len(tgt_batch), max_len, embed_dim)
+
+    for i, (src, tgt) in enumerate(zip(src_batch, tgt_batch)):
+        padded_src[i, : src.shape[0]] = src
+        padded_tgt[i, : tgt.shape[0]] = tgt
+
+    return padded_src, padded_tgt
+
+
+# Backward-compatible alias for existing training scripts/tests.
+collate = collate_embeddings
 
 
 class LCMDataset(Dataset):
@@ -34,16 +67,4 @@ class LCMDataset(Dataset):
 
 
 def collate_fn(batch):
-    src_batch, tgt_batch = zip(*batch)
-    # Pad sequences
-    max_len = max(s.shape[0] for s in src_batch)
-    embed_dim = src_batch[0].shape[1]
-
-    padded_src = torch.zeros(len(src_batch), max_len, embed_dim)
-    padded_tgt = torch.zeros(len(tgt_batch), max_len, embed_dim)
-
-    for i, (src, tgt) in enumerate(zip(src_batch, tgt_batch)):
-        padded_src[i, : len(src)] = src
-        padded_tgt[i, : len(tgt)] = tgt
-
-    return padded_src, padded_tgt
+    return collate_embeddings(batch)

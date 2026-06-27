@@ -6,31 +6,36 @@ Usage:
 """
 
 import os
-import sys
-
-sys.path.append(os.path.dirname(__file__))
 
 from dotenv import load_dotenv
 load_dotenv()
 
 import argparse
+import importlib.util
 import time
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from blt_loader import BLTLoader
-from base_lcm import BaseLCM
-from eval_metrics import compute_all
-from experiment_config import setup_logging
+from lcm_scripts.data_loader import EmbeddingDataset, collate_embeddings as collate
 
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+PEFT_AVAILABLE = importlib.util.find_spec("peft") is not None
 
-PEFT_AVAILABLE = True
+
+def load_peft_components():
+    if not PEFT_AVAILABLE:
+        raise ImportError(
+            "PEFT is required for --lora/--qlora fine-tuning. "
+            "Install the optional peft dependency or run without --lora/--qlora."
+        )
+
+    from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+
+    return LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
 
 def prepare_data(fraction=1.0, max_sent_per_doc=20):
-    from bhashasetu_utils import load_bhashasetu_documents
+    from lcm_scripts.bhashasetu_utils import load_bhashasetu_documents
 
     return load_bhashasetu_documents(
         fraction=fraction,
@@ -38,32 +43,8 @@ def prepare_data(fraction=1.0, max_sent_per_doc=20):
         text_col="marathi",
     )
 
-class EmbeddingDataset(torch.utils.data.Dataset):
-    def __init__(self, embeddings_seqs):
-        self.data = embeddings_seqs
 
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        seq = self.data[idx]
-        return seq[:-1], seq[1:]
-
-
-def collate(batch):
-    srcs, tgts = zip(*batch)
-    max_len = max(s.shape[0] for s in srcs)
-    emb_dim = srcs[0].shape[1]
-    B = len(srcs)
-    src_p = torch.zeros(B, max_len, emb_dim)
-    tgt_p = torch.zeros(B, max_len, emb_dim)
-    for i, (s, t) in enumerate(zip(srcs, tgts)):
-        src_p[i, : s.shape[0]] = s
-        tgt_p[i, : t.shape[0]] = t
-    return src_p, tgt_p
-
-
-def main():
+def build_arg_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--checkpoint",
@@ -80,6 +61,12 @@ def main():
     )
     parser.add_argument("--epochs", type=int, default=5, help="Fine-tuning epochs")
     parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cuda" if torch.cuda.is_available() else "cpu",
+        help="Device to use for fine-tuning (e.g., cuda, cuda:0, or cpu)",
+    )
     parser.add_argument(
         "--lr",
         type=float,
@@ -143,7 +130,47 @@ def main():
         default=None,
         help="Optional COMET model name or checkpoint path",
     )
-    args = parser.parse_args()
+    return parser
+
+
+def configure_peft_model(model, args, load_components=load_peft_components):
+    if not (args.lora or args.qlora):
+        return model
+
+    (
+        LoraConfig,
+        get_peft_model,
+        prepare_model_for_kbit_training,
+    ) = load_components()
+
+    if args.qlora:
+        model = prepare_model_for_kbit_training(
+            model, use_gradient_checkpointing=False
+        )
+        print("Prepared model for QLoRA")
+
+    lora_config = LoraConfig(
+        r=args.lora_rank,
+        lora_alpha=args.lora_alpha,
+        target_modules=args.target_modules,
+        lora_dropout=args.lora_dropout,
+        bias="none",
+        task_type="SEQ_2_SEQ_LM",
+    )
+    model = get_peft_model(model, lora_config)
+    print(f"Applied LoRA with rank {args.lora_rank}")
+    if args.qlora:
+        print("Using QLoRA (4-bit + LoRA)")
+    return model
+
+
+def main(argv=None):
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+
+    from lcm_scripts.base_lcm import BaseLCM
+    from lcm_scripts.blt_loader import BLTLoader
+    from lcm_scripts.experiment_config import setup_logging
 
     device = torch.device(args.device)
     writer = None
@@ -151,7 +178,7 @@ def main():
         writer = setup_logging(args.log_dir)
     wandb_module = None
     if args.wandb:
-        from experiment_config import setup_wandb
+        from lcm_scripts.experiment_config import setup_wandb
 
         wandb_module = setup_wandb(
             args.log_dir or ".",
@@ -187,26 +214,7 @@ def main():
     print(f"Loaded pre-trained model from {args.checkpoint}")
 
     # Apply LoRA or QLoRA if enabled
-    if args.lora or args.qlora:
-        if args.qlora:
-            # Prepare for QLoRA
-            model = prepare_model_for_kbit_training(
-                model, use_gradient_checkpointing=False
-            )
-            print("Prepared model for QLoRA")
-        # Define LoRA config
-        lora_config = LoraConfig(
-            r=args.lora_rank,
-            lora_alpha=args.lora_alpha,
-            target_modules=args.target_modules,
-            lora_dropout=args.lora_dropout,
-            bias="none",
-            task_type="SEQ_2_SEQ_LM",  # or appropriate task
-        )
-        model = get_peft_model(model, lora_config)
-        print(f"Applied LoRA with rank {args.lora_rank}")
-        if args.qlora:
-            print("Using QLoRA (4-bit + LoRA)")
+    model = configure_peft_model(model, args)
 
     # Freeze layers if specified
     if args.freeze_prenet:
@@ -295,6 +303,8 @@ def main():
                 hyps = [l.strip() for l in f if l.strip()]
             with open(args.eval_ref, encoding="utf-8") as f:
                 refs = [l.strip() for l in f if l.strip()]
+            from lcm_scripts.eval_metrics import compute_all
+
             metrics = compute_all(hyps, refs, comet_model_name=args.comet_model)
             for k, v in metrics.items():
                 writer.add_scalar(f"eval/{k}", v, epoch + 1)

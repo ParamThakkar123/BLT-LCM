@@ -97,7 +97,7 @@ uv run scripts/download_dataset.py
 # Then set HF_DATASETS_OFFLINE=1 in your .env before running on compute nodes.
 ```
 
-If you want to use your own data, pass `--data_path` to the training scripts.
+The BLT and SONAR LCM training scripts currently load `ParamTh/BhashaSetu` directly. For custom corpora, adapt the relevant `prepare_data(...)` function or precompute embeddings and point the BLT path at them with `--embed_cache`.
 
 ## Testing
 
@@ -145,7 +145,7 @@ python tokenization_statistics/patch_compression_by_morpheme_class.py \
 
 To train on specific percentages of the full dataset (~2.78M rows from `ParamTh/BhashaSetu`), use the following commands. These use `--fraction` to select the subset and `--epochs 1` for a single epoch approximation of max_steps.
 
-Note: If your dataset contains one sentence per row (sentence-level corpus) the script will automatically group consecutive sentences into pseudo-documents. To disable this automatic grouping and keep strict per-row documents, pass `--no_grouping`. The default group size is 4.
+Note: `lcm_scripts/train_lcm_blt.py` builds pseudo-documents from consecutive Marathi sentences in `ParamTh/BhashaSetu` inside `prepare_data(...)`; its CLI exposes `--fraction`, `--num_docs`, and checkpoint/cache options, but it does not currently expose `--data_path`, `--no_grouping`, or a grouping-size flag.
 
 ### 25% Subset
 - LCM on SONAR embeddings:

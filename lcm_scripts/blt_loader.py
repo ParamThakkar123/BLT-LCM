@@ -3,19 +3,18 @@ BLT embedding loader for LCM
 Uses BLT byte patching and entropy model for concept embeddings
 """
 
-import torch
-import sys
 import os
+import sys
 
-sys.path.append(os.path.join(os.path.dirname(__file__), "..", "patching_scratch"))
+import torch
 
-from run_blt_patching import (
+from patching_scratch.run_blt_patching import (
     text_to_byte_tokens,
     byte_tokens_to_text,
     compute_entropies_for_tokens,
     entropy_patch_sentence,
 )
-from run_blt_patching import ByteEntropyModel
+from patching_scratch.run_blt_patching import ByteEntropyModel
 
 
 class BLTLoader:
