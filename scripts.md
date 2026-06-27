@@ -211,26 +211,30 @@ uv run lcm_scripts/eval_lcm_sonar.py \
 uv run lcm_scripts/train_bpe_llama8b.py \
   --fraction 0.25 --epochs 1 --batch_size 1 --grad_accum 16 \
   --noise_levels 0.0 0.1 0.2 \
-  --out_dir runs/bpe_llama8b_25
+  --out_dir runs/bpe_llama8b_25 --wandb --wandb_project BLT-LCM \
+  --wandb_name bpe_llama8b_25
 # → runs/bpe_llama8b_25/metrics_fraction0.25.csv
 
 # 25%  (with QLoRA 4-bit — fits ~16GB VRAM)
 uv run lcm_scripts/train_bpe_llama8b.py \
   --fraction 0.25 --epochs 1 --batch_size 1 --grad_accum 16 \
   --qlora --noise_levels 0.0 0.1 0.2 \
-  --out_dir runs/bpe_llama8b_25_qlora
+  --out_dir runs/bpe_llama8b_25_qlora --wandb --wandb_project BLT-LCM \
+  --wandb_name bpe_llama8b_25_qlora
 
 # 50%  (with QLoRA)
 uv run lcm_scripts/train_bpe_llama8b.py \
   --fraction 0.50 --epochs 1 --batch_size 1 --grad_accum 16 \
   --qlora --noise_levels 0.0 0.1 0.2 \
-  --out_dir runs/bpe_llama8b_50_qlora
+  --out_dir runs/bpe_llama8b_50_qlora --wandb --wandb_project BLT-LCM \
+  --wandb_name bpe_llama8b_50_qlora
 
 # 80%  (with QLoRA)
 uv run lcm_scripts/train_bpe_llama8b.py \
   --fraction 0.80 --epochs 1 --batch_size 1 --grad_accum 16 \
   --qlora --noise_levels 0.0 0.1 0.2 \
-  --out_dir runs/bpe_llama8b_80_qlora
+  --out_dir runs/bpe_llama8b_80_qlora --wandb --wandb_project BLT-LCM \
+  --wandb_name bpe_llama8b_80_qlora
 ```
 
 ### 4.2 Output columns (per CSV)
@@ -249,20 +253,23 @@ uv run lcm_scripts/train_bpe_llama8b.py \
 uv run lcm_scripts/train_bpe_transformer.py \
   --fraction 0.25 --epochs 3 --batch_size 32 \
   --noise_levels 0.0 0.1 0.2 \
-  --out_dir runs/bpe_transformer_25
+  --out_dir runs/bpe_transformer_25 --wandb --wandb_project BLT-LCM \
+  --wandb_name bpe_transformer_25
 # → runs/bpe_transformer_25/metrics_fraction0.25.csv
 
 # 50%
 uv run lcm_scripts/train_bpe_transformer.py \
   --fraction 0.50 --epochs 3 --batch_size 32 \
   --noise_levels 0.0 0.1 0.2 \
-  --out_dir runs/bpe_transformer_50
+  --out_dir runs/bpe_transformer_50 --wandb --wandb_project BLT-LCM \
+  --wandb_name bpe_transformer_50
 
 # 80%
 uv run lcm_scripts/train_bpe_transformer.py \
   --fraction 0.80 --epochs 3 --batch_size 32 \
   --noise_levels 0.0 0.1 0.2 \
-  --out_dir runs/bpe_transformer_80
+  --out_dir runs/bpe_transformer_80 --wandb --wandb_project BLT-LCM \
+  --wandb_name bpe_transformer_80
 ```
 
 ### 5.2 Output columns (per CSV)
@@ -281,7 +288,7 @@ uv run lcm_scripts/benchmark_bhashasetu_models.py \
   --fractions 0.25 0.50 0.80 \
   --noise_levels 0.0 0.1 0.2 \
   --eval_docs 100 --epochs 1 \
-  --out_dir runs/bhashasetu_benchmarks
+  --out_dir runs/bhashasetu_benchmarks --wandb --wandb_project BLT-LCM
 
 # Include Llama-8B (requires ~48GB VRAM or use --llama_qlora)
 uv run lcm_scripts/benchmark_bhashasetu_models.py \
@@ -289,7 +296,8 @@ uv run lcm_scripts/benchmark_bhashasetu_models.py \
   --fractions 0.25 0.50 0.80 \
   --noise_levels 0.0 0.1 0.2 \
   --epochs 1 --eval_docs 100 --eval_examples 500 \
-  --llama_qlora --out_dir runs/bhashasetu_benchmarks
+  --llama_qlora --out_dir runs/bhashasetu_benchmarks --wandb \
+  --wandb_project BLT-LCM
 
 # Final summary
 # → runs/bhashasetu_benchmarks/summary_metrics.csv

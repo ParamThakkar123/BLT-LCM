@@ -36,10 +36,21 @@ def read_metrics(path: Path) -> list[dict[str, str]]:
 
 
 def main():
-    p = argparse.ArgumentParser(description="Benchmark BPE Transformer, BPE-LCM, BPE Llama-8B and SONAR-LCM on BhashaSetu")
-    p.add_argument("--models", nargs="+", default=["bpe_transformer", "bpe_lcm", "bpe_llama8b", "sonar_lcm"], choices=["bpe_transformer", "bpe_lcm", "bpe_llama8b", "sonar_lcm"])
-    p.add_argument("--fractions", type=float, nargs="+", default=list(DEFAULT_FRACTIONS))
-    p.add_argument("--noise_levels", type=float, nargs="+", default=list(DEFAULT_NOISE_LEVELS))
+    p = argparse.ArgumentParser(
+        description="Benchmark BPE Transformer, BPE-LCM, BPE Llama-8B and SONAR-LCM on BhashaSetu"
+    )
+    p.add_argument(
+        "--models",
+        nargs="+",
+        default=["bpe_transformer", "bpe_lcm", "bpe_llama8b", "sonar_lcm"],
+        choices=["bpe_transformer", "bpe_lcm", "bpe_llama8b", "sonar_lcm"],
+    )
+    p.add_argument(
+        "--fractions", type=float, nargs="+", default=list(DEFAULT_FRACTIONS)
+    )
+    p.add_argument(
+        "--noise_levels", type=float, nargs="+", default=list(DEFAULT_NOISE_LEVELS)
+    )
     p.add_argument("--out_dir", default="runs/bhashasetu_benchmarks")
     p.add_argument("--max_examples", type=int, default=None)
     p.add_argument("--eval_examples", type=int, default=1000)
@@ -51,11 +62,27 @@ def main():
     p.add_argument("--llama_qlora", action="store_true")
     p.add_argument("--device", default=None)
     p.add_argument("--dry_run", action="store_true")
+    p.add_argument(
+        "--wandb", action="store_true", help="Enable Weights & Biases logging"
+    )
+    p.add_argument("--wandb_project", type=str, default=None)
+    p.add_argument("--wandb_name", type=str, default=None)
+    p.add_argument("--wandb_entity", type=str, default=os.environ.get("WANDB_ENTITY"))
     args = p.parse_args()
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     py = sys.executable
+
+    wandb_args = []
+    if args.wandb:
+        wandb_args = ["--wandb"]
+        if args.wandb_project:
+            wandb_args += ["--wandb_project", args.wandb_project]
+        if args.wandb_name:
+            wandb_args += ["--wandb_name", args.wandb_name]
+        if args.wandb_entity:
+            wandb_args += ["--wandb_entity", args.wandb_entity]
 
     all_rows: list[dict[str, str]] = []
     for frac in args.fractions:
@@ -72,19 +99,67 @@ def main():
 
         if "bpe_transformer" in args.models:
             run_dir = out_dir / f"bpe_transformer_{frac_tag}"
-            cmd = [py, str(SCRIPT_DIR / "train_bpe_transformer.py"), "--fraction", str(frac), "--epochs", str(args.epochs), "--eval_examples", str(args.eval_examples), "--out_dir", str(run_dir), "--noise_levels", *common_noise, *data_cols, *device_cols]
+            cmd = [
+                py,
+                str(SCRIPT_DIR / "train_bpe_transformer.py"),
+                "--fraction",
+                str(frac),
+                "--epochs",
+                str(args.epochs),
+                "--eval_examples",
+                str(args.eval_examples),
+                "--out_dir",
+                str(run_dir),
+                "--noise_levels",
+                *common_noise,
+                *data_cols,
+                *device_cols,
+                *wandb_args,
+            ]
             run(cmd, args.dry_run)
             all_rows.extend(read_metrics(run_dir / f"metrics_fraction{frac}.csv"))
 
         if "bpe_lcm" in args.models:
             run_dir = out_dir / f"bpe_lcm_{frac_tag}"
-            cmd = [py, str(SCRIPT_DIR / "train_lcm_bpe.py"), "--fraction", str(frac), "--epochs", str(args.epochs), "--eval_docs", str(args.eval_docs), "--out_dir", str(run_dir), "--noise_levels", *common_noise, *device_cols]
+            cmd = [
+                py,
+                str(SCRIPT_DIR / "train_lcm_bpe.py"),
+                "--fraction",
+                str(frac),
+                "--epochs",
+                str(args.epochs),
+                "--eval_docs",
+                str(args.eval_docs),
+                "--out_dir",
+                str(run_dir),
+                "--noise_levels",
+                *common_noise,
+                *device_cols,
+                *wandb_args,
+            ]
             run(cmd, args.dry_run)
             all_rows.extend(read_metrics(run_dir / f"metrics_fraction{frac}.csv"))
 
         if "bpe_llama8b" in args.models:
             run_dir = out_dir / f"bpe_llama8b_{frac_tag}"
-            cmd = [py, str(SCRIPT_DIR / "train_bpe_llama8b.py"), "--model_name", args.llama_model_name, "--fraction", str(frac), "--epochs", str(args.epochs), "--eval_examples", str(args.eval_examples), "--out_dir", str(run_dir), "--noise_levels", *common_noise, *data_cols]
+            cmd = [
+                py,
+                str(SCRIPT_DIR / "train_bpe_llama8b.py"),
+                "--model_name",
+                args.llama_model_name,
+                "--fraction",
+                str(frac),
+                "--epochs",
+                str(args.epochs),
+                "--eval_examples",
+                str(args.eval_examples),
+                "--out_dir",
+                str(run_dir),
+                "--noise_levels",
+                *common_noise,
+                *data_cols,
+                *wandb_args,
+            ]
             if args.llama_qlora:
                 cmd.append("--qlora")
             run(cmd, args.dry_run)
@@ -92,7 +167,22 @@ def main():
 
         if "sonar_lcm" in args.models:
             run_dir = out_dir / f"sonar_lcm_{frac_tag}"
-            cmd = [py, str(SCRIPT_DIR / "train_lcm_sonar.py"), "--fraction", str(frac), "--epochs", str(args.epochs), "--eval_docs", str(args.eval_docs), "--out_dir", str(run_dir), "--noise_levels", *common_noise, *device_cols]
+            cmd = [
+                py,
+                str(SCRIPT_DIR / "train_lcm_sonar.py"),
+                "--fraction",
+                str(frac),
+                "--epochs",
+                str(args.epochs),
+                "--eval_docs",
+                str(args.eval_docs),
+                "--out_dir",
+                str(run_dir),
+                "--noise_levels",
+                *common_noise,
+                *device_cols,
+                *wandb_args,
+            ]
             run(cmd, args.dry_run)
             all_rows.extend(read_metrics(run_dir / f"metrics_fraction{frac}.csv"))
 
@@ -101,7 +191,8 @@ def main():
         fieldnames = ["model", "fraction", "noise", "BLEU", "chrF++", "TER"]
         with open(summary, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader(); writer.writerows(all_rows)
+            writer.writeheader()
+            writer.writerows(all_rows)
         print(f"Wrote summary to {summary}")
     elif args.dry_run:
         print("Dry run complete; no metrics were collected.")

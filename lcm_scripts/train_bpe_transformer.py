@@ -48,7 +48,9 @@ UNK_ID = 3
 
 
 class TranslationDataset(Dataset):
-    def __init__(self, pairs: Sequence[ParallelExample], sp, max_len: int, noise: float = 0.0):
+    def __init__(
+        self, pairs: Sequence[ParallelExample], sp, max_len: int, noise: float = 0.0
+    ):
         self.pairs = list(pairs)
         self.sp = sp
         self.max_len = max_len
@@ -58,12 +60,18 @@ class TranslationDataset(Dataset):
         return len(self.pairs)
 
     def _encode(self, text: str) -> list[int]:
-        ids = [BOS_ID] + self.sp.encode(text, out_type=int)[: self.max_len - 2] + [EOS_ID]
+        ids = (
+            [BOS_ID] + self.sp.encode(text, out_type=int)[: self.max_len - 2] + [EOS_ID]
+        )
         return ids
 
     def __getitem__(self, idx: int):
         ex = self.pairs[idx]
-        src = add_character_noise(ex.source, self.noise, seed=idx) if self.noise else ex.source
+        src = (
+            add_character_noise(ex.source, self.noise, seed=idx)
+            if self.noise
+            else ex.source
+        )
         return torch.tensor(self._encode(src)), torch.tensor(self._encode(ex.target))
 
 
@@ -84,7 +92,9 @@ class PositionalEncoding(nn.Module):
         super().__init__()
         pe = torch.zeros(max_len, dim)
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, dim, 2).float() * (-math.log(10000.0) / dim))
+        div_term = torch.exp(
+            torch.arange(0, dim, 2).float() * (-math.log(10000.0) / dim)
+        )
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
         self.register_buffer("pe", pe.unsqueeze(0))
@@ -94,7 +104,15 @@ class PositionalEncoding(nn.Module):
 
 
 class BPETransformer(nn.Module):
-    def __init__(self, vocab_size: int, d_model: int, nhead: int, num_layers: int, dim_ff: int, dropout: float):
+    def __init__(
+        self,
+        vocab_size: int,
+        d_model: int,
+        nhead: int,
+        num_layers: int,
+        dim_ff: int,
+        dropout: float,
+    ):
         super().__init__()
         self.d_model = d_model
         self.src_emb = nn.Embedding(vocab_size, d_model, padding_idx=PAD_ID)
@@ -114,7 +132,9 @@ class BPETransformer(nn.Module):
     def forward(self, src, tgt_in):
         src_pad = src.eq(PAD_ID)
         tgt_pad = tgt_in.eq(PAD_ID)
-        tgt_mask = nn.Transformer.generate_square_subsequent_mask(tgt_in.size(1), device=tgt_in.device)
+        tgt_mask = nn.Transformer.generate_square_subsequent_mask(
+            tgt_in.size(1), device=tgt_in.device
+        )
         src_e = self.pos(self.src_emb(src) * math.sqrt(self.d_model))
         tgt_e = self.pos(self.tgt_emb(tgt_in) * math.sqrt(self.d_model))
         y = self.transformer(
@@ -128,9 +148,13 @@ class BPETransformer(nn.Module):
         return self.out(y)
 
 
-def train_sentencepiece(pairs: Sequence[ParallelExample], out_dir: str, vocab_size: int) -> str:
+def train_sentencepiece(
+    pairs: Sequence[ParallelExample], out_dir: str, vocab_size: int
+) -> str:
     if spm is None:
-        raise RuntimeError("sentencepiece is required. Install project dependencies first.")
+        raise RuntimeError(
+            "sentencepiece is required. Install project dependencies first."
+        )
     os.makedirs(out_dir, exist_ok=True)
     corpus_path = os.path.join(out_dir, "bpe_corpus.txt")
     with open(corpus_path, "w", encoding="utf-8") as f:
@@ -165,19 +189,34 @@ def greedy_decode(model, sp, src, max_len: int, device) -> list[str]:
                 ys = torch.cat([ys, torch.tensor([[next_id]], device=device)], dim=1)
                 if next_id == EOS_ID:
                     break
-            ids = [i for i in ys.squeeze(0).tolist() if i not in (BOS_ID, EOS_ID, PAD_ID)]
+            ids = [
+                i for i in ys.squeeze(0).tolist() if i not in (BOS_ID, EOS_ID, PAD_ID)
+            ]
             hyps.append(sp.decode(ids))
     return hyps
 
 
 def evaluate(model, sp, pairs, args, noise: float, device) -> dict[str, float]:
     ds = TranslationDataset(pairs, sp, args.max_len, noise=noise)
-    loader = DataLoader(ds, batch_size=args.eval_batch_size, shuffle=False, collate_fn=collate)
+    loader = DataLoader(
+        ds, batch_size=args.eval_batch_size, shuffle=False, collate_fn=collate
+    )
     hyps, refs = [], []
     for src, tgt in tqdm(loader, desc=f"eval noise={noise:.2f}"):
         hyps.extend(greedy_decode(model, sp, src, args.max_len, device))
-        refs.extend([sp.decode([i for i in row.tolist() if i not in (BOS_ID, EOS_ID, PAD_ID)]) for row in tgt])
-    return {"BLEU": compute_bleu(hyps, refs), "chrF++": compute_chrf(hyps, refs), "TER": compute_ter(hyps, refs)}
+        refs.extend(
+            [
+                sp.decode(
+                    [i for i in row.tolist() if i not in (BOS_ID, EOS_ID, PAD_ID)]
+                )
+                for row in tgt
+            ]
+        )
+    return {
+        "BLEU": compute_bleu(hyps, refs),
+        "chrF++": compute_chrf(hyps, refs),
+        "TER": compute_ter(hyps, refs),
+    }
 
 
 def main():
@@ -201,27 +240,70 @@ def main():
     p.add_argument("--dim_ff", type=int, default=2048)
     p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--lr", type=float, default=3e-4)
-    p.add_argument("--noise_levels", type=float, nargs="+", default=list(DEFAULT_NOISE_LEVELS))
+    p.add_argument(
+        "--noise_levels", type=float, nargs="+", default=list(DEFAULT_NOISE_LEVELS)
+    )
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument(
+        "--wandb", action="store_true", help="Enable Weights & Biases logging"
+    )
+    p.add_argument("--wandb_project", type=str, default=None)
+    p.add_argument("--wandb_name", type=str, default=None)
+    p.add_argument("--wandb_entity", type=str, default=os.environ.get("WANDB_ENTITY"))
     args = p.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
     print(f"Loading BhashaSetu fraction={args.fraction}")
-    pairs = load_bhashasetu_pairs(args.dataset, args.split, args.fraction, args.max_examples, args.src_col, args.tgt_col)
+
+    wandb_module = None
+    if args.wandb:
+        from experiment_config import setup_wandb
+
+        wandb_module = setup_wandb(
+            args.out_dir,
+            project=args.wandb_project,
+            name=args.wandb_name,
+            entity=args.wandb_entity,
+            config={},
+        )
+    pairs = load_bhashasetu_pairs(
+        args.dataset,
+        args.split,
+        args.fraction,
+        args.max_examples,
+        args.src_col,
+        args.tgt_col,
+    )
     if len(pairs) < 2:
-        raise RuntimeError("Need at least two parallel examples. Check src/tgt columns.")
+        raise RuntimeError(
+            "Need at least two parallel examples. Check src/tgt columns."
+        )
     split = max(1, int(len(pairs) * 0.95))
-    train_pairs, eval_pairs = pairs[:split], pairs[split: split + args.eval_examples]
+    train_pairs, eval_pairs = pairs[:split], pairs[split : split + args.eval_examples]
     if not eval_pairs:
         eval_pairs = train_pairs[: min(args.eval_examples, len(train_pairs))]
 
     sp_model = train_sentencepiece(train_pairs, args.out_dir, args.vocab_size)
     sp = spm.SentencePieceProcessor(model_file=sp_model)
     train_ds = TranslationDataset(train_pairs, sp, args.max_len)
-    loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate)
+    loader = DataLoader(
+        train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate
+    )
 
     device = torch.device(args.device)
-    model = BPETransformer(sp.get_piece_size(), args.d_model, args.nhead, args.num_layers, args.dim_ff, args.dropout).to(device)
+    model = BPETransformer(
+        sp.get_piece_size(),
+        args.d_model,
+        args.nhead,
+        args.num_layers,
+        args.dim_ff,
+        args.dropout,
+    ).to(device)
+    if wandb_module is not None:
+        try:
+            wandb_module.watch(model, log="all", log_freq=100)
+        except Exception:
+            pass
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
     criterion = nn.CrossEntropyLoss(ignore_index=PAD_ID)
 
@@ -232,26 +314,65 @@ def main():
             src, tgt = src.to(device), tgt.to(device)
             opt.zero_grad()
             logits = model(src, tgt[:, :-1])
-            loss = criterion(logits.reshape(-1, logits.size(-1)), tgt[:, 1:].reshape(-1))
+            loss = criterion(
+                logits.reshape(-1, logits.size(-1)), tgt[:, 1:].reshape(-1)
+            )
             loss.backward()
             opt.step()
             total += float(loss.item())
             steps += 1
-        print(f"epoch={epoch + 1} train_loss={total / max(1, steps):.4f}")
-        torch.save(model.state_dict(), os.path.join(args.out_dir, f"bpe_transformer_fraction{args.fraction}_epoch{epoch + 1}.pt"))
+        avg_loss = total / max(1, steps)
+        print(f"epoch={epoch + 1} train_loss={avg_loss:.4f}")
+        if wandb_module is not None:
+            try:
+                wandb_module.log({"train/loss": avg_loss}, step=epoch + 1)
+            except Exception:
+                pass
+        torch.save(
+            model.state_dict(),
+            os.path.join(
+                args.out_dir,
+                f"bpe_transformer_fraction{args.fraction}_epoch{epoch + 1}.pt",
+            ),
+        )
 
     rows = []
     for noise in args.noise_levels:
         metrics = evaluate(model, sp, eval_pairs, args, noise, device)
-        row = {"model": "bpe_transformer", "fraction": args.fraction, "noise": noise, **metrics}
+        row = {
+            "model": "bpe_transformer",
+            "fraction": args.fraction,
+            "noise": noise,
+            **metrics,
+        }
         rows.append(row)
         print(row)
+        if wandb_module is not None:
+            try:
+                wandb_module.log(
+                    {
+                        f"eval/noise_{noise}/BLEU": metrics["BLEU"],
+                        f"eval/noise_{noise}/chrF++": metrics["chrF++"],
+                        f"eval/noise_{noise}/TER": metrics["TER"],
+                    }
+                )
+            except Exception:
+                pass
 
     out_csv = os.path.join(args.out_dir, f"metrics_fraction{args.fraction}.csv")
     with open(out_csv, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["model", "fraction", "noise", "BLEU", "chrF++", "TER"])
-        writer.writeheader(); writer.writerows(rows)
+        writer = csv.DictWriter(
+            f, fieldnames=["model", "fraction", "noise", "BLEU", "chrF++", "TER"]
+        )
+        writer.writeheader()
+        writer.writerows(rows)
     print(f"Wrote {out_csv}")
+
+    if wandb_module is not None:
+        try:
+            wandb_module.finish()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
