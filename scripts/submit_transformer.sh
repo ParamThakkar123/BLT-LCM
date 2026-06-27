@@ -34,7 +34,10 @@ uv run lcm_scripts/train_bpe_transformer.py \
     --epochs 3 \
     --batch_size 32 \
     --noise_levels 0.0 0.1 0.2 \
-    --out_dir "runs/${RUN_NAME}"
+    --out_dir "runs/${RUN_NAME}" \
+    --wandb \
+    --wandb_project "BLT-LCM" \
+    --wandb_name "$RUN_NAME"
 
 echo "Job finished: $(date)"
 echo "Total elapsed: $(( $(date +%s) - START ))s"

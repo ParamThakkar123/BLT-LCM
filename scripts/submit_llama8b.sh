@@ -46,6 +46,9 @@ uv run lcm_scripts/train_bpe_llama8b.py \
     --grad_accum 16 \
     --noise_levels 0.0 0.1 0.2 \
     --out_dir "runs/${RUN_NAME}" \
+    --wandb \
+    --wandb_project "BLT-LCM" \
+    --wandb_name "$RUN_NAME" \
     $QLORA_FLAG
 
 echo "Job finished: $(date)"
