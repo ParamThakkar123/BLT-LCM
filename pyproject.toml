@@ -14,7 +14,7 @@ build-backend = "setuptools.build_meta"
     "sentencepiece",
     "tiktoken",
     "sonar-space",
-    "fairseq2",
+    "fairseq2~=0.3.0",
     "datasets",
     "numpy>=1.26.0,<2.0",
     "tqdm",
