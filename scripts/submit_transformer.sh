@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -J bpe-lcm
+#SBATCH -J bpe-transformer
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --nodes=1
@@ -11,13 +11,13 @@
 #SBATCH --error=logs/%x_%j.err
 
 # Usage (via wrapper — recommended):
-#   scripts/sbatch.sh scripts/submit_bpe_lcm.sh [fraction] [run_name]
-#   scripts/sbatch.sh scripts/submit_bpe_lcm.sh 0.25 lcm_bpe_25
-#   scripts/sbatch.sh scripts/submit_bpe_lcm.sh 0.50 lcm_bpe_50
-#   scripts/sbatch.sh scripts/submit_bpe_lcm.sh 0.80 lcm_bpe_80
+#   scripts/sbatch.sh scripts/submit_transformer.sh [fraction] [run_name]
+#   scripts/sbatch.sh scripts/submit_transformer.sh 0.25 bpe_transformer_25
+#   scripts/sbatch.sh scripts/submit_transformer.sh 0.50 bpe_transformer_50
+#   scripts/sbatch.sh scripts/submit_transformer.sh 0.80 bpe_transformer_80
 
 FRACTION=${1:-0.25}
-RUN_NAME=${2:-"lcm_bpe_$(echo $FRACTION | tr -d '.')"}
+RUN_NAME=${2:-"bpe_transformer_$(echo $FRACTION | tr -d '.')"}
 
 REPO_DIR=$(realpath "$(dirname "$0")/..")
 cd "$REPO_DIR"
@@ -29,15 +29,12 @@ set -a && source .env && set +a
 echo "Job started:  $(date)"
 START=$(date +%s)
 
-uv run lcm_scripts/train_lcm_bpe.py \
+uv run lcm_scripts/train_bpe_transformer.py \
     --fraction "$FRACTION" \
-    --epochs 2 \
-    --batch_size 8 \
+    --epochs 3 \
+    --batch_size 32 \
     --noise_levels 0.0 0.1 0.2 \
-    --out_dir "runs/${RUN_NAME}" \
-    --wandb \
-    --wandb_project "BLT-LCM" \
-    --wandb_name "$RUN_NAME"
+    --out_dir "runs/${RUN_NAME}"
 
 echo "Job finished: $(date)"
 echo "Total elapsed: $(( $(date +%s) - START ))s"

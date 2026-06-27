@@ -7,21 +7,22 @@
 #SBATCH --time=2-00:00:00
 #SBATCH --gres=gpu:1
 #SBATCH --mem=48G
-#SBATCH --output=/mnt/lustre/home/gehler/gfh098/dev/BLT-LCM/logs/encode_%j.out
-#SBATCH --error=/mnt/lustre/home/gehler/gfh098/dev/BLT-LCM/logs/encode_%j.err
+#SBATCH --output=logs/%x_%j.out
+#SBATCH --error=logs/%x_%j.err
 
 # Pre-compute and cache BLT embeddings for a given dataset fraction.
-# Run this once per fraction before submitting training jobs.
+# Run once per fraction before submitting training jobs.
 #
-# Usage:
-#   sbatch scripts/encode_blt.sh [fraction]
-#   sbatch scripts/encode_blt.sh 0.25
-#   sbatch scripts/encode_blt.sh 1.0
+# Usage (via wrapper — recommended):
+#   scripts/sbatch.sh scripts/encode_blt.sh [fraction]
+#   scripts/sbatch.sh scripts/encode_blt.sh 0.25
+#   scripts/sbatch.sh scripts/encode_blt.sh 0.50
+#   scripts/sbatch.sh scripts/encode_blt.sh 0.80
 
 FRACTION=${1:-1.0}
 CACHE_NAME="blt_embeddings_frac$(echo $FRACTION | tr -d '.').pth"
 
-REPO_DIR=/mnt/lustre/home/gehler/gfh098/dev/BLT-LCM
+REPO_DIR=$(realpath "$(dirname "$0")/..")
 cd "$REPO_DIR"
 
 mkdir -p logs embeddings

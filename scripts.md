@@ -345,26 +345,54 @@ print('\\\\begin{tabular}{lcccc}')
 
 ## 8. Slurm Cluster Submission
 
-Existing Slurm scripts in `scripts/`:
+Set `CLUSTER_PARTITION` in `.env` (copy from `.env.example`) to select the GPU queue.
+Then use `scripts/sbatch.sh` as a drop-in replacement for `sbatch` — it reads the partition
+from `.env` automatically, so the same commands work on Galvani, Ferranti, and any other cluster.
 
 ```bash
-# BLT-LCM
-sbatch scripts/submit_blt.sh 0.25 lcm_blt_25 11:00:00
-sbatch scripts/submit_blt.sh 0.50 lcm_blt_50 21:00:00
-sbatch scripts/submit_blt.sh 0.80 lcm_blt_80 1-09:00
+# Pre-encode BLT embeddings (run once per fraction before BLT-LCM training)
+scripts/sbatch.sh scripts/encode_blt.sh 0.25
+scripts/sbatch.sh scripts/encode_blt.sh 0.50
+scripts/sbatch.sh scripts/encode_blt.sh 0.80
 
-# Pre-encode BLT embeddings
-sbatch scripts/encode_blt.sh 0.25
-sbatch scripts/encode_blt.sh 0.50
-sbatch scripts/encode_blt.sh 0.80
+# BLT-LCM — train
+scripts/sbatch.sh scripts/submit_blt.sh 0.25 lcm_blt_25 11:00:00
+scripts/sbatch.sh scripts/submit_blt.sh 0.50 lcm_blt_50 21:00:00
+scripts/sbatch.sh scripts/submit_blt.sh 0.80 lcm_blt_80 1-09:00
 
-# BPE-LCM
-sbatch scripts/submit_bpe_lcm.sh 0.25 lcm_bpe_25
-sbatch scripts/submit_bpe_lcm.sh 0.50 lcm_bpe_50
-sbatch scripts/submit_bpe_lcm.sh 0.80 lcm_bpe_80
+# BLT-LCM — evaluate
+scripts/sbatch.sh scripts/eval_blt.sh 0.25 lcm_blt_25
+scripts/sbatch.sh scripts/eval_blt.sh 0.50 lcm_blt_50
+scripts/sbatch.sh scripts/eval_blt.sh 0.80 lcm_blt_80
 
-# SONAR-LCM
-sbatch scripts/submit_sonar.sh 0.25 lcm_sonar_25
-sbatch scripts/submit_sonar.sh 0.50 lcm_sonar_50
-sbatch scripts/submit_sonar.sh 0.80 lcm_sonar_80
+# BLT-LCM — full metric suite (requires hypothesis files from eval step)
+scripts/sbatch.sh scripts/metric_suite.sh 0.25 lcm_blt_25
+scripts/sbatch.sh scripts/metric_suite.sh 0.50 lcm_blt_50
+scripts/sbatch.sh scripts/metric_suite.sh 0.80 lcm_blt_80
+
+# BPE-LCM — train & evaluate
+scripts/sbatch.sh scripts/submit_bpe_lcm.sh 0.25 lcm_bpe_25
+scripts/sbatch.sh scripts/submit_bpe_lcm.sh 0.50 lcm_bpe_50
+scripts/sbatch.sh scripts/submit_bpe_lcm.sh 0.80 lcm_bpe_80
+
+# SONAR-LCM — train & evaluate
+scripts/sbatch.sh scripts/submit_sonar.sh 0.25 lcm_sonar_25 11:00:00
+scripts/sbatch.sh scripts/submit_sonar.sh 0.50 lcm_sonar_50 21:00:00
+scripts/sbatch.sh scripts/submit_sonar.sh 0.80 lcm_sonar_80 1-09:00
+
+# SONAR-LCM — evaluate existing checkpoint separately
+scripts/sbatch.sh scripts/eval_sonar.sh 0.25 lcm_sonar_25 2
+
+# BPE + Llama-8B — QLoRA (default, ~16GB VRAM)
+scripts/sbatch.sh scripts/submit_llama8b.sh 0.25 bpe_llama8b_25_qlora qlora
+scripts/sbatch.sh scripts/submit_llama8b.sh 0.50 bpe_llama8b_50_qlora qlora
+scripts/sbatch.sh scripts/submit_llama8b.sh 0.80 bpe_llama8b_80_qlora qlora
+
+# BPE + Llama-8B — full precision (~48GB VRAM, 25% only)
+scripts/sbatch.sh scripts/submit_llama8b.sh 0.25 bpe_llama8b_25_full full
+
+# BPE + Transformer — train & evaluate
+scripts/sbatch.sh scripts/submit_transformer.sh 0.25 bpe_transformer_25
+scripts/sbatch.sh scripts/submit_transformer.sh 0.50 bpe_transformer_50
+scripts/sbatch.sh scripts/submit_transformer.sh 0.80 bpe_transformer_80
 ```
