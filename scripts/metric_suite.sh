@@ -23,7 +23,7 @@ FRACTION=${1:-0.25}
 RUN_NAME=${2:-"lcm_blt_$(echo $FRACTION | tr -d '.')"}
 FRAC_TAG=$(echo "$FRACTION" | tr -d '.')
 
-REPO_DIR=$(realpath "$(dirname "$0")/..")
+REPO_DIR=${SLURM_SUBMIT_DIR:-$(realpath "$(dirname "$0")/..")}
 cd "$REPO_DIR"
 
 mkdir -p logs results

@@ -24,7 +24,7 @@ FRACTION=${1:-0.25}
 RUN_NAME=${2:-"bpe_llama8b_$(echo $FRACTION | tr -d '.')"}
 MODE=${3:-qlora}    # "qlora" (default) or "full"
 
-REPO_DIR=$(realpath "$(dirname "$0")/..")
+REPO_DIR=${SLURM_SUBMIT_DIR:-$(realpath "$(dirname "$0")/..")}
 cd "$REPO_DIR"
 
 mkdir -p logs

@@ -22,7 +22,7 @@
 FRACTION=${1:-1.0}
 CACHE_NAME="blt_embeddings_frac$(echo $FRACTION | tr -d '.').pth"
 
-REPO_DIR=$(realpath "$(dirname "$0")/..")
+REPO_DIR=${SLURM_SUBMIT_DIR:-$(realpath "$(dirname "$0")/..")}
 cd "$REPO_DIR"
 
 mkdir -p logs embeddings
