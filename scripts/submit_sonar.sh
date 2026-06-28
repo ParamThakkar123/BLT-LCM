@@ -28,6 +28,10 @@ mkdir -p logs
 
 set -a && source .env && set +a
 
+# Ensure libcudart.so.12 is visible to fairseq2n native extension
+_cuda_lib=$(ldconfig -p 2>/dev/null | awk '/libcudart\.so\.12/{print $NF}' | head -1 | xargs dirname 2>/dev/null)
+[ -n "$_cuda_lib" ] && export LD_LIBRARY_PATH="$_cuda_lib:${LD_LIBRARY_PATH:-}"
+
 echo "Job started:  $(date)"
 START=$(date +%s)
 

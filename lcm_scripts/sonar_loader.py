@@ -35,6 +35,11 @@ class SonarLoader:
 
     def _load_pipeline(self):
         """Load the real SONAR Marathi encoder pipeline from Hugging Face."""
+        # fairseq2 0.2.x exposes 'asset_store'; sonar-space 0.3.x expects 'default_asset_store'
+        import fairseq2.assets as _fa
+        if not hasattr(_fa, "default_asset_store") and hasattr(_fa, "asset_store"):
+            _fa.default_asset_store = _fa.asset_store
+
         from sonar.inference_pipelines.text import TextToEmbeddingModelPipeline
         from sonar.models.sonar_text.builder import (
             create_sonar_text_encoder_model,
