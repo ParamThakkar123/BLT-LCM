@@ -24,6 +24,8 @@ RUN_NAME=${2:-"lcm_blt_$(echo $FRACTION | tr -d '.')"}
 FRAC_TAG=$(echo "$FRACTION" | tr -d '.')
 
 REPO_DIR=${SLURM_SUBMIT_DIR:-$(realpath "$(dirname "$0")/..")}
+APPTAINER_IMAGE=${APPTAINER_IMAGE:-"$REPO_DIR/lcm-sonar.sif"}
+
 cd "$REPO_DIR"
 
 mkdir -p logs results
@@ -33,7 +35,11 @@ set -a && source .env && set +a
 echo "Job started:  $(date)"
 START=$(date +%s)
 
-uv run lcm_scripts/run_metric_suite.py \
+apptainer exec --nv \
+    --bind "$REPO_DIR:/workspace" \
+    --pwd /workspace \
+    "$APPTAINER_IMAGE" \
+    python -u lcm_scripts/run_metric_suite.py \
     --checkpoints_dir "lcm_models/${RUN_NAME}" \
     --checkpoint_glob "lcm_blt_best.pth" \
     --hyp_dir "outputs/${RUN_NAME}_hyps" \

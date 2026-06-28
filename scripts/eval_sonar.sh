@@ -22,6 +22,8 @@ EPOCHS=${3:-2}
 FRAC_TAG=$(echo "$FRACTION" | tr -d '.')
 
 REPO_DIR=${SLURM_SUBMIT_DIR:-$(realpath "$(dirname "$0")/..")}
+APPTAINER_IMAGE=${APPTAINER_IMAGE:-"$REPO_DIR/lcm-sonar.sif"}
+
 cd "$REPO_DIR"
 
 mkdir -p logs
@@ -31,7 +33,11 @@ set -a && source .env && set +a
 echo "Job started:  $(date)"
 START=$(date +%s)
 
-uv run lcm_scripts/eval_lcm_sonar.py \
+apptainer exec --nv \
+    --bind "$REPO_DIR:/workspace" \
+    --pwd /workspace \
+    "$APPTAINER_IMAGE" \
+    python -u lcm_scripts/eval_lcm_sonar.py \
     --checkpoint "runs/${RUN_NAME}/lcm_sonar_fraction${FRACTION}_epoch${EPOCHS}.pth" \
     --fraction "$FRACTION" \
     --eval_docs 100 \

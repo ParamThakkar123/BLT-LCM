@@ -23,6 +23,8 @@ FRACTION=${1:-1.0}
 CACHE_NAME="blt_embeddings_frac$(echo $FRACTION | tr -d '.').pth"
 
 REPO_DIR=${SLURM_SUBMIT_DIR:-$(realpath "$(dirname "$0")/..")}
+APPTAINER_IMAGE=${APPTAINER_IMAGE:-"$REPO_DIR/lcm-sonar.sif"}
+
 cd "$REPO_DIR"
 
 mkdir -p logs embeddings
@@ -32,7 +34,11 @@ set -a && source .env && set +a
 echo "Job started:  $(date)"
 START=$(date +%s)
 
-uv run lcm_scripts/train_lcm_blt.py \
+apptainer exec --nv \
+    --bind "$REPO_DIR:/workspace" \
+    --pwd /workspace \
+    "$APPTAINER_IMAGE" \
+    python -u lcm_scripts/train_lcm_blt.py \
     --entropy_model patching_scratch/entropy_model_marathi.pt \
     --fraction "$FRACTION" \
     --epochs 0 \

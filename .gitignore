@@ -15,6 +15,7 @@ data/
 tea_debug.log
 blt_embeddings_cache.pth
 embeddings/
+singularity
 evaluation_results.txt
 outputs/
 results/mt_eval_results.csv
@@ -25,7 +26,12 @@ tokenization_statistics\patch_compression_by_morpheme_class.csv
 tokenization_statistics/patch_bpe_sentence_comparison.csv
 Tokeniser_Augmented.zip
 Tokeniser_Retrained.zip
+go1.13.linux-amd64.tar.gz
+singularity-3.5.3.tar.gz
 indic_nlp_resources/
 logs/
 tokenization_statistics/patch_compression_by_morpheme_class.png
 neurips_paper/references.bib
+
+# Apptainer container image
+*.sif

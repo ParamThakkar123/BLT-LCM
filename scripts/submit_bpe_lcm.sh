@@ -20,6 +20,8 @@ FRACTION=${1:-0.25}
 RUN_NAME=${2:-"lcm_bpe_$(echo $FRACTION | tr -d '.')"}
 
 REPO_DIR=${SLURM_SUBMIT_DIR:-$(realpath "$(dirname "$0")/..")}
+APPTAINER_IMAGE=${APPTAINER_IMAGE:-"$REPO_DIR/lcm-sonar.sif"}
+
 cd "$REPO_DIR"
 
 mkdir -p logs
@@ -29,7 +31,11 @@ set -a && source .env && set +a
 echo "Job started:  $(date)"
 START=$(date +%s)
 
-uv run lcm_scripts/train_lcm_bpe.py \
+apptainer exec --nv \
+    --bind "$REPO_DIR:/workspace" \
+    --pwd /workspace \
+    "$APPTAINER_IMAGE" \
+    python -u lcm_scripts/train_lcm_bpe.py \
     --fraction "$FRACTION" \
     --epochs 2 \
     --batch_size 8 \
