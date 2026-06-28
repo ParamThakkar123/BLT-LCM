@@ -29,7 +29,8 @@ mkdir -p logs
 set -a && source .env && set +a
 
 # Expose venv-bundled CUDA runtime to fairseq2n native extension
-export LD_LIBRARY_PATH="$(ls -d "$REPO_DIR"/.venv/lib/python*/site-packages/nvidia/cuda_runtime/lib 2>/dev/null | head -1):${LD_LIBRARY_PATH:-}"
+_cuda_lib=$(find "$REPO_DIR/.venv" -maxdepth 8 -name "libcudart.so*" -exec dirname {} \; 2>/dev/null | head -1)
+[ -n "$_cuda_lib" ] && export LD_LIBRARY_PATH="$_cuda_lib:${LD_LIBRARY_PATH:-}"
 
 echo "Job started:  $(date)"
 START=$(date +%s)
