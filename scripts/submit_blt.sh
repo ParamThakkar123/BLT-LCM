@@ -1,5 +1,4 @@
 #!/bin/bash
-set -euo pipefail
 #SBATCH -J lcm-blt
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -10,6 +9,8 @@ set -euo pipefail
 #SBATCH --mem=16G
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
+
+set -euo pipefail
 
 # Usage (via wrapper — recommended):
 #   scripts/sbatch.sh scripts/submit_blt.sh [fraction] [run_name] [time_limit]

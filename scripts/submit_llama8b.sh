@@ -1,5 +1,4 @@
 #!/bin/bash
-set -euo pipefail
 #SBATCH -J bpe-llama8b
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -10,6 +9,8 @@ set -euo pipefail
 #SBATCH --mem=48G
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
+
+set -euo pipefail
 
 # Train BPE + Llama-8B with LoRA (default: QLoRA 4-bit, ~16GB VRAM).
 # Without --qlora the model needs ~48GB VRAM; mem=48G covers both cases.

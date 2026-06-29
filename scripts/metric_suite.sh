@@ -1,5 +1,4 @@
 #!/bin/bash
-set -euo pipefail
 #SBATCH -J metric-suite
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -7,9 +6,11 @@ set -euo pipefail
 #SBATCH --partition=a100-galvani
 #SBATCH --time=4:00:00
 #SBATCH --gres=gpu:1
-#SBATCH --mem=16G
+#SBATCH --mem=120G
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
+
+set -euo pipefail
 
 # Run the full BLT-LCM metric suite (BLEU / chrF++ / METEOR / COMET / TER).
 # Requires hypothesis files to already exist in HYP_DIR.

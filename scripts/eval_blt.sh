@@ -1,5 +1,4 @@
 #!/bin/bash
-set -euo pipefail
 #SBATCH -J eval-blt
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -10,6 +9,8 @@ set -euo pipefail
 #SBATCH --mem=16G
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
+
+set -euo pipefail
 
 # Evaluate a trained BLT-LCM checkpoint (NN retrieval → BLEU / chrF++ / TER / METEOR / COMET).
 #
