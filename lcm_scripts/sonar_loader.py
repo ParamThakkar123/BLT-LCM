@@ -33,10 +33,15 @@ class SonarLoader:
             device=self.device,
         )
 
+    # SONAR text encoder max positional length is 514 tokens.
+    # For Marathi Devanagari, 1500 chars is a safe ceiling (~3 chars/token).
+    _MAX_CHARS = 1500
+
     def encode_sentences(self, sentences, lang="mar_Deva"):
         """Encode a list of sentences to 1024-dimensional SONAR embeddings."""
         if not sentences:
             return torch.empty(0, SONAR_EMBEDDING_DIM, device=self.device)
+        sentences = [s[: self._MAX_CHARS] for s in sentences]
         return self.model.predict(
             sentences,
             source_lang=lang,
