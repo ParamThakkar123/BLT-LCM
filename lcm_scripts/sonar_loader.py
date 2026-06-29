@@ -41,7 +41,6 @@ class SonarLoader:
             sentences,
             source_lang=lang,
             batch_size=self.batch_size,
-            target_device=self.device,
         )
 
     def decode_embeddings(self, embeddings, target_lang="mar_Deva"):
