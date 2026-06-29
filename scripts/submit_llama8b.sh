@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 #SBATCH -J bpe-llama8b
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
