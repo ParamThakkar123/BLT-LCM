@@ -40,10 +40,7 @@ class SonarLoader:
             create_sonar_text_encoder_model,
             sonar_text_encoder_archs,
         )
-        from sonar.models.sonar_text.loader import (
-            convert_sonar_text_encoder_checkpoint,
-            load_sonar_tokenizer,
-        )
+        from sonar.models.sonar_text.loader import load_sonar_tokenizer
 
         checkpoint_path = hf_hub_download(
             repo_id=self.encoder_repo_id,
@@ -52,8 +49,8 @@ class SonarLoader:
         config = sonar_text_encoder_archs.get_config("basic")
         encoder = create_sonar_text_encoder_model(config, device=self.device)
         checkpoint = torch.load(Path(checkpoint_path), map_location=self.device)
-        converted = convert_sonar_text_encoder_checkpoint(checkpoint, config)
-        state_dict = converted.get("model", converted)
+        # facebook/SONAR .pt files are flat state dicts — no conversion needed
+        state_dict = checkpoint.get("model", checkpoint)
         encoder.load_state_dict(state_dict)
         encoder.eval()
 
