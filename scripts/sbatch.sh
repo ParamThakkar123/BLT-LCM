@@ -15,6 +15,7 @@ REPO_DIR=$(realpath "$SCRIPT_DIR/..")
 [ -f "$REPO_DIR/.env" ] && set -a && source "$REPO_DIR/.env" && set +a
 
 PARTITION=${CLUSTER_PARTITION:-a100-galvani}
+MEM=${CLUSTER_MEM:-40G}
 mkdir -p "$REPO_DIR/logs"
 
-exec sbatch --partition="$PARTITION" "$@"
+exec sbatch --partition="$PARTITION" --mem="$MEM" "$@"
