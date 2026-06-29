@@ -49,7 +49,7 @@ class SonarLoader:
             repo_id=self.encoder_repo_id,
             filename=self.encoder_filename,
         )
-        config = sonar_text_encoder_archs.get("basic")
+        config = sonar_text_encoder_archs("basic")
         encoder = create_sonar_text_encoder_model(config, device=self.device)
         checkpoint = torch.load(Path(checkpoint_path), map_location=self.device)
         converted = convert_sonar_text_encoder_checkpoint(checkpoint, config)
