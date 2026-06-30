@@ -79,10 +79,16 @@ def compute_ter(hyps: List[str], refs: List[str]) -> float:
         return float("nan")
 
 
-def compute_meteor(hyps: List[str], refs: List[str]) -> float:
+def compute_meteor(hyps: List[str], refs: List[str], max_sentences: int = 10_000) -> float:
     if not _HAS_NLTK:
         warnings.warn("nltk not installed; METEOR unavailable")
         return float("nan")
+    # nltk single_meteor_score is ~8ms/call — cap to a sample to avoid multi-hour runtimes
+    if len(hyps) > max_sentences:
+        import random
+        indices = random.sample(range(len(hyps)), max_sentences)
+        hyps = [hyps[i] for i in indices]
+        refs = [refs[i] for i in indices]
     scores = []
     for h, r in zip(hyps, refs):
         try:
