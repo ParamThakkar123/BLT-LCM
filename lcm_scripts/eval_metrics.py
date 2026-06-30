@@ -130,7 +130,9 @@ def compute_comet(
         samples = [
             {"src": "", "mt": h, "ref": r} for h, r in zip(hyps, refs)
         ]
-        res = model.predict(samples, batch_size=32, gpus=0)
+        import torch
+        n_gpus = 1 if torch.cuda.is_available() else 0
+        res = model.predict(samples, batch_size=32, gpus=n_gpus)
 
         if isinstance(res, tuple):
             # comet returns (scores_list, system_score)

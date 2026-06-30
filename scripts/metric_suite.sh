@@ -4,7 +4,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --nodes=1
 #SBATCH --partition=a100-galvani
-#SBATCH --time=4:00:00
+#SBATCH --time=8:00:00
 #SBATCH --gres=gpu:1
 #SBATCH --mem=120G
 #SBATCH --output=logs/%x_%j.out
