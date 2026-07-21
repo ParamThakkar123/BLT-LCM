@@ -1,3 +1,8 @@
+if __name__ != "__main__":
+    raise ImportError(
+        "This module is a script and should not be imported. Run it directly."
+    )
+
 from datasets import load_dataset
 import json
 

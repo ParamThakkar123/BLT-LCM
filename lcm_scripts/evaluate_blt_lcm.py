@@ -21,6 +21,9 @@ def prepare_data(is_test=False, max_sent_per_doc=20):
     if is_test:
         test_start = int(total * 0.8)  # last 20%
         ds = ds.select(range(test_start, total))
+    else:
+        train_end = int(total * 0.8)  # first 80%, disjoint from test
+        ds = ds.select(range(train_end))
     docs = []
     for row in tqdm(ds, desc="Loading data"):
         text = row.get("marathi", "")
@@ -48,8 +51,8 @@ def collate(batch):
     max_len = max(s.shape[0] for s in srcs)
     emb_dim = srcs[0].shape[1]
     B = len(srcs)
-    src_p = torch.zeros(B, max_len, emb_dim)
-    tgt_p = torch.zeros(B, max_len, emb_dim)
+    src_p = torch.zeros(B, max_len, emb_dim, device=srcs[0].device, dtype=srcs[0].dtype)
+    tgt_p = torch.zeros(B, max_len, emb_dim, device=srcs[0].device, dtype=srcs[0].dtype)
     for i, (s, t) in enumerate(zip(srcs, tgts)):
         src_p[i, : s.shape[0]] = s
         tgt_p[i, : t.shape[0]] = t
@@ -63,12 +66,10 @@ def main():
     entropy_model_path = "patching_scratch/entropy_model_marathi.pt"
     blt = BLTLoader(entropy_model_path=entropy_model_path, device=str(device))
 
-    # Prepare training data for closest sentence lookup (use 10% to save time)
+    # Prepare training data for closest sentence lookup
     print("Preparing training data for lookup...")
     train_docs = prepare_data(is_test=False)
-    train_sentences = []
-    for doc in train_docs[: int(len(train_docs) * 0.1)]:  # 10%
-        train_sentences.extend(doc)
+    train_sentences = [s for doc in train_docs for s in doc]
     print(f"Loaded {len(train_sentences)} training sentences")
 
     # Encode training sentences
@@ -105,7 +106,7 @@ def main():
     # stack per-document tensors
     for i in range(len(embeddings_seqs)):
         if len(embeddings_seqs[i]) == 0:
-            embeddings_seqs[i] = torch.empty((0, blt.model.dim))
+            embeddings_seqs[i] = torch.empty((0, blt.dim))
         else:
             embeddings_seqs[i] = torch.stack(embeddings_seqs[i], dim=0)
 

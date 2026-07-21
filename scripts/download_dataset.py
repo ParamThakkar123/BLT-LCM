@@ -8,6 +8,11 @@ Usage:
   uv run scripts/download_dataset.py
 """
 
+import sys
+
+if __name__ != "__main__":
+    sys.exit(0)
+
 import os
 from dotenv import load_dotenv
 

@@ -29,7 +29,9 @@ class EmbeddingRetriever:
             embeddings: [N, embed_dim] normalized or raw embeddings.
         """
         self.sentences = sentences
-        self.embeddings = F.normalize(embeddings.float(), dim=1)
+        self.embeddings = F.normalize(
+            embeddings.float(), dim=1
+        )  # embeddings stay on original device
 
     @classmethod
     def from_corpus(
@@ -67,6 +69,11 @@ class EmbeddingRetriever:
                 flat.append(doc_emb)
         embeddings = torch.cat(flat, dim=0)
         n = min(len(sentences), embeddings.shape[0])
+        if len(sentences) != embeddings.shape[0]:
+            raise ValueError(
+                f"Mismatch: {len(sentences)} sentences vs {embeddings.shape[0]} embeddings. "
+                "Sentences and embeddings must have the same length."
+            )
         return cls(sentences[:n], embeddings[:n])
 
     def retrieve(

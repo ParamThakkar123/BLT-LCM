@@ -3,7 +3,9 @@
 This project implements BLT-LCM (Byte Latent Transformer - Large Concept Model) for script-agnostic concept extraction in Marathi machine translation, and provides tooling to train and evaluate two concept sources:
 
 - SONAR-lite (in-repo SONAR-like byte encoder → bottleneck → decoder)
-- BLT-derived patch embeddings (using the entropy model in `patching_scratch`)
+- BLT concept embeddings: entropy-based patch boundaries + a cross-attention pooler over byte hidden states (the entropy model in `patching_scratch` decides boundaries only), decoded back to text by a trained generative byte decoder
+
+The concept model is trained for English → Marathi translation (`train_lcm_blt_mt.py`); a monolingual concept next-sentence variant (`train_lcm_blt.py`) is also included for analysis.
 
 Key scripts live under `lcm_scripts/`.
 
@@ -135,8 +137,11 @@ python tokenization_statistics/patch_compression_by_morpheme_class.py \
 
 - `lcm_scripts/train_sonar.py` — pretrain SONAR-lite (denoising AE + MSE bottleneck distillation). Supports `--wandb` logging. Streams sentences from `ParamTh/BhashaSetu` by default.
 - `lcm_scripts/train_lcm_sonar.py` — encode documents with SONAR-lite and train BaseLCM on SONAR embeddings.
-- `lcm_scripts/train_lcm_blt.py` — compute BLT sentence embeddings (via `lcm_scripts/blt_loader.py` and `patching_scratch/entropy_model_marathi.pt`) and train BaseLCM on BLT embeddings.
-- `lcm_scripts/blt_loader.py` — BLT loader that uses the entropy model checkpoint to extract patch embeddings and aggregate them to sentence embeddings (mean pooling by default).
+- `lcm_scripts/train_lcm_blt.py` — compute BLT sentence embeddings (via `lcm_scripts/blt_loader.py`) and train BaseLCM on them (concept next-sentence task). Pass `--pooler lcm_models/blt_pooler.pth` to use the learned pooler.
+- `lcm_scripts/train_lcm_blt_mt.py` — **English → Marathi machine translation** at the concept level: train BaseLCM to map the source concept to the target concept, then decode to Marathi generatively; evaluates across source-noise levels and writes a metrics CSV.
+- `lcm_scripts/blt_loader.py` — BLT loader. The entropy model is used **only** to place patch boundaries; patch representations are pooled from byte *hidden states* by a cross-attention pooler (BLT §3.2.2), then averaged into a sentence concept (dim 256).
+- `lcm_scripts/blt_decoder.py` — trains the cross-attention pooler + a generative byte decoder jointly (byte-reconstruction; backbone frozen). Produces `lcm_models/blt_pooler.pth` and `lcm_models/blt_decoder.pth` used by BLT training/eval/MT.
+- `lcm_scripts/eval_lcm_blt.py` — evaluates BLT-LCM; predicted concepts are decoded to text **generatively** with `BLTDecoder` (`--decode_method generative`, default). `--decode_method retrieval` is a nearest-neighbor baseline only.
 - `lcm_scripts/eval_metrics.py` and `lcm_scripts/eval_runner.py` — evaluation metrics wrappers (BLEU/chrF/TER via sacrebleu, METEOR via NLTK, optional COMET) and runner for noisy-input tests.
 - `lcm_scripts/experiment_config.py` — helpers for YAML configs, TensorBoard (`setup_logging`), W&B (`setup_wandb`), and a VRAM check helper.
 - `patching_scratch/entropy_model_marathi.pt` — example entropy model checkpoint used by the BLT loader.
@@ -204,11 +209,12 @@ Options for fine-tuning:
 - `--freeze_postnet`: Freeze the output projection layers  
 - `--freeze_layers N`: Freeze the first N transformer layers
 - `--lr`: Set a lower learning rate (default 1e-5 for fine-tuning)
-- `--lora`: Enable LoRA fine-tuning for parameter efficiency
-- `--qlora`: Enable QLoRA (4-bit quantization + LoRA) for memory efficiency
+- `--lora`: Enable LoRA (parameter-efficient) fine-tuning of the pretrained LCM checkpoint
 - `--lora_rank`: LoRA rank (default 8)
 - `--lora_alpha`: LoRA alpha (default 32)
-- `--target_modules`: Modules to apply LoRA (default ["linear"] for all Linear layers)
+- `--target_modules`: Modules to apply LoRA (default `["linear"]`, i.e. the PreNet/PostNet projections)
+
+(4-bit "QLoRA" for the LCM was removed: `BaseLCM` is a custom fp32 module, so no genuine 4-bit quantization was applied. Real QLoRA remains available for the Llama-8B baseline in `train_bpe_llama8b.py`.)
 
 5) Run evaluation (generate hypothesis/reference files first, one sentence per line):
 

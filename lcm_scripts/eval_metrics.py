@@ -1,6 +1,6 @@
 # Lightweight evaluation metric wrappers (BLEU, chrF, METEOR, TER, COMET optional)
 import warnings
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict, Optional, Union, Sequence
 
 try:
     import sacrebleu
@@ -38,9 +38,7 @@ except Exception:
     _HAS_COMET = False
 
 
-def _ensure_refs(refs: List[List[str]]):
-    # sacrebleu expects list of reference lists (one list per reference file)
-    # We accept refs as List[str] or List[List[str]]
+def _ensure_refs(refs: Union[List[str], List[List[str]]]) -> List[List[str]]:
     if not refs:
         return []
     if isinstance(refs[0], str):
@@ -48,7 +46,7 @@ def _ensure_refs(refs: List[List[str]]):
     return refs
 
 
-def compute_bleu(hyps: List[str], refs: List[str]) -> float:
+def compute_bleu(hyps: List[str], refs: Union[List[str], List[List[str]]]) -> float:
     refs2 = _ensure_refs(refs)
     if _HAS_SACREBLEU:
         bleu = sacrebleu.corpus_bleu(hyps, refs2)
@@ -58,7 +56,7 @@ def compute_bleu(hyps: List[str], refs: List[str]) -> float:
         return float("nan")
 
 
-def compute_chrf(hyps: List[str], refs: List[str]) -> float:
+def compute_chrf(hyps: List[str], refs: Union[List[str], List[List[str]]]) -> float:
     refs2 = _ensure_refs(refs)
     if _HAS_SACREBLEU:
         # chrF++ corresponds to enabling word n-grams (word_order=2).
@@ -69,7 +67,7 @@ def compute_chrf(hyps: List[str], refs: List[str]) -> float:
         return float("nan")
 
 
-def compute_ter(hyps: List[str], refs: List[str]) -> float:
+def compute_ter(hyps: List[str], refs: Union[List[str], List[List[str]]]) -> float:
     refs2 = _ensure_refs(refs)
     if _HAS_SACREBLEU:
         ter = sacrebleu.corpus_ter(hyps, refs2)
@@ -127,9 +125,7 @@ def compute_comet(
         return float("nan")
 
     try:
-        samples = [
-            {"src": "", "mt": h, "ref": r} for h, r in zip(hyps, refs)
-        ]
+        samples = [{"src": "", "mt": h, "ref": r} for h, r in zip(hyps, refs)]
         res = model.predict(samples, batch_size=32, gpus=0)
 
         if isinstance(res, tuple):
@@ -150,26 +146,23 @@ def compute_comet(
 
 def compute_all(
     hyps: List[str],
-    refs: List[str],
+    refs: Union[List[str], List[List[str]]],
     comet_model_name: Optional[str] = None,
     comet_model_obj: Optional[object] = None,
 ) -> Dict[str, float]:
-    # refs can be List[str] (single ref) or List[List[str]]
-    # expand refs to single list when computing metrics that expect parallel lists
-    if isinstance(refs[0], list):
-        # choose first reference for metrics that do not support multiple refs
-        refs_single = [r[0] for r in zip(*refs)] if refs else []
+    # METEOR/COMET require List[str] refs; extract first reference if multi-ref
+    if refs and isinstance(refs[0], list):
+        refs_flat: List[str] = [r[0] for r in refs]
     else:
-        refs_single = refs
+        refs_flat = refs  # type: ignore[assignment]
 
     out = {}
     out["BLEU"] = compute_bleu(hyps, refs)
     out["chrF++"] = compute_chrf(hyps, refs)
     out["TER"] = compute_ter(hyps, refs)
-    out["METEOR"] = compute_meteor(hyps, refs_single)
-    # COMET skipped by default
+    out["METEOR"] = compute_meteor(hyps, refs_flat)
     out["COMET"] = compute_comet(
-        hyps, refs, model_name=comet_model_name, model_obj=comet_model_obj
+        hyps, refs_flat, model_name=comet_model_name, model_obj=comet_model_obj
     )
     return out
 

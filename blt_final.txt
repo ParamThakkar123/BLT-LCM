@@ -1,0 +1,19 @@
+277:         for src, tgt in tqdm(dataloader):
+278:             src = src.to(device)
+279:             tgt = tgt.to(device)
+280:             if tgt.shape[1] == 0:
+281:                 continue
+282:             optim.zero_grad()
+283:             pred = model(src, tgt)
+284:             # Mask loss over padded (zero) positions
+285:             mask = (tgt.abs().sum(dim=-1, keepdim=True) > 0).float()
+286:             loss = ((pred - tgt).pow(2) * mask).sum() / mask.sum().clamp(min=1)
+287:             loss.backward()
+288:             optim.step()
+289:             total += loss.item()
+290:             n += 1
+291:             global_step += 1
+292: 
+293:             # periodic autosave: save intermediate checkpoint and cleanup old ones
+294:             if (
+295:                 args.save_interval_steps > 0

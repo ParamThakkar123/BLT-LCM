@@ -137,10 +137,13 @@ def bounded_subset(items: Sequence[str], ids: Set[int], label: str) -> List[str]
 
 
 def theoretical_factor(fertility_lambda: float, exponent: float) -> float:
-    """Return f(λ)=λ^-α for the error bound E(BLT) ≤ f(λ)·E(BPE).
+    """Return f(λ)=λ^-α for the *empirical diagnostic* E(BLT) ≤ f(λ)·E(BPE).
 
-    This monotone factor is 1 at λ=1 and decreases as fertility rises, matching
-    the expected stronger BLT advantage for higher-fertility morpheme classes.
+    This is the heuristic scaling relationship from the Theoretical Analysis
+    (a motivation under stated assumptions, not a proven bound); α is fitted /
+    swept, not derived. The monotone factor is 1 at λ=1 and decreases as
+    fertility rises, matching the expected stronger BLT advantage for
+    higher-fertility morpheme classes.
     """
 
     if fertility_lambda <= 0:

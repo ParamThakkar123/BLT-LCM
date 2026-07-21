@@ -50,6 +50,13 @@ for prev, counter in transitions.items():
 # ── Entropy helpers ──────────────────────────────────────────────────────────
 
 def compute_entropy(seq, default_entropy=8.0):
+    """Per-position conditional entropy: H(next_byte | prev_byte).
+    
+    NOTE: This uses a bigram co-occurrence model (empirical conditional entropy
+    from corpus statistics), NOT the neural ByteEntropyModel used in
+    run_blt_patching.py and blt_loader.py. Results from this sweep may differ
+    systematically from the neural model's entropy estimates.
+    """
     """Per-position conditional entropy: H(next_byte | prev_byte)."""
     entropies = []
     for i in range(len(seq) - 1):

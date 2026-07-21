@@ -1,0 +1,52 @@
+269:     # keep a single global step counter across epochs so logging steps are monotonic
+270:     global_step = 0
+271:     for epoch in range(args.epochs):
+272:         model.train()
+273:         total = 0.0
+274:         n = 0
+275:         start = time.time()
+276:         # don't reset `global_step` here ΓÇö it must be monotonically increasing for loggers
+277:         for src, tgt in tqdm(dataloader):
+278:             src = src.to(device)
+279:             tgt = tgt.to(device)
+280:             seq_len = tgt.shape[1]
+281:             if seq_len == 0:
+282:                 continue
+283:             optim.zero_grad()
+284:             losses = []
+285:             for i in range(seq_len):
+286:                 prefix = src[:, : i + 1] if i + 1 <= src.shape[1] else src
+287:                 pred = model(prefix, tgt[:, i : i + 1])
+288:                 losses.append(mse(pred, tgt[:, i]))
+289:             loss = torch.stack(losses).mean()
+290:             loss.backward()
+291:             optim.step()
+292:             total += loss.item()
+293:             n += 1
+294:             global_step += 1
+295: 
+296:             # periodic autosave: save intermediate checkpoint and cleanup old ones
+297:             if (
+298:                 args.save_interval_steps > 0
+299:                 and global_step % args.save_interval_steps == 0
+300:             ):
+301:                 os.makedirs(args.model_dir, exist_ok=True)
+302:                 ckpt_name = f"{args.model_dir}/lcm_blt_step{global_step}.pth"
+303:                 try:
+304:                     torch.save(model.state_dict(), ckpt_name)
+305:                     # cleanup older checkpoints - keep only the most recent `max_checkpoints`
+306:                     if args.max_checkpoints > 0:
+307:                         cks = sorted(
+308:                             [
+309:                                 p
+310:                                 for p in os.listdir(args.model_dir)
+311:                                 if p.startswith("lcm_blt_step")
+312:                             ]
+313:                         )
+314:                         if len(cks) > args.max_checkpoints:
+315:                             to_remove = cks[: len(cks) - args.max_checkpoints]
+316:                             for rm in to_remove:
+317:                                 try:
+318:                                     os.remove(os.path.join(args.model_dir, rm))
+319:                                 except Exception:
+320:                                     pass

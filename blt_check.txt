@@ -1,0 +1,20 @@
+276:         # don't reset `global_step` here ΓÇö it must be monotonically increasing for loggers
+277:         for src, tgt in tqdm(dataloader):
+278:             src = src.to(device)
+279:             tgt = tgt.to(device)
+280:             seq_len = tgt.shape[1]
+281:             if seq_len == 0:
+282:                 continue
+283:             optim.zero_grad()
+284:             losses = []
+285:             pred = model(src, tgt)
+286:             # Mask loss over padded (zero) positions
+287:             mask = (tgt.abs().sum(dim=-1, keepdim=True) > 0).float()
+288:             loss = ((pred - tgt).pow(2) * mask).sum() / mask.sum().clamp(min=1)
+289:             loss.backward()
+290:             optim.step()
+291:             total += loss.item()
+292:             n += 1
+293:             global_step += 1
+294: 
+295:             # periodic autosave: save intermediate checkpoint and cleanup old ones

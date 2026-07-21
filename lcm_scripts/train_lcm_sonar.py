@@ -24,7 +24,13 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from base_lcm import BaseLCM
-from bhashasetu_utils import DEFAULT_DATASET, DEFAULT_NOISE_LEVELS, add_character_noise, load_bhashasetu_documents, split_train_eval_documents
+from bhashasetu_utils import (
+    DEFAULT_DATASET,
+    DEFAULT_NOISE_LEVELS,
+    add_character_noise,
+    load_bhashasetu_documents,
+    split_train_eval_documents,
+)
 from embedding_retriever import EmbeddingRetriever
 from eval_metrics import compute_bleu, compute_chrf, compute_ter
 from sonar_loader import SonarLoader
@@ -46,19 +52,27 @@ def collate(batch):
     srcs, tgts = zip(*batch)
     max_len = max(s.shape[0] for s in srcs)
     dim = srcs[0].shape[1]
-    src = torch.zeros(len(batch), max_len, dim)
-    tgt = torch.zeros(len(batch), max_len, dim)
+    src = torch.zeros(
+        len(batch), max_len, dim, device=srcs[0].device, dtype=srcs[0].dtype
+    )
+    tgt = torch.zeros(
+        len(batch), max_len, dim, device=srcs[0].device, dtype=srcs[0].dtype
+    )
     for i, (s, t) in enumerate(zip(srcs, tgts)):
         src[i, : s.shape[0]] = s
         tgt[i, : t.shape[0]] = t
     return src, tgt
 
 
-def encode_docs(docs: list[list[str]], encoder: SonarLoader, batch_size: int) -> list[torch.Tensor]:
+def encode_docs(
+    docs: list[list[str]], encoder: SonarLoader, batch_size: int
+) -> list[torch.Tensor]:
     flat = [s for doc in docs for s in doc]
     encoded = []
     for i in tqdm(range(0, len(flat), batch_size), desc="SONAR encode"):
-        encoded.extend([e.cpu() for e in encoder.encode_sentences(flat[i : i + batch_size])])
+        encoded.extend(
+            [e.cpu() for e in encoder.encode_sentences(flat[i : i + batch_size])]
+        )
     seqs, offset = [], 0
     for doc in docs:
         seqs.append(torch.stack(encoded[offset : offset + len(doc)]))
@@ -67,25 +81,40 @@ def encode_docs(docs: list[list[str]], encoder: SonarLoader, batch_size: int) ->
 
 
 def train_epoch(model, loader, optim, device):
-    mse = torch.nn.MSELoss()
-    model.train(); total = 0.0; steps = 0
+    model.train()
+    total = 0.0
+    steps = 0
     for src, tgt in tqdm(loader, desc="train"):
         src, tgt = src.to(device), tgt.to(device)
         optim.zero_grad()
         pred = model(src, tgt)
-        loss = mse(pred, tgt)
-        loss.backward(); optim.step()
-        total += float(loss.item()); steps += 1
+        # Mask loss over padded (zero) positions so padding doesn't bias
+        # the model toward predicting the origin.
+        mask = (tgt.abs().sum(dim=-1, keepdim=True) > 0).float()
+        loss = ((pred - tgt).pow(2) * mask).sum() / mask.sum().clamp(min=1)
+        loss.backward()
+        optim.step()
+        total += float(loss.item())
+        steps += 1
     return total / max(1, steps)
 
 
-def evaluate(model, docs, encoder, retriever, args, noise: float, device) -> dict[str, float]:
+def evaluate(
+    model, docs, encoder, retriever, args, noise: float, device
+) -> dict[str, float]:
     hyps, refs = [], []
     model.eval()
     for doc_idx, doc in enumerate(tqdm(docs, desc=f"eval noise={noise:.2f}")):
         if len(doc) < args.min_prefix + 1:
             continue
-        noisy_doc = [add_character_noise(s, noise, seed=doc_idx * 1000 + i) for i, s in enumerate(doc)] if noise else doc
+        noisy_doc = (
+            [
+                add_character_noise(s, noise, seed=doc_idx * 1000 + i)
+                for i, s in enumerate(doc)
+            ]
+            if noise
+            else doc
+        )
         embs = encoder.encode_sentences(noisy_doc).detach().cpu()
         for i in range(args.min_prefix, len(doc)):
             with torch.no_grad():
@@ -94,7 +123,11 @@ def evaluate(model, docs, encoder, retriever, args, noise: float, device) -> dic
                 pred = pred.unsqueeze(0)
             hyps.append(retriever.retrieve(pred)[0])
             refs.append(doc[i])
-    return {"BLEU": compute_bleu(hyps, refs), "chrF++": compute_chrf(hyps, refs), "TER": compute_ter(hyps, refs)}
+    return {
+        "BLEU": compute_bleu(hyps, refs),
+        "chrF++": compute_chrf(hyps, refs),
+        "TER": compute_ter(hyps, refs),
+    }
 
 
 def main():
@@ -114,12 +147,18 @@ def main():
     p.add_argument("--n_heads", type=int, default=16)
     p.add_argument("--min_prefix", type=int, default=2)
     p.add_argument("--out_dir", default="runs/lcm_sonar")
-    p.add_argument("--log_dir", default=None, help="Alias for --out_dir used by Slurm/W&B launchers")
+    p.add_argument(
+        "--log_dir",
+        default=None,
+        help="Alias for --out_dir used by Slurm/W&B launchers",
+    )
     p.add_argument("--wandb", action="store_true")
     p.add_argument("--wandb_project", default="BLT-LCM")
     p.add_argument("--wandb_name", default=None)
     p.add_argument("--wandb_entity", default=os.environ.get("WANDB_ENTITY"))
-    p.add_argument("--noise_levels", type=float, nargs="+", default=list(DEFAULT_NOISE_LEVELS))
+    p.add_argument(
+        "--noise_levels", type=float, nargs="+", default=list(DEFAULT_NOISE_LEVELS)
+    )
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = p.parse_args()
 
@@ -143,7 +182,9 @@ def main():
         )
 
     os.makedirs(args.out_dir, exist_ok=True)
-    docs = load_bhashasetu_documents(args.dataset, args.split, args.fraction, args.max_sent_per_doc, args.text_col)
+    docs = load_bhashasetu_documents(
+        args.dataset, args.split, args.fraction, args.max_sent_per_doc, args.text_col
+    )
     train_docs, eval_docs = split_train_eval_documents(docs, args.eval_docs)
 
     device = torch.device(args.device)
@@ -154,28 +195,53 @@ def main():
     retriever = EmbeddingRetriever(flat_sents, flat_embs)
 
     dataset = EmbeddingSequenceDataset(seqs)
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate)
+    loader = DataLoader(
+        dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate
+    )
+    if not seqs:
+        raise RuntimeError(
+            "No valid documents found after encoding. Check dataset filters."
+        )
     embed_dim = seqs[0].shape[1]
-    model = BaseLCM(embed_dim=embed_dim, model_dim=args.model_dim, n_layers=args.n_layers, n_heads=args.n_heads).to(device)
+    model = BaseLCM(
+        embed_dim=embed_dim,
+        model_dim=args.model_dim,
+        n_layers=args.n_layers,
+        n_heads=args.n_heads,
+    ).to(device)
     optim = torch.optim.AdamW(model.parameters(), lr=args.lr)
     for epoch in range(args.epochs):
         loss = train_epoch(model, loader, optim, device)
         print(f"epoch={epoch + 1} train_loss={loss:.4f}")
         if wandb_run:
             wandb_run.log({"train/loss": loss, "epoch": epoch + 1})
-        torch.save(model.state_dict(), os.path.join(args.out_dir, f"lcm_sonar_fraction{args.fraction}_epoch{epoch + 1}.pth"))
+        torch.save(
+            model.state_dict(),
+            os.path.join(
+                args.out_dir, f"lcm_sonar_fraction{args.fraction}_epoch{epoch + 1}.pth"
+            ),
+        )
 
     rows = []
     for noise in args.noise_levels:
         metrics = evaluate(model, eval_docs, encoder, retriever, args, noise, device)
-        row = {"model": "sonar_lcm", "fraction": args.fraction, "noise": noise, **metrics}
-        rows.append(row); print(row)
+        row = {
+            "model": "sonar_lcm",
+            "fraction": args.fraction,
+            "noise": noise,
+            **metrics,
+        }
+        rows.append(row)
+        print(row)
         if wandb_run:
             wandb_run.log({f"eval/{k}_noise_{noise}": v for k, v in metrics.items()})
     out_csv = os.path.join(args.out_dir, f"metrics_fraction{args.fraction}.csv")
     with open(out_csv, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["model", "fraction", "noise", "BLEU", "chrF++", "TER"])
-        writer.writeheader(); writer.writerows(rows)
+        writer = csv.DictWriter(
+            f, fieldnames=["model", "fraction", "noise", "BLEU", "chrF++", "TER"]
+        )
+        writer.writeheader()
+        writer.writerows(rows)
     print(f"Wrote {out_csv}")
     if wandb_run:
         wandb_run.finish()

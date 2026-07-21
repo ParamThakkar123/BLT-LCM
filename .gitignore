@@ -28,4 +28,10 @@ Tokeniser_Retrained.zip
 indic_nlp_resources/
 logs/
 tokenization_statistics/patch_compression_by_morpheme_class.png
-neurips_paper/references.bib
+
+# Vendored/third-party tooling and downloaded archives (do not commit — they
+# bloat the repo). Singularity is a container runtime pulled in for HPC builds.
+singularity/
+*.tar.gz
+go*.linux-amd64.tar.gz
+singularity-*.tar.gz

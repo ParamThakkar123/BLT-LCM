@@ -34,10 +34,14 @@ class ParallelExample:
 def split_sentences(text: str) -> list[str]:
     """Split Indic/plain text into non-empty sentence-like chunks."""
 
-    return [s.strip() for s in re.split(r"[.!?।]+", text.replace("\n", " ")) if s.strip()]
+    return [
+        s.strip() for s in re.split(r"[.!?।]+", text.replace("\n", " ")) if s.strip()
+    ]
 
 
-def add_character_noise(text: str, noise_prob: float, seed: Optional[int] = None) -> str:
+def add_character_noise(
+    text: str, noise_prob: float, seed: Optional[int] = None
+) -> str:
     """Corrupt a percentage of non-space characters for robustness benchmarks.
 
     The corruption uses missing-matra deletions and Devanagari substitutions
@@ -115,7 +119,9 @@ def row_to_example(
     # Nested HF translation feature.
     trans = row.get("translation")
     if isinstance(trans, dict):
-        src_key = src_col or next((k for k in ("en", "english", "hi", "hindi") if k in trans), None)
+        src_key = src_col or next(
+            (k for k in ("en", "english", "hi", "hindi") if k in trans), None
+        )
         tgt_key = tgt_col or next((k for k in ("mr", "marathi") if k in trans), None)
         if src_key and tgt_key:
             src = str(trans.get(src_key, "")).strip()
@@ -168,7 +174,9 @@ def load_bhashasetu_pairs(
     if max_examples is not None:
         take = min(take, max_examples)
     ds = ds.shuffle(seed=seed).select(range(take))
-    pairs = [ex for row in ds if (ex := row_to_example(row, src_col, tgt_col)) is not None]
+    pairs = [
+        ex for row in ds if (ex := row_to_example(row, src_col, tgt_col)) is not None
+    ]
     return pairs
 
 
@@ -187,11 +195,22 @@ def load_bhashasetu_documents(
     ds = load_dataset(dataset_name, split=split)
     total = len(ds)
     take = min(total, int(total * fraction))
-    ds = ds.shuffle(seed=seed).select(range(take))
+    # Select a random subset of rows but preserve their original order so that
+    # consecutive sentences in a pseudo-document have whatever local coherence
+    # the dataset provides (e.g. topic, domain, or difficulty ordering).
+    # This matches the principle of LM pre-training: shuffle documents, not
+    # sentences within them.
+    rng = random.Random(seed)
+    indices = list(range(total))
+    rng.shuffle(indices)
+    selected = sorted(indices[:take])
+    ds = ds.select(selected)
     docs: list[list[str]] = []
     buf: list[str] = []
     for row in ds:
-        text = _value(row, text_col) or _value(row, "target") or _value(row, "translation")
+        text = (
+            _value(row, text_col) or _value(row, "target") or _value(row, "translation")
+        )
         if not text:
             continue
         buf.extend(split_sentences(text))
@@ -203,10 +222,15 @@ def load_bhashasetu_documents(
     return docs
 
 
-def write_parallel_text(pairs: Sequence[ParallelExample], src_path: str, tgt_path: str) -> None:
+def write_parallel_text(
+    pairs: Sequence[ParallelExample], src_path: str, tgt_path: str
+) -> None:
     """Write source and target text files, one example per line."""
 
-    with open(src_path, "w", encoding="utf-8") as src_f, open(tgt_path, "w", encoding="utf-8") as tgt_f:
+    with (
+        open(src_path, "w", encoding="utf-8") as src_f,
+        open(tgt_path, "w", encoding="utf-8") as tgt_f,
+    ):
         for ex in pairs:
             src_f.write(ex.source.replace("\n", " ") + "\n")
             tgt_f.write(ex.target.replace("\n", " ") + "\n")
@@ -217,8 +241,13 @@ def split_train_eval_documents(
 ) -> tuple[list[list[str]], list[list[str]]]:
     """Split fraction-selected documents into training and evaluation sets."""
 
-    if eval_docs <= 0 or len(docs) <= eval_docs:
-        return docs, docs
+    if eval_docs <= 0:
+        raise ValueError(f"eval_docs must be positive, got {eval_docs}")
+    if len(docs) <= eval_docs:
+        raise ValueError(
+            f"Only {len(docs)} documents available but eval_docs={eval_docs} requested. "
+            "Increase dataset fraction or reduce eval_docs."
+        )
     train_docs = docs[:-eval_docs]
     eval_split = docs[-eval_docs:]
     return train_docs, eval_split

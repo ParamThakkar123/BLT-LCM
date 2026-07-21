@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import argparse
+import logging
 import time
 import torch
 from torch.utils.data import DataLoader
@@ -24,7 +25,7 @@ from base_lcm import BaseLCM
 from eval_metrics import compute_all
 from experiment_config import setup_logging
 
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from peft import LoraConfig, get_peft_model
 
 PEFT_AVAILABLE = True
 
@@ -55,8 +56,8 @@ def collate(batch):
     max_len = max(s.shape[0] for s in srcs)
     emb_dim = srcs[0].shape[1]
     B = len(srcs)
-    src_p = torch.zeros(B, max_len, emb_dim)
-    tgt_p = torch.zeros(B, max_len, emb_dim)
+    src_p = torch.zeros(B, max_len, emb_dim, device=srcs[0].device, dtype=srcs[0].dtype)
+    tgt_p = torch.zeros(B, max_len, emb_dim, device=srcs[0].device, dtype=srcs[0].dtype)
     for i, (s, t) in enumerate(zip(srcs, tgts)):
         src_p[i, : s.shape[0]] = s
         tgt_p[i, : t.shape[0]] = t
@@ -102,11 +103,10 @@ def main():
         default=0,
         help="Number of transformer layers to freeze from the bottom",
     )
-    parser.add_argument("--lora", action="store_true", help="Enable LoRA fine-tuning")
     parser.add_argument(
-        "--qlora",
+        "--lora",
         action="store_true",
-        help="Enable QLoRA fine-tuning (4-bit quantization + LoRA)",
+        help="Enable LoRA (parameter-efficient) fine-tuning of the pretrained LCM",
     )
     parser.add_argument("--lora_rank", type=int, default=8, help="LoRA rank")
     parser.add_argument("--lora_alpha", type=int, default=32, help="LoRA alpha")
@@ -125,6 +125,12 @@ def main():
     parser.add_argument("--wandb_project", type=str, default=None)
     parser.add_argument("--wandb_name", type=str, default=None)
     parser.add_argument("--wandb_entity", type=str, default=os.environ.get("WANDB_ENTITY"))
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cuda" if torch.cuda.is_available() else "cpu",
+        help="Device for computation",
+    )
     parser.add_argument(
         "--eval_hyp",
         type=str,
@@ -186,27 +192,26 @@ def main():
     model.load_state_dict(checkpoint)
     print(f"Loaded pre-trained model from {args.checkpoint}")
 
-    # Apply LoRA or QLoRA if enabled
-    if args.lora or args.qlora:
-        if args.qlora:
-            # Prepare for QLoRA
-            model = prepare_model_for_kbit_training(
-                model, use_gradient_checkpointing=False
-            )
-            print("Prepared model for QLoRA")
-        # Define LoRA config
+    # Apply LoRA (parameter-efficient fine-tuning) if enabled.
+    # Note: this fine-tunes the *pretrained* BaseLCM checkpoint, so LoRA adapters
+    # are appropriate. 4-bit "QLoRA" was intentionally removed: BaseLCM is a
+    # custom fp32 module (not a HF from_pretrained model with a bitsandbytes
+    # 4-bit config), so no genuine 4-bit quantization was ever applied.
+    if args.lora:
+        # task_type=None: BaseLCM has a custom forward(src_embs, tgt_embs) rather
+        # than a HF input_ids interface, so the generic PeftModel wrapper (which
+        # forwards *args positionally) is required; a task-specific wrapper would
+        # inject input_ids and break the forward pass.
         lora_config = LoraConfig(
             r=args.lora_rank,
             lora_alpha=args.lora_alpha,
             target_modules=args.target_modules,
             lora_dropout=args.lora_dropout,
             bias="none",
-            task_type="SEQ_2_SEQ_LM",  # or appropriate task
+            task_type=None,
         )
         model = get_peft_model(model, lora_config)
         print(f"Applied LoRA with rank {args.lora_rank}")
-        if args.qlora:
-            print("Using QLoRA (4-bit + LoRA)")
 
     # Freeze layers if specified
     if args.freeze_prenet:
@@ -228,8 +233,8 @@ def main():
     if wandb_module is not None:
         try:
             wandb_module.watch(model, log="all", log_freq=100)
-        except Exception:
-            pass
+        except Exception as e:
+            logging.warning(f"wandb.watch failed: {e}")
 
     optim = torch.optim.AdamW(model.parameters(), lr=args.lr)
     mse = torch.nn.MSELoss()
@@ -261,8 +266,8 @@ def main():
                 try:
                     lr = optim.param_groups[0]["lr"]
                     writer.add_scalar("finetune/lr", lr, global_step)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logging.warning(f"LR logging failed: {e}")
                 try:
                     total_norm = 0.0
                     for p in model.parameters():
@@ -271,8 +276,8 @@ def main():
                             total_norm += param_norm * param_norm
                     total_norm = total_norm**0.5
                     writer.add_scalar("finetune/grad_norm", total_norm, global_step)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logging.warning(f"Grad norm logging failed: {e}")
 
         elapsed = time.time() - start
         print(
@@ -287,8 +292,8 @@ def main():
                 wandb_module.log(
                     {"finetune/loss": total / n if n > 0 else 0.0}, step=epoch + 1
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logging.warning(f"wandb epoch log failed: {e}")
 
         if args.eval_hyp and args.eval_ref and writer is not None:
             with open(args.eval_hyp, encoding="utf-8") as f:

@@ -334,7 +334,7 @@ print("\n" + "=" * 78)
 print("BOUNDARY EFFICIENCY (F1 per 100 boundaries)")
 print("=" * 78)
 
-entropy_boundaries = 332.86 - 1  # patches - 1 from sweep at tau=1.0
+entropy_boundaries = 332.86 - 1  # patches - 1 from sweep at tau=1.0; TODO: compute from actual sweep data instead of hardcoding
 methods_eff = [
     ("Entropy (tau=1.0)", entropy_best["f1"], entropy_boundaries),
     ("Fixed 4-byte", results["fixed_chunk_results"]["4"]["f1"],
