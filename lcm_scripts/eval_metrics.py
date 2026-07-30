@@ -77,27 +77,93 @@ def compute_ter(hyps: List[str], refs: Union[List[str], List[List[str]]]) -> flo
         return float("nan")
 
 
+def _ensure_wordnet() -> bool:
+    """Make sure NLTK's WordNet corpus is present (METEOR needs it)."""
+    try:
+        import nltk
+
+        try:
+            nltk.data.find("corpora/wordnet.zip")
+            return True
+        except LookupError:
+            nltk.download("wordnet", quiet=True)
+            nltk.data.find("corpora/wordnet.zip")
+            return True
+    except Exception as e:
+        warnings.warn(f"Could not provision NLTK WordNet for METEOR: {e}")
+        return False
+
+
 def compute_meteor(hyps: List[str], refs: List[str]) -> float:
+    """METEOR via NLTK.
+
+    NOTE: NLTK's METEOR uses the *English* WordNet for its synonymy-matching
+    stage. On Devanagari output the synonym/stem modules contribute nothing, so
+    this degrades to a bare unigram alignment score and is not comparable to
+    METEOR as reported for English MT. Prefer chrF++ / COMET for Marathi; treat
+    this number as a weak diagnostic only.
+    """
     if not _HAS_NLTK:
         warnings.warn("nltk not installed; METEOR unavailable")
         return float("nan")
+    if not _ensure_wordnet():
+        warnings.warn("NLTK WordNet unavailable; METEOR reported as NaN")
+        return float("nan")
+
     scores = []
+    n_failed = 0
+    first_error: Optional[BaseException] = None
     for h, r in zip(hyps, refs):
         try:
             scores.append(meteor_score.single_meteor_score(r.split(), h.split()))
-        except Exception:
-            scores.append(0.0)
-    return float(100.0 * sum(scores) / max(1, len(scores)))
+        except Exception as e:  # do NOT silently fold failures into 0.0
+            n_failed += 1
+            if first_error is None:
+                first_error = e
+
+    if n_failed:
+        warnings.warn(
+            f"METEOR failed on {n_failed}/{len(hyps)} segments "
+            f"(first error: {first_error!r})"
+        )
+    if not scores:
+        # Every segment failed. Returning 0.0 here would be indistinguishable
+        # from a genuinely terrible system, so report NaN instead.
+        return float("nan")
+    return float(100.0 * sum(scores) / len(scores))
 
 
 def compute_comet(
     hyps: List[str],
     refs: List[str],
+    srcs: Optional[List[str]] = None,
     model_name: Optional[str] = None,
     model_obj: Optional[object] = None,
 ) -> float:
+    """COMET system score.
+
+    ``srcs`` is REQUIRED. The standard checkpoints (e.g. ``Unbabel/wmt22-comet-da``)
+    are source-aware: they encode (src, mt, ref) jointly. Passing empty strings as
+    sources does not "skip" the source -- it feeds the model an out-of-distribution
+    input and yields numbers that look plausible but are not COMET scores. We
+    therefore refuse to score rather than emit an invalid value.
+    """
     if not _HAS_COMET:
         warnings.warn("comet not installed; COMET unavailable")
+        return float("nan")
+
+    if srcs is None:
+        warnings.warn(
+            "COMET requires source sentences (srcs=...). Scoring with empty "
+            "sources produces invalid scores, so COMET is reported as NaN. "
+            "Pass the source side of the eval set to compute_all(...)."
+        )
+        return float("nan")
+    if len(srcs) != len(hyps):
+        warnings.warn(
+            f"COMET: got {len(srcs)} sources for {len(hyps)} hypotheses; "
+            "refusing to score misaligned data"
+        )
         return float("nan")
 
     model = None
@@ -125,7 +191,9 @@ def compute_comet(
         return float("nan")
 
     try:
-        samples = [{"src": "", "mt": h, "ref": r} for h, r in zip(hyps, refs)]
+        samples = [
+            {"src": s, "mt": h, "ref": r} for s, h, r in zip(srcs, hyps, refs)
+        ]
         res = model.predict(samples, batch_size=32, gpus=0)
 
         if isinstance(res, tuple):
@@ -147,9 +215,17 @@ def compute_comet(
 def compute_all(
     hyps: List[str],
     refs: Union[List[str], List[List[str]]],
+    srcs: Optional[List[str]] = None,
     comet_model_name: Optional[str] = None,
     comet_model_obj: Optional[object] = None,
+    include_meteor: bool = True,
 ) -> Dict[str, float]:
+    """Compute the full metric suite.
+
+    ``srcs`` should be the *clean* source sentences of the eval set. It is only
+    used by COMET, which is source-aware; without it COMET is reported as NaN
+    rather than silently scored against empty sources.
+    """
     # METEOR/COMET require List[str] refs; extract first reference if multi-ref
     if refs and isinstance(refs[0], list):
         refs_flat: List[str] = [r[0] for r in refs]
@@ -160,9 +236,14 @@ def compute_all(
     out["BLEU"] = compute_bleu(hyps, refs)
     out["chrF++"] = compute_chrf(hyps, refs)
     out["TER"] = compute_ter(hyps, refs)
-    out["METEOR"] = compute_meteor(hyps, refs_flat)
+    if include_meteor:
+        out["METEOR"] = compute_meteor(hyps, refs_flat)
     out["COMET"] = compute_comet(
-        hyps, refs_flat, model_name=comet_model_name, model_obj=comet_model_obj
+        hyps,
+        refs_flat,
+        srcs=srcs,
+        model_name=comet_model_name,
+        model_obj=comet_model_obj,
     )
     return out
 

@@ -9,6 +9,11 @@ build-backend = "setuptools.build_meta"
     authors = [{name = "Your Name"}]
     requires-python = ">=3.10,<3.13"
     dependencies = [
+    # CUDA build, pulled from the pytorch-cu121 index below. The PyPI Windows
+    # torch wheels are CPU-only, and `uv run` re-syncs the venv on every
+    # invocation -- so without this pin a manually installed CUDA torch gets
+    # silently reverted before the script runs.
+    "torch==2.5.1",
     "transformers>=4.0.0",
     "huggingface-hub>=0.34.0",
     "sentencepiece",
@@ -27,9 +32,12 @@ build-backend = "setuptools.build_meta"
     "python-dotenv>=1.0.0",
     "setuptools<81",
     "matplotlib>=3.7.0",
+    # Provides the `comet` module used by lcm_scripts/eval_metrics.py.
+    # NOTE: do NOT also add the PyPI package named `comet` -- that is an
+    # unrelated astronomy VOEvent broker whose top-level module is also
+    # named `comet`, and it shadows this one (COMET then silently scores NaN).
     "unbabel-comet>=2.2.7",
     "nltk>=3.9.1",
-    "comet>=3.1.0",
     "stanza>=1.12.2",
 ]
 
@@ -37,6 +45,16 @@ build-backend = "setuptools.build_meta"
 test = [
     "pytest>=7.0.0",
 ]
+
+# `explicit = true` keeps this index from shadowing PyPI for everything else;
+# only the packages mapped in [tool.uv.sources] are fetched from it.
+[[tool.uv.index]]
+name = "pytorch-cu121"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu121" }
 
 [tool.setuptools]
 packages = { find = { where = ["."], include = ["*"] } }

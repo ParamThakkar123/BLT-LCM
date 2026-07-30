@@ -47,8 +47,10 @@ load_dotenv()
 
 import argparse
 import csv
+import random
 import time
 
+import numpy as np
 import torch
 from tqdm import tqdm
 
@@ -57,6 +59,14 @@ from blt_decoder import load_decoder
 from base_lcm import BaseLCM
 from eval_metrics import compute_all
 from bhashasetu_utils import load_bhashasetu_pairs, add_character_noise
+
+
+def set_seed(seed: int) -> None:
+    """Seed every RNG that affects training, so --seed gives real run-to-run variance."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
 def encode_concepts(blt, texts, batch_size=128, desc="encoding"):
@@ -89,6 +99,16 @@ def main():
     )
     parser.add_argument("--model_dir", default="lcm_models")
     parser.add_argument("--out_csv", default=None)
+    parser.add_argument(
+        "--seed", type=int, default=42,
+        help="Training seed: model init, batch shuffling and eval-noise draws. "
+             "Vary this (e.g. 42/43/44) to get genuine error bars.",
+    )
+    parser.add_argument(
+        "--data_seed", type=int, default=42,
+        help="Seed for the corpus fraction/split. Keep FIXED across --seed runs "
+             "so every seed sees the same train/eval split.",
+    )
     parser.add_argument("--max_decode_len", type=int, default=256)
     parser.add_argument("--comet_model", default=None)
     parser.add_argument(
@@ -97,14 +117,25 @@ def main():
     args = parser.parse_args()
 
     device = torch.device(args.device)
+    if not args.comet_model:
+        print(
+            "WARNING: --comet_model not set, so the COMET column will be NaN. "
+            "Pass --comet_model Unbabel/wmt22-comet-da to report COMET."
+        )
+    set_seed(args.seed)
+    print(f"seed={args.seed} (training)  data_seed={args.data_seed} (corpus split)")
 
     # --- Parallel data (English -> Marathi) ---
+    # data_seed is deliberately independent of --seed: the train/eval split must
+    # stay identical across seeds, otherwise seed-to-seed spread would conflate
+    # training variance with a changing evaluation set.
     print("Loading BhashaSetu parallel pairs (English -> Marathi)...")
     pairs = load_bhashasetu_pairs(
         fraction=args.fraction,
         max_examples=args.max_examples,
         src_col=args.src_col,
         tgt_col=args.tgt_col,
+        seed=args.data_seed,
     )
     if len(pairs) < args.eval_examples + 10:
         raise ValueError(
@@ -145,8 +176,10 @@ def main():
     )
 
     dataset = torch.utils.data.TensorDataset(src_tr, tgt_tr)
+    shuffle_gen = torch.Generator()
+    shuffle_gen.manual_seed(args.seed)
     loader = torch.utils.data.DataLoader(
-        dataset, batch_size=args.batch_size, shuffle=True
+        dataset, batch_size=args.batch_size, shuffle=True, generator=shuffle_gen
     )
 
     # --- LCM: source concept -> target concept ---
@@ -174,20 +207,30 @@ def main():
             f"| {time.time() - start:.1f}s"
         )
         torch.save(
-            lcm.state_dict(), f"{args.model_dir}/lcm_blt_mt_epoch{epoch + 1}.pth"
+            lcm.state_dict(),
+            f"{args.model_dir}/lcm_blt_mt_s{args.seed}_epoch{epoch + 1}.pth",
         )
-    best_ckpt = f"{args.model_dir}/lcm_blt_mt_best.pth"
+    # Seed in the filename: multi-seed runs would otherwise clobber each other.
+    best_ckpt = f"{args.model_dir}/lcm_blt_mt_s{args.seed}_best.pth"
     torch.save(lcm.state_dict(), best_ckpt)
     print(f"Saved LCM to {best_ckpt}")
 
     # --- Evaluate: English -> concept -> Marathi, across source-noise levels ---
     lcm.eval()
     refs = [p.target for p in eval_pairs]
+    clean_srcs = [p.source for p in eval_pairs]
     rows = []
     for noise in args.noise_levels:
+        # Per-sentence noise seeds derived from --seed, so (a) each sentence gets
+        # an independent corruption rather than the same RNG stream, and (b) the
+        # noise realisation changes across seeds, which is what makes the error
+        # bars on the noisy conditions meaningful.
+        noise_rng = random.Random(f"noise|{args.seed}|{noise}")
         src_texts = [
-            add_character_noise(p.source, noise, seed=1234) if noise > 0 else p.source
-            for p in eval_pairs
+            add_character_noise(s, noise, seed=noise_rng.randrange(2**31))
+            if noise > 0
+            else s
+            for s in clean_srcs
         ]
         src_emb = torch.stack(
             encode_concepts(blt, src_texts, desc=f"encode src (noise={noise})")
@@ -204,19 +247,32 @@ def main():
                     pred = pred.unsqueeze(0)
                 hyps.extend(decoder.decode(pred, max_len=args.max_decode_len))
 
-        metrics = compute_all(hyps, refs, comet_model_name=args.comet_model)
+        # COMET is scored against the CLEAN source: the metric asks "does the
+        # output convey the source meaning", and the true meaning is the
+        # uncorrupted sentence. Feeding it the noised source would move the
+        # target the model is being judged against.
+        metrics = compute_all(
+            hyps, refs, srcs=clean_srcs, comet_model_name=args.comet_model
+        )
         print(
-            f"noise={noise}: "
+            f"seed={args.seed} noise={noise}: "
             + "  ".join(f"{k}={v:.2f}" for k, v in metrics.items() if v == v)
         )
         rows.append(
-            {"model": "blt_lcm_mt", "fraction": args.fraction, "noise": noise, **metrics}
+            {
+                "model": "blt_lcm_mt",
+                "fraction": args.fraction,
+                "noise": noise,
+                "seed": args.seed,
+                **metrics,
+            }
         )
 
     if args.out_csv:
         os.makedirs(os.path.dirname(args.out_csv) or ".", exist_ok=True)
         fieldnames = [
-            "model", "fraction", "noise", "BLEU", "chrF++", "TER", "METEOR", "COMET"
+            "model", "fraction", "noise", "seed",
+            "BLEU", "chrF++", "TER", "METEOR", "COMET",
         ]
         with open(args.out_csv, "w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
