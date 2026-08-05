@@ -126,10 +126,45 @@ CLASS_DISPLAY = {
 
 CORPUS_PATH = os.path.join(os.path.dirname(__file__), "..", "marathi_sentences.json")
 CORPUS_PATH = os.path.normpath(CORPUS_PATH)
+# How many Marathi sentences to materialize if the corpus file is missing.
+CORPUS_GEN_SIZE = int(os.environ.get("FERTILITY_CORPUS_SIZE", "20000"))
+
+
+def _generate_corpus_from_bhashasetu(path: str, num_sentences: int) -> list:
+    """Build ``marathi_sentences.json`` from BhashaSetu so the audit is
+    reproducible from the repository alone (the corpus file is not tracked).
+
+    Streams the Marathi column deterministically and caches the result to
+    ``path`` for subsequent runs.
+    """
+    from datasets import load_dataset
+
+    logger.info(
+        "Corpus file not found; generating %d Marathi sentences from "
+        "ParamTh/BhashaSetu (one-time, cached to %s)…",
+        num_sentences,
+        path,
+    )
+    ds = load_dataset("ParamTh/BhashaSetu", split="train", streaming=True)
+    collected = []
+    for row in ds:
+        text = (row.get("marathi") or "").strip()
+        if len(text) > 5:
+            collected.append(text)
+        if len(collected) >= num_sentences:
+            break
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(collected, fh, ensure_ascii=False)
+    logger.info("Generated and cached %d sentences to %s", len(collected), path)
+    return collected
+
 
 logger.info("Loading corpus from %s…", CORPUS_PATH)
-with open(CORPUS_PATH, "r", encoding="utf-8") as f:
-    all_sentences = json.load(f)
+if os.path.exists(CORPUS_PATH):
+    with open(CORPUS_PATH, "r", encoding="utf-8") as f:
+        all_sentences = json.load(f)
+else:
+    all_sentences = _generate_corpus_from_bhashasetu(CORPUS_PATH, CORPUS_GEN_SIZE)
 logger.info("Corpus loaded: %d sentences total", len(all_sentences))
 
 # Use a sample for efficiency — Stanza POS tagging is slower than byte-level ops.
@@ -155,8 +190,8 @@ batch_t0 = time.time()
 for batch_start in range(0, len(sentences), BATCH_SIZE):
     batch = sentences[batch_start : batch_start + BATCH_SIZE]
 
-    # Stanza processes a list of sentences efficiently
-    docs = [nlp(sent) for sent in batch]
+    # Stanza accepts a list of strings in one call, returning list[Document]
+    docs = nlp(batch)
 
     for doc_idx, doc in enumerate(docs):
         sent_idx = batch_start + doc_idx

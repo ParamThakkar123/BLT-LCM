@@ -164,6 +164,7 @@ class ByteEntropyModel(nn.Module):
         super().__init__()
         self.max_length = max_seqlen
         self.vocab_size = vocab_size
+        self.dim = dim  # hidden width; used by the BLT local encoder / pooler
 
         self.tok_embeddings = nn.Embedding(vocab_size, dim)
         self.layers = nn.ModuleList(
@@ -175,11 +176,22 @@ class ByteEntropyModel(nn.Module):
         self.norm = RMSNorm(dim)
         self.output = nn.Linear(dim, vocab_size, bias=False)
 
-    def forward(self, tokens):
+    def forward(self, tokens, return_hidden=False):
+        """Run the byte transformer.
+
+        By default returns next-byte logits (used only to compute entropy for
+        patch-boundary placement). With ``return_hidden=True`` it returns the
+        final normalized byte hidden states ``[B, T, dim]`` instead — these are
+        the local-encoder features that BLT pools into patch representations
+        (BLT §3.2.2). The logits are never used as patch/concept embeddings.
+        """
         h = self.tok_embeddings(tokens)
         for layer in self.layers:
             h = layer(h)
-        return self.output(self.norm(h))
+        h = self.norm(h)
+        if return_hidden:
+            return h
+        return self.output(h)
 
 
 # ============================================================

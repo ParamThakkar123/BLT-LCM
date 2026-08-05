@@ -41,16 +41,28 @@ def train_base_lcm(args):
         if len(marathi_texts) >= 1000:  # Small subset for testing
             break
 
-    # Segment into sentences (simple split by .)
-    sentences_list = []
-    for text in marathi_texts[:100]:
-        sents = [s.strip() for s in text.split(".") if s.strip()]
-        if len(sents) > 1:
-            sentences_list.append(sents[:10])  # Max 10 sentences
+    # Split into train (80%) and validation (20%) to prevent data leakage
+    split = int(len(marathi_texts) * 0.8)
+    train_texts = marathi_texts[:split]
+    val_texts = marathi_texts[split:]
+
+    def segment_texts(texts, max_sents=10):
+        sentences_list = []
+        for text in texts[:100]:
+            sents = [s.strip() for s in text.split(".") if s.strip()]
+            if len(sents) > 1:
+                sentences_list.append(sents[:max_sents])
+        return sentences_list
+
+    train_sentences_list = segment_texts(train_texts)
+    val_sentences_list = segment_texts(val_texts)
 
     # Encode all sentences
-    all_sentences = [s for seq in sentences_list for s in seq]
-    all_embeddings = blt_loader.encode_sentences(all_sentences)
+    train_sentences = [s for seq in train_sentences_list for s in seq]
+    val_sentences = [s for seq in val_sentences_list for s in seq]
+    all_embeddings = blt_loader.encode_sentences(train_sentences + val_sentences)
+    train_embs = all_embeddings[: len(train_sentences)]
+    val_embs = all_embeddings[len(train_sentences) :]
 
     # Create dataset from embeddings
     class RealDataset(torch.utils.data.Dataset):
@@ -69,7 +81,7 @@ def train_base_lcm(args):
         def __getitem__(self, idx):
             return self.data[idx]
 
-    dataset = RealDataset(sentences_list, all_embeddings)
+    dataset = RealDataset(train_sentences_list, train_embs)
     dataloader = DataLoader(dataset, batch_size=4, shuffle=True, collate_fn=collate_fn)
 
     model.train()

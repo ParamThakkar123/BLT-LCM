@@ -27,7 +27,13 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from base_lcm import BaseLCM
-from bhashasetu_utils import DEFAULT_DATASET, DEFAULT_NOISE_LEVELS, add_character_noise, load_bhashasetu_documents, split_train_eval_documents
+from bhashasetu_utils import (
+    DEFAULT_DATASET,
+    DEFAULT_NOISE_LEVELS,
+    add_character_noise,
+    load_bhashasetu_documents,
+    split_train_eval_documents,
+)
 from embedding_retriever import EmbeddingRetriever
 from eval_metrics import compute_bleu, compute_chrf, compute_ter
 
@@ -57,7 +63,9 @@ class BPESentenceEncoder(nn.Module):
         pooled = (emb * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp_min(1.0)
         return self.norm(pooled)
 
-    def encode_sentences(self, sentences: list[str], sp, max_len: int, device) -> torch.Tensor:
+    def encode_sentences(
+        self, sentences: list[str], sp, max_len: int, device
+    ) -> torch.Tensor:
         ids, mask = encode_batch(sentences, sp, max_len)
         with torch.no_grad():
             return self(ids.to(device), mask.to(device)).detach().cpu()
@@ -101,14 +109,19 @@ def collate(batch):
     return src, src_mask, tgt, tgt_mask
 
 
-def encode_doc_tensor(encoder: BPESentenceEncoder, ids: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+def encode_doc_tensor(
+    encoder: BPESentenceEncoder, ids: torch.Tensor, mask: torch.Tensor
+) -> torch.Tensor:
     bsz, seq_len, tok_len = ids.shape
-    embs = encoder(ids.reshape(bsz * seq_len, tok_len), mask.reshape(bsz * seq_len, tok_len))
+    embs = encoder(
+        ids.reshape(bsz * seq_len, tok_len), mask.reshape(bsz * seq_len, tok_len)
+    )
     return embs.reshape(bsz, seq_len, -1)
 
 
-
-def encode_batch(sentences: list[str], sp, max_len: int) -> tuple[torch.Tensor, torch.Tensor]:
+def encode_batch(
+    sentences: list[str], sp, max_len: int
+) -> tuple[torch.Tensor, torch.Tensor]:
     encoded = []
     for sent in sentences:
         ids = [BOS_ID] + sp.encode(sent, out_type=int)[: max_len - 2] + [EOS_ID]
@@ -124,7 +137,9 @@ def encode_batch(sentences: list[str], sp, max_len: int) -> tuple[torch.Tensor, 
 
 def train_sentencepiece(docs: list[list[str]], out_dir: str, vocab_size: int) -> str:
     if spm is None:
-        raise RuntimeError("sentencepiece is required. Install project dependencies first.")
+        raise RuntimeError(
+            "sentencepiece is required. Install project dependencies first."
+        )
     os.makedirs(out_dir, exist_ok=True)
     corpus = os.path.join(out_dir, "bpe_lcm_corpus.txt")
     with open(corpus, "w", encoding="utf-8") as f:
@@ -147,7 +162,6 @@ def train_sentencepiece(docs: list[list[str]], out_dir: str, vocab_size: int) ->
 
 
 def train_epoch(model, encoder, loader, optim, device):
-    mse = nn.MSELoss()
     model.train()
     encoder.train()
     total = 0.0
@@ -159,7 +173,9 @@ def train_epoch(model, encoder, loader, optim, device):
         src = encode_doc_tensor(encoder, src_ids, src_mask)
         tgt = encode_doc_tensor(encoder, tgt_ids, tgt_mask)
         pred = model(src, tgt)
-        loss = mse(pred, tgt)
+        # Mask loss over padded sentence positions using the token mask
+        sent_mask = tgt_mask.any(dim=-1, keepdim=True).float()
+        loss = ((pred - tgt).pow(2) * sent_mask).sum() / sent_mask.sum().clamp(min=1)
         loss.backward()
         optim.step()
         total += float(loss.item())
@@ -170,18 +186,33 @@ def train_epoch(model, encoder, loader, optim, device):
 def build_retriever(train_docs, sp, encoder, args, device) -> EmbeddingRetriever:
     flat_sents = [sent for doc in train_docs for sent in doc]
     chunks = []
-    for i in tqdm(range(0, len(flat_sents), args.encode_batch_size), desc="BPE encode retriever"):
-        chunks.append(encoder.encode_sentences(flat_sents[i : i + args.encode_batch_size], sp, args.max_len, device))
+    for i in tqdm(
+        range(0, len(flat_sents), args.encode_batch_size), desc="BPE encode retriever"
+    ):
+        chunks.append(
+            encoder.encode_sentences(
+                flat_sents[i : i + args.encode_batch_size], sp, args.max_len, device
+            )
+        )
     return EmbeddingRetriever(flat_sents, torch.cat(chunks, dim=0))
 
 
-def evaluate(model, sp, encoder, docs, retriever, args, noise: float, device) -> dict[str, float | int]:
+def evaluate(
+    model, sp, encoder, docs, retriever, args, noise: float, device
+) -> dict[str, float | int]:
     hyps, refs = [], []
     model.eval()
     for doc_idx, doc in enumerate(tqdm(docs, desc=f"eval noise={noise:.2f}")):
         if len(doc) < args.min_prefix + 1:
             continue
-        noisy_doc = [add_character_noise(s, noise, seed=doc_idx * 1000 + i) for i, s in enumerate(doc)] if noise else doc
+        noisy_doc = (
+            [
+                add_character_noise(s, noise, seed=doc_idx * 1000 + i)
+                for i, s in enumerate(doc)
+            ]
+            if noise
+            else doc
+        )
         embs = encoder.encode_sentences(noisy_doc, sp, args.max_len, device)
         for i in range(args.min_prefix, len(doc)):
             with torch.no_grad():
@@ -190,7 +221,12 @@ def evaluate(model, sp, encoder, docs, retriever, args, noise: float, device) ->
                 pred = pred.unsqueeze(0)
             hyps.append(retriever.retrieve(pred)[0])
             refs.append(doc[i])
-    return {"num_predictions": len(hyps), "BLEU": compute_bleu(hyps, refs), "chrF++": compute_chrf(hyps, refs), "TER": compute_ter(hyps, refs)}
+    return {
+        "num_predictions": len(hyps),
+        "BLEU": compute_bleu(hyps, refs),
+        "chrF++": compute_chrf(hyps, refs),
+        "TER": compute_ter(hyps, refs),
+    }
 
 
 def maybe_init_wandb(args):
@@ -198,7 +234,13 @@ def maybe_init_wandb(args):
         return None
     import wandb
 
-    return wandb.init(project=args.wandb_project, entity=args.wandb_entity, name=args.wandb_name, dir=args.log_dir, config=vars(args))
+    return wandb.init(
+        project=args.wandb_project,
+        entity=args.wandb_entity,
+        name=args.wandb_name,
+        dir=args.log_dir,
+        config=vars(args),
+    )
 
 
 def main():
@@ -226,9 +268,16 @@ def main():
     p.add_argument("--wandb_project", default="BLT-LCM")
     p.add_argument("--wandb_name", default=None)
     p.add_argument("--wandb_entity", default=os.environ.get("WANDB_ENTITY"))
-    p.add_argument("--noise_levels", type=float, nargs="+", default=list(DEFAULT_NOISE_LEVELS))
+    p.add_argument(
+        "--noise_levels", type=float, nargs="+", default=list(DEFAULT_NOISE_LEVELS)
+    )
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = p.parse_args()
+
+    if args.model_dim <= args.embed_dim:
+        raise ValueError(
+            f"model_dim ({args.model_dim}) must be > embed_dim ({args.embed_dim})"
+        )
 
     if args.log_dir and args.out_dir == "runs/lcm_bpe":
         args.out_dir = args.log_dir
@@ -241,39 +290,80 @@ def main():
     run = maybe_init_wandb(args)
     device = torch.device(args.device)
 
-    docs = load_bhashasetu_documents(args.dataset, args.split, args.fraction, args.max_sent_per_doc, args.text_col)
+    docs = load_bhashasetu_documents(
+        args.dataset, args.split, args.fraction, args.max_sent_per_doc, args.text_col
+    )
     train_docs, eval_docs = split_train_eval_documents(docs, args.eval_docs)
     if not train_docs or not eval_docs:
-        raise RuntimeError("No BhashaSetu documents available for BPE-LCM training/evaluation")
+        raise RuntimeError(
+            "No BhashaSetu documents available for BPE-LCM training/evaluation"
+        )
 
     sp_model = train_sentencepiece(train_docs, args.out_dir, args.vocab_size)
     sp = spm.SentencePieceProcessor(model_file=sp_model)
     encoder = BPESentenceEncoder(sp.get_piece_size(), args.embed_dim).to(device)
     dataset = BPEDocumentDataset(train_docs, sp, args.max_len)
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate)
-    model = BaseLCM(embed_dim=args.embed_dim, model_dim=args.model_dim, n_layers=args.n_layers, n_heads=args.n_heads).to(device)
-    optim = torch.optim.AdamW(list(model.parameters()) + list(encoder.parameters()), lr=args.lr)
+    loader = DataLoader(
+        dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate
+    )
+    model = BaseLCM(
+        embed_dim=args.embed_dim,
+        model_dim=args.model_dim,
+        n_layers=args.n_layers,
+        n_heads=args.n_heads,
+    ).to(device)
+    optim = torch.optim.AdamW(
+        list(model.parameters()) + list(encoder.parameters()), lr=args.lr
+    )
 
     for epoch in range(args.epochs):
         loss = train_epoch(model, encoder, loader, optim, device)
         print(f"epoch={epoch + 1} train_loss={loss:.4f}")
         if run:
             run.log({"train/loss": loss, "epoch": epoch + 1})
-        torch.save({"lcm": model.state_dict(), "encoder": encoder.state_dict(), "args": vars(args)}, os.path.join(args.out_dir, f"lcm_bpe_fraction{args.fraction}_epoch{epoch + 1}.pth"))
+        torch.save(
+            {
+                "lcm": model.state_dict(),
+                "encoder": encoder.state_dict(),
+                "args": vars(args),
+            },
+            os.path.join(
+                args.out_dir, f"lcm_bpe_fraction{args.fraction}_epoch{epoch + 1}.pth"
+            ),
+        )
 
     retriever = build_retriever(train_docs, sp, encoder, args, device)
     rows = []
     for noise in args.noise_levels:
-        metrics = evaluate(model, sp, encoder, eval_docs, retriever, args, noise, device)
+        metrics = evaluate(
+            model, sp, encoder, eval_docs, retriever, args, noise, device
+        )
         row = {"model": "bpe_lcm", "fraction": args.fraction, "noise": noise, **metrics}
         rows.append(row)
         print(row)
         if run:
-            run.log({f"eval/{k}_noise_{noise}": v for k, v in metrics.items() if isinstance(v, (int, float))})
+            run.log(
+                {
+                    f"eval/{k}_noise_{noise}": v
+                    for k, v in metrics.items()
+                    if isinstance(v, (int, float))
+                }
+            )
 
     out_csv = os.path.join(args.out_dir, f"metrics_fraction{args.fraction}.csv")
     with open(out_csv, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["model", "fraction", "noise", "num_predictions", "BLEU", "chrF++", "TER"])
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "model",
+                "fraction",
+                "noise",
+                "num_predictions",
+                "BLEU",
+                "chrF++",
+                "TER",
+            ],
+        )
         writer.writeheader()
         writer.writerows(rows)
     print(f"Wrote {out_csv}")

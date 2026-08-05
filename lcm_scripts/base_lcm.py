@@ -64,8 +64,11 @@ class BaseLCM(nn.Module):
         # Position embeddings
         self.pos_emb = nn.Embedding(max_seq_len, model_dim)
 
+        # Beginning-of-sequence token (in model_dim space, used as decoder start)
+        self.bos_emb = nn.Parameter(torch.randn(model_dim))
+
         # Transformer decoder layers (keep as ModuleList so we can optionally
-        # apply activation checkpointing per-layer to reduce memory)
+        # apply activation checkpointing per-layer to reduce memory) and end of text token
         self.layers = nn.ModuleList()
         for _ in range(n_layers):
             layer = TransformerDecoderLayer(
@@ -96,34 +99,32 @@ class BaseLCM(nn.Module):
         positions = torch.arange(seq_len, device=src.device).unsqueeze(0)
         src = src + self.pos_emb(positions)
 
-        # For autoregressive prediction, target is the next embedding
         if tgt_embs is not None:
-            # Support both single-step targets of shape [B,1,E] and
-            # multi-step targets [B, L, E]. Running the decoder once for the
-            # full target sequence is much more efficient than looping per
-            # position in the training loop.
+            # Training: teacher forcing with BOS prefix.
+            # Decoder input = [BOS, prenet(tgt_embs[:, :-1, :])]
+            # Decoder target = tgt_embs  (position k predicts k-th target embedding)
             single_step = tgt_embs.dim() == 3 and tgt_embs.shape[1] == 1
-            tgt = self.prenet(tgt_embs)  # [batch, L, model_dim] or [batch,1,model_dim]
-            L = tgt.shape[1]
+            bos = self.bos_emb.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, -1)
+            tgt_input = self.prenet(tgt_embs[:, :-1, :])  # [batch, L-1, model_dim]
+            tgt_input = torch.cat([bos, tgt_input], dim=1)  # [batch, L, model_dim]
+            L = tgt_input.shape[1]
             tgt_pos = torch.arange(seq_len, seq_len + L, device=src.device).unsqueeze(0)
-            tgt = tgt + self.pos_emb(tgt_pos)
+            tgt_input = tgt_input + self.pos_emb(tgt_pos)
 
-            # Causal mask for decoder: shape [L, L]
+            # Causal mask: position k attends to positions ≤ k (safe because
+            # input at position k is the k-1-th target, not the k-th, so no
+            # autoencoder shortcut)
             tgt_mask = torch.triu(
                 torch.ones(L, L, dtype=torch.bool, device=src.device), diagonal=1
             )
 
-            # Decode in a single call for all target positions
-            # Run decoder layers sequentially; apply gradient checkpointing per
-            # layer if enabled to reduce activation memory.
-            output = tgt
+            output = tgt_input
             from torch.utils.checkpoint import checkpoint as _cp
 
             for layer in self.layers:
                 if self.checkpointing and self.training:
-                    # checkpoint requires positional args only
                     output = _cp(
-                        lambda o, m, mask: layer(o, m, tgt_mask=mask),
+                        lambda o, m, tmask, layer=layer: layer(o, m, tgt_mask=tmask),
                         output,
                         src,
                         tgt_mask,
@@ -131,19 +132,17 @@ class BaseLCM(nn.Module):
                 else:
                     output = layer(output, src, tgt_mask=tgt_mask)
 
-            # PostNet
             pred = self.postnet(output)  # [batch, L, embed_dim]
             if single_step:
-                return pred.squeeze(1)
+                return pred.squeeze(1)  # [batch, embed_dim]
             return pred
         else:
-            # Inference: predict next (autoregressively) without artificial dummies.
-            # Use the last source sentence representation as the initial real
-            # conditioning token rather than creating a synthetic zero tensor.
-            # src is already prenet-applied and position-embedded: [batch, seq_len, model_dim]
-            batch_size = src.shape[0]
-            # take most recent source token as starting target (real data)
-            output = src[:, -1:, :]
+            # Inference: start with BOS, predict the next embedding
+            bos = self.bos_emb.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, -1)
+            tgt_pos = torch.arange(seq_len, seq_len + 1, device=src.device).unsqueeze(0)
+            output = bos + self.pos_emb(tgt_pos)
+
+            # Single-token mask: BOS attends to itself (diagonal=1 → [[False]])
             tgt_mask = torch.triu(
                 torch.ones(1, 1, dtype=torch.bool, device=src.device), diagonal=1
             )
@@ -151,9 +150,8 @@ class BaseLCM(nn.Module):
 
             for layer in self.layers:
                 if self.checkpointing and self.training:
-                    # checkpoint requires positional args only
                     output = _cp(
-                        lambda o, m, mask: layer(o, m, tgt_mask=mask),
+                        lambda o, m, mask, layer=layer: layer(o, m, tgt_mask=mask),
                         output,
                         src,
                         tgt_mask,
@@ -161,8 +159,7 @@ class BaseLCM(nn.Module):
                 else:
                     output = layer(output, src, tgt_mask=tgt_mask)
 
-            pred_emb = self.postnet(output.squeeze(1))
-            return pred_emb
+            return self.postnet(output.squeeze(1))  # [batch, embed_dim]
 
     def generate_sequence(self, initial_embs, max_len=50):
         """Generate a sequence of embeddings autoregressively"""

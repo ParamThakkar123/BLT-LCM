@@ -23,7 +23,6 @@ VOCAB_SIZE = 256 + OFFSET
 PAD = 0
 BOS = 1
 EOT = 2
-UNK = 3
 
 
 def text_to_byte_tokens(text: str) -> List[int]:
@@ -33,6 +32,18 @@ def text_to_byte_tokens(text: str) -> List[int]:
 def byte_tokens_to_text(tokens: List[int]) -> str:
     byte_vals = [t - OFFSET for t in tokens if OFFSET <= t < OFFSET + 256]
     return bytes(byte_vals).decode("utf-8", errors="replace")
+
+
+def causal_mask(seq_len: int, device) -> torch.Tensor:
+    """Boolean [T, T] causal mask (True = disallowed) for a Transformer decoder.
+
+    Position k may attend only to positions <= k. Without this, teacher-forced
+    training lets each target position see future tokens and the decoder learns
+    to copy, which fails at autoregressive inference.
+    """
+    return torch.triu(
+        torch.ones(seq_len, seq_len, dtype=torch.bool, device=device), diagonal=1
+    )
 
 
 class SimpleTransformerEncoder(nn.Module):
@@ -204,14 +215,7 @@ class SonarLite(nn.Module):
 
         Returns: logits (if tgt_in provided) and embedding tensor [batch, embed_dim]
         """
-        enc_out = self.encoder(token_tensor, mask)
-        # mean pool
-        mask_f = mask.float()
-        lengths = mask_f.sum(dim=1, keepdim=True).clamp_min(1.0)
-        summed = (enc_out * mask_f.unsqueeze(-1)).sum(dim=1)
-        pooled = summed / lengths
-        emb = self.pool(pooled)
-        emb = self.post_norm(emb)
+        emb = self.encode_tokens(token_tensor, mask)
 
         # optionally apply robust scaler
         if apply_robust:
@@ -229,7 +233,9 @@ class SonarLite(nn.Module):
         if tgt_in is not None:
             # prepare memory for decoder
             memory = self.decoder_proj(emb_for_dec).unsqueeze(1)
-            logits = self.decoder(tgt_in, memory)
+            # Causal mask so teacher forcing cannot attend to future tokens.
+            tgt_mask = causal_mask(tgt_in.size(1), tgt_in.device)
+            logits = self.decoder(tgt_in, memory, tgt_mask=tgt_mask)
 
         return logits, emb
 
@@ -249,8 +255,9 @@ class SonarLite(nn.Module):
         outputs = [[] for _ in range(batch)]
 
         for step in range(max_len):
-            # No tgt_mask (we provide full left context)
-            logits = self.decoder(cur_tokens, memory)  # [batch, seq, vocab]
+            # Causal mask keeps decoding consistent with masked training.
+            tgt_mask = causal_mask(cur_tokens.size(1), device)
+            logits = self.decoder(cur_tokens, memory, tgt_mask=tgt_mask)  # [b, seq, vocab]
             next_logits = logits[:, -1, :]
             next_tok = next_logits.argmax(dim=-1)
             cur_tokens = torch.cat([cur_tokens, next_tok.unsqueeze(1)], dim=1)

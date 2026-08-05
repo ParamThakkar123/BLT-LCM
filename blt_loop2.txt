@@ -1,0 +1,16 @@
+257: 
+258:     model = BaseLCM(
+259:         embed_dim=embeddings_seqs[0].shape[1], model_dim=2048, n_layers=12, n_heads=16
+260:     ).to(device)
+261:     if wandb_module is not None:
+262:         try:
+263:             wandb_module.watch(model, log="all", log_freq=100)
+264:         except Exception:
+265:             pass
+266:     optim = torch.optim.AdamW(model.parameters(), lr=1e-4)
+267:     mse = torch.nn.MSELoss()
+268: 
+269:     # keep a single global step counter across epochs so logging steps are monotonic
+270:     global_step = 0
+267:     mse = torch.nn.MSELoss()
+288:                 losses.append(mse(pred, tgt[:, i]))

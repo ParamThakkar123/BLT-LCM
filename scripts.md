@@ -18,6 +18,26 @@ uv sync                 # install dependencies
 
 ## 1. BLT-LCM
 
+### 1.0 Learn the concept space (pooler + generative decoder) — do this first
+
+BLT concept embeddings are produced by a cross-attention **pooler** over byte
+hidden states, and predicted concepts are turned back into text by a generative
+**BLTDecoder** (not nearest-neighbor retrieval). Both are trained jointly with a
+byte-reconstruction objective (the byte backbone/entropy boundaries stay frozen):
+
+```bash
+python lcm_scripts/blt_decoder.py \
+  --entropy_model patching_scratch/entropy_model_marathi.pt \
+  --num_sentences 50000 --epochs 10 \
+  --pooler_save_path lcm_models/blt_pooler.pth \
+  --save_path lcm_models/blt_decoder.pth
+# Outputs → lcm_models/blt_pooler.pth  (loaded by all BLT training/eval via --pooler)
+#           lcm_models/blt_decoder.pth (generative decoder for eval)
+```
+
+Train the pooler+decoder BEFORE encoding LCM embeddings, and regenerate any
+`--embed_cache` afterwards (concept vectors change when the pooler changes).
+
 ### 1.1 Pre-encode BLT embeddings (cache step, ~hours per fraction)
 
 ```bash
@@ -69,26 +89,38 @@ uv run lcm_scripts/train_lcm_blt.py \
   --wandb_name blt_lcm_80
 ```
 
-### 1.3 Evaluate BLT-LCM (NN retrieval → BLEU / chrF++ / TER / METEOR / COMET)
+### 1.3 Evaluate BLT-LCM (generative decoding → BLEU / chrF++ / TER / METEOR / COMET)
+
+Predicted concepts are decoded to text with the trained `BLTDecoder`
+(`--decode_method generative`, the default). Pass the same `--pooler`/`--decoder`
+produced in step 1.0 and used to train the LCM. `--decode_method retrieval` is
+available only as a nearest-neighbor baseline.
 
 ```bash
-# 25%  —  noise 0.0, 0.1, 0.2
+# 25%  (concept next-sentence task)
 uv run lcm_scripts/eval_lcm_blt.py \
   --lcm_checkpoint lcm_models/blt_lcm_25/lcm_blt_best.pth \
   --entropy_model patching_scratch/entropy_model_marathi.pt \
-  --embed_cache embeddings/blt_embeddings_frac025.pth \
+  --pooler lcm_models/blt_pooler.pth \
+  --decoder lcm_models/blt_decoder.pth \
   --fraction 0.25 --out_csv results/blt_lcm_25_metrics.csv
-# Note: intrinsic eval uses clean data only; for noisy input evaluation
-# use the per-document prefix approach below:
+```
 
-# 25%  —  evaluate with noise 0.1, 0.2 (via custom eval)
-uv run lcm_scripts/eval_lcm_blt.py \
-  --lcm_checkpoint lcm_models/blt_lcm_25/lcm_blt_best.pth \
+### 1.5 English → Marathi translation (the MT task, with source-noise levels)
+
+This is the actual translation task (English source → Marathi target), evaluated
+across 0/10/20% source-side character noise. It trains `BaseLCM` to map the
+source concept to the target concept, then decodes to Marathi generatively.
+
+```bash
+uv run lcm_scripts/train_lcm_blt_mt.py \
   --entropy_model patching_scratch/entropy_model_marathi.pt \
-  --embed_cache embeddings/blt_embeddings_frac025.pth \
-  --fraction 0.25 --out_csv results/blt_lcm_25_clean.csv
-# For noise 0.1 / 0.2 re-run the evaluation with modified eval code or
-# use the evaluate_blt_lcm.py pipeline which runs eval_runner with noisy_probs.
+  --pooler lcm_models/blt_pooler.pth \
+  --decoder lcm_models/blt_decoder.pth \
+  --fraction 0.25 --epochs 3 \
+  --noise_levels 0.0 0.1 0.2 \
+  --out_csv results/blt_lcm_mt_25.csv
+# CSV columns: model, fraction, noise, BLEU, chrF++, TER, METEOR, COMET
 ```
 
 ### 1.4 BLT-LCM full evaluation suite (BLEU / chrF++ / METEOR / COMET / TER)
