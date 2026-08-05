@@ -18,8 +18,6 @@ build-backend = "setuptools.build_meta"
     "huggingface-hub>=0.34.0",
     "sentencepiece",
     "tiktoken",
-    "sonar-space==0.2.0",
-    "fairseq2==0.2.1",
     "datasets",
     "numpy>=1.26.0,<2.0",
     "tqdm",
@@ -46,6 +44,18 @@ build-backend = "setuptools.build_meta"
 test = [
     "pytest>=7.0.0",
 ]
+
+# lcm_scripts/sonar_loader.py (used by train_lcm_sonar.py / eval_lcm_sonar.py) needs
+# the real `sonar-space==0.2.0` + `fairseq2==0.2.1` -- but fairseq2==0.2.1 hard-requires
+# torch==2.2.2 via fairseq2n, which is unresolvable against the torch==2.5.1 pin above
+# (confirmed: `uv lock` fails outright with both in one dependency set, including as
+# a `uv`-declared extra, since `uv lock` resolves all extras into one universal lock).
+# These are deliberately NOT project dependencies here. They only ever install inside
+# apptainer.def's separate, manual `pip install` -- a fully isolated environment. Do
+# not add them back to `dependencies` or `[project.optional-dependencies]` without
+# re-verifying `uv lock` still succeeds.
+# lcm_scripts/train_sonar.py (SONAR-lite, sonar_module.py) has no such dependency
+# and runs fine in this project's normal venv.
 
 # `explicit = true` keeps this index from shadowing PyPI for everything else;
 # only the packages mapped in [tool.uv.sources] are fetched from it.
