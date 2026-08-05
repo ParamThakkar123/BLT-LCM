@@ -50,6 +50,16 @@ test = [
     "pytest>=7.0.0",
 ]
 
+# The only two platforms this project runs on: Windows workstations and the
+# Linux HPC cluster. Without this, uv resolves universally and can fail on
+# splits nobody uses (e.g. emscripten). Add a marker here before running on a
+# new platform -- macOS in particular is NOT covered.
+[tool.uv]
+environments = [
+    "sys_platform == 'linux'",
+    "sys_platform == 'win32'",
+]
+
 # `explicit = true` keeps this index from shadowing PyPI for everything else;
 # only the packages mapped in [tool.uv.sources] are fetched from it.
 [[tool.uv.index]]
