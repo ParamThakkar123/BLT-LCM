@@ -18,7 +18,11 @@ build-backend = "setuptools.build_meta"
     "huggingface-hub>=0.34.0",
     "sentencepiece",
     "tiktoken",
-    "sonar-space",
+    # Pinned: sonar-space >=0.4.0 requires fairseq2, which pins torch==2.2.2 and
+    # conflicts with the torch==2.5.1 pin above. 0.3.2 is the last release that
+    # declares no fairseq2 dependency. Without this pin a lock-less `uv sync`
+    # (uv.lock is gitignored) backtracks to sonar-space 0.2.1 and fails.
+    "sonar-space==0.3.2",
     "datasets",
     "numpy>=1.26.0,<2.0",
     "tqdm",
