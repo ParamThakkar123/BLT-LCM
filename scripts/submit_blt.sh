@@ -11,10 +11,10 @@
 #SBATCH --error=logs/%x_%j.err
 
 # Usage (via wrapper — recommended):
-#   scripts/sbatch.sh scripts/submit_blt.sh [fraction] [run_name] [time_limit]
-#   scripts/sbatch.sh scripts/submit_blt.sh 0.25 lcm_blt_25 11:00:00
-#   scripts/sbatch.sh scripts/submit_blt.sh 0.50 lcm_blt_50 21:00:00
-#   scripts/sbatch.sh scripts/submit_blt.sh 0.80 lcm_blt_80 1-09:00
+#   scripts/sbatch.sh scripts/submit_blt.sh [fraction] [run_name]
+#   scripts/sbatch.sh scripts/submit_blt.sh 0.25 lcm_blt_25
+#   scripts/sbatch.sh scripts/submit_blt.sh 0.50 lcm_blt_50
+#   scripts/sbatch.sh scripts/submit_blt.sh 0.80 lcm_blt_80
 
 FRACTION=${1:-0.25}
 RUN_NAME=${2:-"lcm_blt_$(echo $FRACTION | tr -d '.')"}
@@ -22,7 +22,6 @@ FRAC_TAG=$(echo "$FRACTION" | tr -d '.')
 CACHE_NAME="blt_embeddings_frac${FRAC_TAG}.pth"
 
 REPO_DIR=${SLURM_SUBMIT_DIR:-$(realpath "$(dirname "$0")/..")}
-APPTAINER_IMAGE=${APPTAINER_IMAGE:-"$REPO_DIR/lcm-sonar.sif"}
 
 cd "$REPO_DIR"
 
@@ -33,11 +32,7 @@ set -a && source .env && set +a
 echo "Job started:  $(date)"
 START=$(date +%s)
 
-apptainer exec --nv \
-    --bind "$REPO_DIR:/workspace" \
-    --pwd /workspace \
-    "$APPTAINER_IMAGE" \
-    python -u lcm_scripts/train_lcm_blt.py \
+uv run --frozen lcm_scripts/train_lcm_blt.py \
     --entropy_model patching_scratch/entropy_model_marathi.pt \
     --fraction "$FRACTION" \
     --epochs 2 \
