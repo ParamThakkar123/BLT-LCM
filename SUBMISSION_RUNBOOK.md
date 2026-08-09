@@ -64,8 +64,10 @@ numbers.
 ### Compute reality
 
 The local RTX 3050 (4 GB) cannot run any of this. Use the cluster. Slurm scripts
-exist in `scripts/` for BLT, BPE-LCM and SONAR — **you still need to write them
-for BPE-Transformer and Llama-8B.**
+now exist in `scripts/` for all five model types (BLT, BPE-LCM, SONAR,
+BPE-Transformer, Llama-8B) via `scripts/submit_*.sh` — submit through the
+`scripts/sbatch.sh` wrapper so `CLUSTER_PARTITION`/`CLUSTER_MEM` from `.env` are
+honored instead of the scripts' hardcoded Galvani defaults.
 
 ### Bar check
 

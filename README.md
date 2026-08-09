@@ -135,8 +135,8 @@ python tokenization_statistics/patch_compression_by_morpheme_class.py \
 
 ## Important files / scripts
 
-- `lcm_scripts/train_sonar.py` — pretrain SONAR-lite (denoising AE + MSE bottleneck distillation). Supports `--wandb` logging. Streams sentences from `ParamTh/BhashaSetu` by default.
-- `lcm_scripts/train_lcm_sonar.py` — encode documents with SONAR-lite and train BaseLCM on SONAR embeddings.
+- `lcm_scripts/train_sonar.py` — pretrain SONAR-lite (denoising AE + MSE bottleneck distillation). Supports `--wandb` logging. Streams sentences from `ParamTh/BhashaSetu` by default. Runs in the normal project venv; no `sonar-space`/`fairseq2` dependency.
+- `lcm_scripts/train_lcm_sonar.py` — encode documents with the **real** SONAR text encoder (`lcm_scripts/sonar_loader.py`, via `sonar-space`/`fairseq2`, not SONAR-lite) and train BaseLCM on those embeddings. **Requires the apptainer container** (see `apptainer.md`) — `sonar-space`/`fairseq2` are deliberately not in this project's default dependencies (see the comment in `pyproject.toml`), so a plain `uv run` will fail with `ModuleNotFoundError: sonar`.
 - `lcm_scripts/train_lcm_blt.py` — compute BLT sentence embeddings (via `lcm_scripts/blt_loader.py`) and train BaseLCM on them (concept next-sentence task). Pass `--pooler lcm_models/blt_pooler.pth` to use the learned pooler.
 - `lcm_scripts/train_lcm_blt_mt.py` — **English → Marathi machine translation** at the concept level: train BaseLCM to map the source concept to the target concept, then decode to Marathi generatively; evaluates across source-noise levels and writes a metrics CSV.
 - `lcm_scripts/blt_loader.py` — BLT loader. The entropy model is used **only** to place patch boundaries; patch representations are pooled from byte *hidden states* by a cross-attention pooler (BLT §3.2.2), then averaged into a sentence concept (dim 256).
@@ -151,6 +151,8 @@ python tokenization_statistics/patch_compression_by_morpheme_class.py \
 To train on specific percentages of the full dataset (~2.78M rows from `ParamTh/BhashaSetu`), use the following commands. These use `--fraction` to select the subset and `--epochs 1` for a single epoch approximation of max_steps.
 
 Note: If your dataset contains one sentence per row (sentence-level corpus) the script will automatically group consecutive sentences into pseudo-documents. To disable this automatic grouping and keep strict per-row documents, pass `--no_grouping`. The default group size is 4.
+
+Note: the `train_lcm_sonar.py` commands below need the apptainer container (see the SONAR baseline note above and `apptainer.md`) — replace `uv run lcm_scripts/train_lcm_sonar.py ...` with `apptainer exec --nv --bind "$PWD:/workspace" --pwd /workspace lcm-sonar.sif python -u lcm_scripts/train_lcm_sonar.py ...`, or submit via `scripts/sbatch.sh scripts/submit_sonar.sh`.
 
 ### 25% Subset
 - LCM on SONAR embeddings:
@@ -322,21 +324,24 @@ The orchestrator creates one metrics CSV per model/fraction and a combined `runs
     --out_dir runs/bpe_llama8b_25
   ```
 
-- **SONAR embedding + LCM baseline** encodes Marathi sentence documents with the SONAR-like loader, trains `BaseLCM`, decodes with nearest-neighbor retrieval and computes the same metrics:
+- **SONAR embedding + LCM baseline** encodes Marathi sentence documents with the real SONAR text encoder, trains `BaseLCM`, decodes with nearest-neighbor retrieval and computes the same metrics. This needs the apptainer container (`sonar-space`/`fairseq2` aren't installed in the default venv — see `apptainer.md`):
 
   ```bash
-  uv run lcm_scripts/train_lcm_sonar.py \
+  apptainer exec --nv --bind "$PWD:/workspace" --pwd /workspace lcm-sonar.sif \
+    python -u lcm_scripts/train_lcm_sonar.py \
     --fraction 0.25 \
     --epochs 2 \
     --noise_levels 0.0 0.10 0.20 \
     --out_dir runs/lcm_sonar_25
   ```
 
+  Or via the Slurm wrapper: `scripts/sbatch.sh scripts/submit_sonar.sh 0.25 lcm_sonar_25`.
+
 If your local BhashaSetu export uses non-default parallel column names, pass `--src_col` and `--tgt_col` to the parallel-text BPE scripts or the benchmark orchestrator.
 
 ### Recover SONAR-LCM baseline metrics from an existing checkpoint
 
-If a SONAR-LCM run produced checkpoints or TensorBoard event files but did not write a metrics CSV, evaluate the saved checkpoint directly. Use the same fraction and model dimensions that were used during training so the deterministic BhashaSetu split and `BaseLCM` shape match the checkpoint.
+If a SONAR-LCM run produced checkpoints or TensorBoard event files but did not write a metrics CSV, evaluate the saved checkpoint directly. Use the same fraction and model dimensions that were used during training so the deterministic BhashaSetu split and `BaseLCM` shape match the checkpoint. This also needs the apptainer container, same as training:
 
 ```bash
 uv run lcm_scripts/eval_lcm_sonar.py \

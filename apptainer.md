@@ -1,6 +1,14 @@
 # Apptainer Container for BLT-LCM
 
-An [Apptainer](https://apptainer.org/) (formerly Singularity) definition for running lcm-sonar on HPC systems without `uv` or a local Python environment. The container packages CUDA 12.1, Python 3.10, PyTorch, and all project dependencies. Source code is bind-mounted at runtime so the container doesn't need rebuilding for code changes.
+An [Apptainer](https://apptainer.org/) (formerly Singularity) definition, used **only for the
+SONAR baseline** (`submit_sonar.sh`/`eval_sonar.sh`). The real SONAR text encoder needs
+`sonar-space`/`fairseq2`, and `fairseq2` hard-pins a `torch` version that's incompatible with
+this project's own `torch==2.5.1` (see the comment in `pyproject.toml`) — `uv` cannot resolve
+both in one environment, so the SONAR baseline gets its own isolated, non-`uv` container instead.
+Source code is bind-mounted at runtime so the container doesn't need rebuilding for code changes.
+
+Every other job (BLT, BPE-LCM, BPE-Transformer, Llama-8B) runs via plain `uv run --frozen` and
+does **not** need this container — see their own `scripts/submit_*.sh`.
 
 ## Quickstart
 
@@ -8,9 +16,8 @@ An [Apptainer](https://apptainer.org/) (formerly Singularity) definition for run
 # 1. Build the container (needs internet; ~15-30 min; run on a login node)
 ./scripts/build_apptainer.sh
 
-# 2. Submit Slurm jobs as usual — the container is used automatically
+# 2. Submit the SONAR baseline — this is the only job that uses the container
 scripts/sbatch.sh scripts/submit_sonar.sh 0.25 lcm_sonar_25
-scripts/sbatch.sh scripts/submit_blt.sh 0.25 lcm_blt_25
 ```
 
 ## Building
@@ -30,7 +37,7 @@ The output is `lcm-sonar.sif` in the repo root (also ignored by git via `*.sif`)
 
 ## How It Works
 
-The Slurm scripts in `scripts/` have been updated to call `apptainer exec` instead of `uv run`. Each script:
+`submit_sonar.sh`/`eval_sonar.sh` call `apptainer exec` instead of `uv run`. Each script:
 
 1. Sources `.env` for API tokens (W&B, HF)
 2. Mounts the repo at `/workspace` inside the container
@@ -69,23 +76,12 @@ apptainer exec --nv \
     --out_dir runs/lcm_sonar_25 --wandb --wandb_project BLT-LCM --wandb_name lcm_sonar_25
 ```
 
-Or set `APPTAINER_IMAGE` in `.env` and keep using the Slurm scripts directly:
+Or set `APPTAINER_IMAGE` in `.env` and keep using the Slurm script directly:
 
 ```bash
-# These now run via Apptainer instead of uv:
+# Runs via Apptainer:
 ./scripts/sbatch.sh scripts/submit_sonar.sh 0.25 lcm_sonar_25
-./scripts/sbatch.sh scripts/submit_blt.sh 0.25 lcm_blt_25
 ```
-
-## Reverting to `uv run`
-
-To go back to using `uv run` directly (e.g. for local development), set `APPTAINER_IMAGE` to an empty value or unset it:
-
-```bash
-unset APPTAINER_IMAGE
-```
-
-Or comment it out in `.env`. The Slurm scripts check `APPTAINER_IMAGE` — if unset or empty, they fall back to `$REPO_DIR/lcm-sonar.sif`. To permanently revert, edit the scripts and change `apptainer exec` back to `uv run`.
 
 ## Container Contents
 

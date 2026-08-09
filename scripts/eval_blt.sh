@@ -23,7 +23,6 @@ RUN_NAME=${2:-"lcm_blt_$(echo $FRACTION | tr -d '.')"}
 FRAC_TAG=$(echo "$FRACTION" | tr -d '.')
 
 REPO_DIR=${SLURM_SUBMIT_DIR:-$(realpath "$(dirname "$0")/..")}
-APPTAINER_IMAGE=${APPTAINER_IMAGE:-"$REPO_DIR/lcm-sonar.sif"}
 
 cd "$REPO_DIR"
 
@@ -34,11 +33,7 @@ set -a && source .env && set +a
 echo "Job started:  $(date)"
 START=$(date +%s)
 
-apptainer exec --nv \
-    --bind "$REPO_DIR:/workspace" \
-    --pwd /workspace \
-    "$APPTAINER_IMAGE" \
-    python -u lcm_scripts/eval_lcm_blt.py \
+uv run --frozen lcm_scripts/eval_lcm_blt.py \
     --lcm_checkpoint "lcm_models/${RUN_NAME}/lcm_blt_best.pth" \
     --entropy_model patching_scratch/entropy_model_marathi.pt \
     --embed_cache "embeddings/blt_embeddings_frac${FRAC_TAG}.pth" \

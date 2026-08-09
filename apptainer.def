@@ -16,6 +16,7 @@ From: nvidia/cuda:12.1.0-runtime-ubuntu22.04
         python3.10-dev \
         python3.10-distutils \
         python3.10-venv \
+        libsndfile1 \
         && rm -rf /var/lib/apt/lists/*
 
     update-alternatives --install /usr/bin/python python /usr/bin/python3.10 1
@@ -31,8 +32,8 @@ From: nvidia/cuda:12.1.0-runtime-ubuntu22.04
         "huggingface-hub>=0.34.0" \
         sentencepiece \
         tiktoken \
-        sonar-space \
-        "fairseq2~=0.2.0" \
+        "sonar-space==0.2.0" \
+        "fairseq2==0.2.1" \
         datasets \
         "numpy>=1.26.0,<2.0" \
         tqdm \

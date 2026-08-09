@@ -30,8 +30,6 @@ singularity-3.5.3.tar.gz
 indic_nlp_resources/
 logs/
 tokenization_statistics/patch_compression_by_morpheme_class.png
-neurips_paper/references.bib
-
 # Apptainer container image
 *.sif
 

@@ -25,6 +25,8 @@ from datasets import load_dataset
 from run_blt_patching import text_to_byte_tokens
 from blt_loader import BLTLoader
 from base_lcm import BaseLCM
+from diffusion_lcm import OneTowerDiffusionLCM, TwoTowerDiffusionLCM
+from quant_lcm import QuantLCM
 from eval_metrics import compute_all
 from experiment_config import setup_logging
 from checkpoint_utils import (
@@ -149,6 +151,53 @@ def main():
         default="lcm_models",
         help="Directory to save model checkpoints",
     )
+    parser.add_argument(
+        "--lcm_variant",
+        choices=["base", "two_tower", "one_tower", "quant"],
+        default="base",
+        help="Which LCM to train. 'base' is the MSE Base-LCM (LCM §2.3.1); "
+        "'two_tower'/'one_tower' are the diffusion variants (§2.3.4/§2.3.3) that "
+        "the paper finds outperform it; 'quant' is the RVQ model (§2.3.5).",
+    )
+    parser.add_argument("--model_dim", type=int, default=2048)
+    parser.add_argument("--n_layers", type=int, default=12)
+    parser.add_argument("--n_heads", type=int, default=16)
+    parser.add_argument(
+        "--diffusion_steps",
+        type=int,
+        default=100,
+        help="Number of discretized diffusion timesteps T (diffusion variants).",
+    )
+    parser.add_argument(
+        "--noise_schedule",
+        choices=["cosine", "quadratic", "sigmoid"],
+        default="cosine",
+        help="Noise schedule for the diffusion variants (LCM §2.3.2).",
+    )
+    parser.add_argument(
+        "--n_codebooks",
+        type=int,
+        default=64,
+        help="RVQ codebooks for --lcm_variant quant (paper uses 64).",
+    )
+    parser.add_argument(
+        "--units_per_codebook",
+        type=int,
+        default=8192,
+        help="Units per RVQ codebook for --lcm_variant quant (paper uses 8192).",
+    )
+    parser.add_argument(
+        "--quant_target",
+        choices=["discrete", "continuous"],
+        default="discrete",
+        help="Quant-LCM-d (cross-entropy over units) or Quant-LCM-c (MSE).",
+    )
+    parser.add_argument(
+        "--quant_fit_samples",
+        type=int,
+        default=200_000,
+        help="Concept vectors used to fit the RVQ codebooks.",
+    )
     add_resume_args(parser, default_interval_steps=1000)
     args = parser.parse_args()
 
@@ -249,26 +298,69 @@ def main():
 
     embed_dim = embeddings_seqs[0].shape[1]
     max_concepts = max(int(s.shape[0]) for s in embeddings_seqs) + 2
-    model = BaseLCM(
-        embed_dim=embed_dim,
-        model_dim=2048,
-        n_layers=12,
-        n_heads=16,
-        max_seq_len=max(128, max_concepts),
-    ).to(device)
-    model.set_eot_embedding(eot_embedding)
+    max_seq_len = max(128, max_concepts)
 
-    # Fit the PreNet/PostNet robust scaler once, on a sample of the actual
-    # training concepts (LCM Eq. 4). Without this the scaler is the identity and
-    # PostNet cannot map predictions back into the encoder's coordinate scale.
+    if args.lcm_variant == "base":
+        model = BaseLCM(
+            embed_dim=embed_dim,
+            model_dim=args.model_dim,
+            n_layers=args.n_layers,
+            n_heads=args.n_heads,
+            max_seq_len=max_seq_len,
+        ).to(device)
+    elif args.lcm_variant == "two_tower":
+        model = TwoTowerDiffusionLCM(
+            embed_dim=embed_dim,
+            model_dim=args.model_dim,
+            context_layers=max(1, args.n_layers // 3),
+            denoiser_layers=args.n_layers,
+            n_heads=args.n_heads,
+            max_seq_len=max_seq_len,
+            timesteps=args.diffusion_steps,
+            schedule=args.noise_schedule,
+        ).to(device)
+    elif args.lcm_variant == "one_tower":
+        model = OneTowerDiffusionLCM(
+            embed_dim=embed_dim,
+            model_dim=args.model_dim,
+            n_layers=args.n_layers,
+            n_heads=args.n_heads,
+            max_seq_len=max_seq_len,
+            timesteps=args.diffusion_steps,
+            schedule=args.noise_schedule,
+        ).to(device)
+    else:  # quant
+        model = QuantLCM(
+            embed_dim=embed_dim,
+            model_dim=args.model_dim,
+            n_layers=args.n_layers,
+            n_heads=args.n_heads,
+            max_seq_len=max_seq_len,
+            n_codebooks=args.n_codebooks,
+            units_per_codebook=args.units_per_codebook,
+            target=args.quant_target,
+        ).to(device)
+    print(f"LCM variant: {args.lcm_variant}")
+
+    # Fit the robust scaler once, on a sample of the actual training concepts
+    # (LCM Eq. 4). Without this the scaler is the identity and the model cannot
+    # map predictions back into the encoder's coordinate scale.
     scaler_sample = torch.cat(
         [s for s in embeddings_seqs if s.shape[0] > 0], dim=0
     )
     if scaler_sample.shape[0] > 200_000:
         idx = torch.randperm(scaler_sample.shape[0])[:200_000]
         scaler_sample = scaler_sample[idx]
-    model.fit_normalizer(scaler_sample.to(device))
+    scaler_sample = scaler_sample.to(device)
+    model.fit_normalizer(scaler_sample)
     print(f"Fitted robust scaler on {scaler_sample.shape[0]} concept vectors")
+
+    if args.lcm_variant == "base":
+        model.set_eot_embedding(eot_embedding)
+    elif args.lcm_variant == "quant":
+        # RVQ codebooks must be fitted before the model can encode targets.
+        print(f"Fitting {args.n_codebooks} RVQ codebooks...")
+        model.fit_quantizer(scaler_sample[: args.quant_fit_samples])
     if wandb_module is not None:
         try:
             wandb_module.watch(model, log="all", log_freq=100)
@@ -278,7 +370,9 @@ def main():
 
     ckpt = TrainingCheckpointer(
         args.model_dir,
-        prefix="lcm_blt",
+        # Variant in the prefix so training two variants into the same
+        # --model_dir does not have them overwrite each other's checkpoints.
+        prefix="lcm_blt" if args.lcm_variant == "base" else f"lcm_blt_{args.lcm_variant}",
         fingerprint=fingerprint,
         max_keep=args.max_checkpoints,
         save_interval_steps=args.save_interval_steps,
@@ -314,13 +408,24 @@ def main():
             if seq_len == 0:
                 continue
             optim.zero_grad()
-            # One causal pass covers every position: output at t predicts the
-            # concept at t+1. The old loop re-ran the model once per position,
-            # which was O(L^2) forward passes for the same gradient.
-            preds = model.forward_all(src)
-            # Mask out padded positions so they don't pull predictions to zero.
-            valid = (tgt.abs().sum(dim=-1, keepdim=True) > 0).float()
-            loss = ((preds - tgt).pow(2) * valid).sum() / valid.sum().clamp(min=1) / tgt.shape[-1]
+            if args.lcm_variant == "base":
+                # One causal pass covers every position: output at t predicts
+                # the concept at t+1. The old loop re-ran the model once per
+                # position, which was O(L^2) forward passes for one gradient.
+                preds = model.forward_all(src)
+                # Mask padded positions so they don't pull predictions to zero.
+                valid = (tgt.abs().sum(dim=-1, keepdim=True) > 0).float()
+                loss = (
+                    ((preds - tgt).pow(2) * valid).sum()
+                    / valid.sum().clamp(min=1)
+                    / tgt.shape[-1]
+                )
+            else:
+                # Diffusion and quantized variants own their objective; they
+                # take the full document (context + target) rather than a
+                # pre-shifted (src, tgt) pair.
+                doc = torch.cat([src, tgt[:, -1:]], dim=1)
+                loss = model.loss(doc)
             loss.backward()
             optim.step()
             total += loss.item()

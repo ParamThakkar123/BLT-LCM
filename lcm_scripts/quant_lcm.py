@@ -16,11 +16,13 @@ the codebook index is fed to the model as an embedding and the head predicts
 only ``units_per_codebook`` units, as the paper does for parameter efficiency.
 """
 
-from typing import List, Optional
+from typing import Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from diffusion_lcm import _Normalizer
 
 
 class ResidualVectorQuantizer(nn.Module):
@@ -138,6 +140,10 @@ class QuantLCM(nn.Module):
         self.max_seq_len = max_seq_len
         self.cfg_dropout = cfg_dropout
 
+        # Concepts are quantized in *normalized* space, matching the other LCM
+        # variants, so the codebooks are not dominated by whichever dimensions
+        # happen to have the largest raw scale.
+        self.scaler = _Normalizer(embed_dim)
         self.quantizer = ResidualVectorQuantizer(
             embed_dim, n_codebooks, units_per_codebook
         )
@@ -165,8 +171,18 @@ class QuantLCM(nn.Module):
 
     # -- setup ------------------------------------------------------------- #
 
+    def fit_normalizer(self, samples: torch.Tensor):
+        """Fit the median/IQR scaler. Call before ``fit_quantizer``."""
+        self.scaler.fit(samples)
+        return self
+
     def fit_quantizer(self, samples: torch.Tensor, **kw):
-        self.quantizer.fit(samples, **kw)
+        """Fit the RVQ codebooks on *normalized* concepts.
+
+        Normalization is applied here rather than by the caller, so the
+        codebooks always live in the same space the model predicts in.
+        """
+        self.quantizer.fit(self.scaler.normalize(samples), **kw)
         return self
 
     # -- core -------------------------------------------------------------- #
@@ -202,6 +218,7 @@ class QuantLCM(nn.Module):
         B, L, D = embeddings.shape
         if L < 2:
             raise ValueError("need at least 2 concepts per document")
+        embeddings = self.scaler.normalize(embeddings)
         context = embeddings[:, :-1]
         target = embeddings[:, -1]
 
@@ -239,6 +256,7 @@ class QuantLCM(nn.Module):
         """Generate the next concept by successive refinement."""
         B, _, D = prefix.shape
         n = n_codebooks or self.quantizer.n_codebooks
+        prefix = self.scaler.normalize(prefix)
         partial = torch.zeros(B, D, device=prefix.device)
         null_ctx = torch.zeros_like(prefix)
         for c in range(n):
@@ -265,7 +283,8 @@ class QuantLCM(nn.Module):
                     probs = probs / probs.sum(dim=-1, keepdim=True).clamp_min(1e-9)
                 idx = torch.multinomial(probs, 1).squeeze(1)
             partial = partial + self.quantizer.codebooks[c][idx]
-        return partial
+        # Back to raw concept coordinates, matching the other LCM variants.
+        return self.scaler.denormalize(partial)
 
     def forward(self, src_embs, tgt_embs=None):
         return self.sample_next(src_embs)

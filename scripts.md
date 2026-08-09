@@ -166,6 +166,43 @@ run it after any change to the model code.
   The paper finds these outperform the MSE Base-LCM, which regresses to the
   *mean* of plausible continuations.
 
+### Selecting an LCM variant
+
+`train_lcm_blt.py --lcm_variant` picks the model. Checkpoints are prefixed by
+variant, so several can share one `--model_dir`.
+
+```bash
+# Base-LCM (MSE) — the paper's baseline, and the weakest of the four
+python lcm_scripts/train_lcm_blt.py --entropy_model patching_scratch/entropy_model_marathi.pt \
+  --lcm_variant base --fraction 0.25 --epochs 5
+
+# Two-Tower diffusion (the variant the paper scales to 7B)
+python lcm_scripts/train_lcm_blt.py --entropy_model patching_scratch/entropy_model_marathi.pt \
+  --lcm_variant two_tower --noise_schedule cosine --diffusion_steps 100 \
+  --fraction 0.25 --epochs 5
+
+# One-Tower diffusion
+python lcm_scripts/train_lcm_blt.py ... --lcm_variant one_tower --noise_schedule sigmoid
+
+# Quant-LCM-d (discrete units) / -c (continuous residual)
+python lcm_scripts/train_lcm_blt.py ... --lcm_variant quant --quant_target discrete \
+  --n_codebooks 64 --units_per_codebook 8192
+```
+
+| Flag | Applies to | Default |
+| --- | --- | --- |
+| `--lcm_variant` | all | `base` |
+| `--model_dim` / `--n_layers` / `--n_heads` | all | 2048 / 12 / 16 |
+| `--diffusion_steps` | diffusion | 100 |
+| `--noise_schedule` | diffusion | `cosine` |
+| `--n_codebooks` / `--units_per_codebook` | quant | 64 / 8192 |
+| `--quant_target` | quant | `discrete` |
+| `--quant_fit_samples` | quant | 200000 |
+
+The robust scaler is fitted for every variant before training; for `quant` the
+RVQ codebooks are then fitted on the **normalized** concepts, so quantization
+is not dominated by whichever dimensions have the largest raw scale.
+
 > **Checkpoint compatibility.** BaseLCM checkpoints produced before it became
 > decoder-only have an incompatible parameter layout and must be retrained;
 > `finetune_lcm.py` reports this explicitly rather than loading garbage.

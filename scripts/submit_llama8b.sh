@@ -25,7 +25,6 @@ RUN_NAME=${2:-"bpe_llama8b_$(echo $FRACTION | tr -d '.')"}
 MODE=${3:-qlora}    # "qlora" (default) or "full"
 
 REPO_DIR=${SLURM_SUBMIT_DIR:-$(realpath "$(dirname "$0")/..")}
-APPTAINER_IMAGE=${APPTAINER_IMAGE:-"$REPO_DIR/lcm-sonar.sif"}
 
 cd "$REPO_DIR"
 
@@ -41,11 +40,7 @@ fi
 echo "Job started:  $(date)"
 START=$(date +%s)
 
-apptainer exec --nv \
-    --bind "$REPO_DIR:/workspace" \
-    --pwd /workspace \
-    "$APPTAINER_IMAGE" \
-    python -u lcm_scripts/train_bpe_llama8b.py \
+uv run --frozen lcm_scripts/train_bpe_llama8b.py \
     --fraction "$FRACTION" \
     --epochs 1 \
     --batch_size 1 \

@@ -520,3 +520,42 @@ def test_blt_loader_exposes_encode_sentences():
 
     assert hasattr(BLTLoader, "encode_sentences")
     assert hasattr(BLTLoader, "encode_sentences_batch")
+
+
+def test_every_lcm_variant_is_trainable_through_one_interface():
+    """train_lcm_blt.py --lcm_variant dispatches over these four models.
+
+    Base-LCM is trained through forward_all + masked MSE; the others own their
+    objective via .loss(document). Both paths must work for the CLI to be able
+    to switch between them.
+    """
+    torch.manual_seed(0)
+    doc = torch.randn(2, 5, 8)
+
+    base = BaseLCM(embed_dim=8, model_dim=16, n_layers=1, n_heads=2, max_seq_len=16)
+    base.fit_normalizer(torch.randn(200, 8))
+    preds = base.forward_all(doc[:, :-1])
+    assert preds.shape == (2, 4, 8)
+
+    variants = [
+        TwoTowerDiffusionLCM(
+            embed_dim=8, model_dim=16, context_layers=1, denoiser_layers=1,
+            n_heads=2, max_seq_len=16, timesteps=10,
+        ),
+        OneTowerDiffusionLCM(
+            embed_dim=8, model_dim=16, n_layers=1, n_heads=2,
+            max_seq_len=16, timesteps=10,
+        ),
+    ]
+    quant = QuantLCM(
+        embed_dim=8, model_dim=16, n_layers=1, n_heads=2, max_seq_len=16,
+        n_codebooks=2, units_per_codebook=8,
+    )
+    quant.fit_quantizer(torch.randn(64, 8), iters=2, verbose=False)
+    variants.append(quant)
+
+    for model in variants:
+        model.fit_normalizer(torch.randn(200, 8))
+        loss = model.loss(doc)
+        assert torch.isfinite(loss) and loss.dim() == 0, type(model).__name__
+        loss.backward()
