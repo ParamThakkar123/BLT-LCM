@@ -29,11 +29,16 @@ from run_blt_patching import (  # noqa: E402
     text_to_byte_tokens,
 )
 from blt_local_encoder import (  # noqa: E402
+    DEFAULT_HASH_VOCAB,
+    DEFAULT_NGRAM_SIZES,
     HASH_BASE_PRIME,
+    PAPER_HASH_VOCAB,
+    PAPER_NGRAM_SIZES,
     BLTLatentTransformer,
     BLTSentenceEncoder,
     HashNGramEmbedder,
     _rolling_poly_hash_tensor,
+    hash_embedding_bytes,
     rolling_poly_hash,
 )
 from base_lcm import BaseLCM, RobustScaler  # noqa: E402
@@ -217,6 +222,42 @@ def test_hash_ngram_embeddings_change_the_representation():
     out = emb(tokens, x)
     assert out.shape == x.shape
     assert not torch.allclose(out, x)
+
+
+def test_default_hash_config_fits_a_single_gpu():
+    """The paper's 500k x n=3..8 config OOMs a 16 GiB GPU under AdamW.
+
+    6 x 500_000 x 256 x 4B = 2.86 GiB of parameters, and AdamW adds a gradient
+    plus two moments -- ~11.4 GiB committed before any activation. The default
+    must stay well inside a single accelerator; opt into the paper config
+    explicitly.
+    """
+    gib = 1024**3
+    default = hash_embedding_bytes(256, DEFAULT_NGRAM_SIZES, DEFAULT_HASH_VOCAB)
+    paper = hash_embedding_bytes(256, PAPER_NGRAM_SIZES, PAPER_HASH_VOCAB)
+    assert default / gib < 2.0, f"default hash tables need {default / gib:.1f} GiB"
+    assert paper / gib > 10.0, "paper config should be the expensive one"
+
+
+def test_hash_vocab_size_is_reachable_from_the_encoder():
+    """It must be configurable, or an OOM has no remedy short of a code edit."""
+    enc = BLTSentenceEncoder(
+        dim=16, concept_dim=32, encoder_layers=1, latent_layers=1, n_heads=2,
+        ngram_sizes=(3,), hash_vocab_size=64,
+    )
+    table = enc.encoder.hash_ngrams.tables["3"]
+    assert table.num_embeddings == 64
+    assert enc.encoder.hash_ngrams.param_bytes == 1 * 64 * 16 * 4
+
+
+def test_hash_ngrams_can_be_disabled():
+    enc = BLTSentenceEncoder(
+        dim=16, concept_dim=32, encoder_layers=1, latent_layers=1, n_heads=2,
+        use_hash_ngrams=False,
+    )
+    assert enc.encoder.hash_ngrams is None
+    tokens = torch.randint(4, 260, (1, 12))
+    assert enc.encoder.byte_hidden(tokens).shape == (1, 12, 16)
 
 
 def test_hash_ngram_normalisation_is_by_num_sizes_plus_one():

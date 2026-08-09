@@ -21,7 +21,7 @@ Both the entropy model's logits and its hidden states are unused downstream.
 import torch
 import sys
 import os
-from typing import Optional
+from typing import Optional, Sequence
 
 sys.path.append(os.path.dirname(__file__))
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "patching_scratch"))
@@ -35,7 +35,11 @@ from run_blt_patching import (
     entropy_patch_sentence,
 )
 from run_blt_patching import ByteEntropyModel
-from blt_local_encoder import BLTSentenceEncoder
+from blt_local_encoder import (
+    DEFAULT_HASH_VOCAB,
+    DEFAULT_NGRAM_SIZES,
+    BLTSentenceEncoder,
+)
 
 
 class BLTLoader:
@@ -51,8 +55,11 @@ class BLTLoader:
         encoder_heads: int = 8,
         encoder_window: int = 512,
         use_hash_ngrams: bool = True,
+        ngram_sizes: Sequence[int] = DEFAULT_NGRAM_SIZES,
+        hash_vocab_size: int = DEFAULT_HASH_VOCAB,
         patching_mode: str = "global",
         threshold_add: float = DEFAULT_THRESHOLD_ADD,
+        verbose: bool = True,
     ):
         self.device = device
         self.patching_mode = patching_mode
@@ -108,8 +115,16 @@ class BLTLoader:
             n_heads=encoder_heads,
             window=encoder_window,
             use_hash_ngrams=use_hash_ngrams,
+            ngram_sizes=ngram_sizes,
+            hash_vocab_size=hash_vocab_size,
         ).to(device)
         self.encoder.eval()
+        if verbose:
+            total = sum(p.numel() for p in self.encoder.parameters())
+            print(f"[BLTLoader] trainable byte-side parameters: {total:,}")
+            ngrams = self.encoder.encoder.hash_ngrams
+            if ngrams is not None:
+                print(f"[BLTLoader] {ngrams.memory_summary()}")
         # Backwards-compatible alias: joint pooler+decoder training and the
         # sidecar files address this stack as ".pooler".
         self.pooler = self.encoder

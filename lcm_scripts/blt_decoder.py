@@ -530,6 +530,42 @@ if __name__ == "__main__":
     )
     parser.add_argument("--threshold", type=float, default=1.335)
     parser.add_argument(
+        "--encoder_dim", type=int, default=256, help="Local encoder byte width"
+    )
+    parser.add_argument("--encoder_layers", type=int, default=1)
+    parser.add_argument("--latent_layers", type=int, default=4)
+    parser.add_argument("--encoder_heads", type=int, default=8)
+    parser.add_argument(
+        "--encoder_window",
+        type=int,
+        default=512,
+        help="Local block-causal attention window in bytes (BLT §3.2)",
+    )
+    parser.add_argument(
+        "--hash_vocab_size",
+        type=int,
+        default=None,
+        help="Hash n-gram table size per n. Memory is "
+        "len(ngram_sizes) * hash_vocab_size * encoder_dim * 4 bytes, and AdamW "
+        "quadruples it. The paper uses 500000 over n=3..8, which is ~11.4 GiB "
+        "of optimizer-committed memory at encoder_dim 256 and will OOM a 16 GiB "
+        "GPU. Default is 100000.",
+    )
+    parser.add_argument(
+        "--ngram_sizes",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Byte n-gram sizes for hash embeddings (default 3 4 5; the paper "
+        "uses 3 4 5 6 7 8).",
+    )
+    parser.add_argument(
+        "--no_hash_ngrams",
+        action="store_true",
+        help="Disable hash n-gram embeddings entirely (BLT Table 8 ablation). "
+        "Removes their memory cost at a real quality cost.",
+    )
+    parser.add_argument(
         "--concept_dim",
         type=int,
         default=1024,
@@ -560,10 +596,24 @@ if __name__ == "__main__":
 
     from blt_loader import BLTLoader
 
+    from blt_local_encoder import DEFAULT_HASH_VOCAB, DEFAULT_NGRAM_SIZES
+
     blt = BLTLoader(
         entropy_model_path=args.entropy_model,
         device=args.device,
         concept_dim=args.concept_dim,
+        encoder_dim=args.encoder_dim,
+        encoder_layers=args.encoder_layers,
+        latent_layers=args.latent_layers,
+        encoder_heads=args.encoder_heads,
+        encoder_window=args.encoder_window,
+        use_hash_ngrams=not args.no_hash_ngrams,
+        ngram_sizes=tuple(args.ngram_sizes) if args.ngram_sizes else DEFAULT_NGRAM_SIZES,
+        hash_vocab_size=(
+            args.hash_vocab_size
+            if args.hash_vocab_size is not None
+            else DEFAULT_HASH_VOCAB
+        ),
     )
 
     decoder = BLTDecoder(

@@ -134,10 +134,28 @@ run it after any change to the model code.
   here (dim 256, 4 layers) are a scaled-down variant of the paper's 100M/14-layer
   model; per Fig. 8, quality rises with both size and context.
 * **Hash n-gram embeddings** (§3.2.1, Eqs. 2–4, Appendix C) are implemented in
-  `blt_local_encoder.HashNGramEmbedder`: rolling polynomial hash over n ∈ 3..8
-  into per-n tables, summed onto the byte embedding and normalised by
-  `len(ngram_sizes) + 1`. Disable with `use_hash_ngrams=False` to reproduce the
-  Table 8 ablation.
+  `blt_local_encoder.HashNGramEmbedder`: rolling polynomial hash into per-n
+  tables, summed onto the byte embedding and normalised by
+  `len(ngram_sizes) + 1`.
+
+  **These tables dominate memory.** Cost is
+  `len(ngram_sizes) × hash_vocab_size × encoder_dim × 4 bytes`, and AdamW
+  quadruples it (gradient + two moments). At `encoder_dim=256`:
+
+  | config | params | committed under AdamW |
+  | --- | --- | --- |
+  | paper: n=3..8 × 500k (§4.8) | 2.86 GiB | **11.44 GiB** — OOMs a 16 GiB GPU |
+  | **default: n=3,4,5 × 100k** | 0.29 GiB | **1.14 GiB** |
+  | n=3,4,5 × 200k | 0.57 GiB | 2.29 GiB |
+  | n=3,4,5 × 400k | 1.14 GiB | 4.58 GiB |
+
+  The default follows BLT Table 8, which shows per-n vocabulary matters more
+  than covering every n and that smaller n are the more impactful ones
+  (`3,4,5 @ 100k` scores 0.837 on the train distribution vs 0.826 for the full
+  `3..8 @ 400k`). Tune with `--hash_vocab_size` / `--ngram_sizes`, or drop them
+  entirely with `--no_hash_ngrams` for the Table 8 ablation. `BLTLoader` prints
+  the footprint at construction so a bad configuration is visible before the
+  first `optimizer.step()` rather than after it.
 * **The local encoder is a separate trainable network** (`BLTLocalEncoder`), not
   the entropy model. The entropy model is frozen and supplies boundaries only.
 * **The patch sequence reaches a latent transformer** (`BLTLatentTransformer`,

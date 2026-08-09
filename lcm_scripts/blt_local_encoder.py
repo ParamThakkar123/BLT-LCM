@@ -32,9 +32,41 @@ import torch.nn.functional as F
 
 # A 10-digit prime, per BLT Appendix C.
 HASH_BASE_PRIME = 1000000007
-DEFAULT_NGRAM_SIZES = (3, 4, 5, 6, 7, 8)
-# BLT §4.8 uses 500,000 hashes with a single hash function.
-DEFAULT_HASH_VOCAB = 500_000
+
+# BLT §4.8 uses 500,000 hashes with a single hash function over n = 3..8.
+PAPER_NGRAM_SIZES = (3, 4, 5, 6, 7, 8)
+PAPER_HASH_VOCAB = 500_000
+
+# That configuration is very large for a single accelerator: at encoder width
+# 256 it is 6 x 500_000 x 256 x 4B = 2.9 GiB of *parameters*, and AdamW keeps a
+# gradient plus two moments, so ~11.4 GiB is committed before any activation --
+# enough to OOM a 16 GiB GPU during optimizer.step().
+#
+# BLT Table 8 shows the per-n vocabulary matters more than covering every n, and
+# that the smaller n are the more impactful ones ("3,4,5 @ 100k" scores 0.837 on
+# the train distribution vs 0.826 for the full "3..8 @ 400k"). The default here
+# is therefore the memory-feasible subset; pass PAPER_NGRAM_SIZES /
+# PAPER_HASH_VOCAB explicitly to reproduce the paper's configuration on hardware
+# that can hold it.
+DEFAULT_NGRAM_SIZES = (3, 4, 5)
+DEFAULT_HASH_VOCAB = 100_000
+
+
+def hash_embedding_bytes(
+    dim: int,
+    ngram_sizes: Sequence[int] = DEFAULT_NGRAM_SIZES,
+    hash_vocab_size: int = DEFAULT_HASH_VOCAB,
+    bytes_per_param: int = 4,
+    optimizer_multiplier: int = 4,
+) -> int:
+    """Bytes the hash tables commit, including optimizer state.
+
+    ``optimizer_multiplier=4`` accounts for parameters + gradient + AdamW's two
+    moments. Use this to sanity-check a configuration before training rather
+    than discovering it at the first optimizer.step().
+    """
+    params = len(tuple(ngram_sizes)) * hash_vocab_size * dim * bytes_per_param
+    return params * optimizer_multiplier
 
 
 def rolling_poly_hash(ngram: Sequence[int], base: int = HASH_BASE_PRIME) -> int:
@@ -114,6 +146,19 @@ class HashNGramEmbedder(nn.Module):
         )
         for n in self.ngram_sizes:
             nn.init.normal_(self.tables[str(n)].weight, std=0.02)
+
+    @property
+    def param_bytes(self) -> int:
+        """Parameter bytes in the hash tables (excluding optimizer state)."""
+        return len(self.ngram_sizes) * self.hash_vocab_size * self.dim * 4
+
+    def memory_summary(self) -> str:
+        gib = 1024**3
+        return (
+            f"hash n-grams n={list(self.ngram_sizes)} x {self.hash_vocab_size:,} "
+            f"@ dim {self.dim}: {self.param_bytes / gib:.2f} GiB params, "
+            f"~{self.param_bytes * 4 / gib:.2f} GiB with AdamW state"
+        )
 
     def forward(self, tokens: torch.Tensor, byte_emb: torch.Tensor) -> torch.Tensor:
         """``tokens``: [B, T] ids. ``byte_emb``: [B, T, dim]. Returns [B, T, dim]."""
