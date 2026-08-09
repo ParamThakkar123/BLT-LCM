@@ -16,6 +16,7 @@ Categories:
   5. Domain-specific vocabulary (legal, medical)
 """
 
+import argparse
 import json
 import os
 import re
@@ -29,6 +30,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lcm_scripts"))
 import torch
 from tokenizers import Tokenizer
 from tqdm import tqdm
+
+from checkpoint_utils import ResumableJsonl, config_fingerprint, load_model_state
 
 from run_blt_patching import (
     text_to_byte_tokens,
@@ -157,6 +160,21 @@ def compute_blt_fertility(text, entropy_model, device, threshold=DEFAULT_THRESHO
 # ── main ─────────────────────────────────────────────────────
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--resume",
+        default="auto",
+        metavar="auto|never",
+        help="'auto' (default) continues from a partial per-sentence scores "
+        "file whose configuration matches; 'never' discards it.",
+    )
+    parser.add_argument(
+        "--progress_jsonl",
+        default=os.path.join(SCRIPT_DIR, "all_sentences_scores.jsonl"),
+        help="Per-sentence fertility rows, streamed as they are computed.",
+    )
+    args = parser.parse_args()
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
 
@@ -182,7 +200,7 @@ def main():
         max_seqlen=cfg.get("max_seqlen", 512),
         ffn_dim_multiplier=cfg.get("ffn_dim_multiplier", 1.3),
     ).to(device)
-    entropy_model.load_state_dict(checkpoint["model_state_dict"])
+    entropy_model.load_state_dict(load_model_state(checkpoint))
     entropy_model.eval()
     print("  Entropy model loaded.")
 
@@ -197,16 +215,38 @@ def main():
     sentences = all_sentences
     print(f"  Analyzing {len(sentences)} sentences...")
 
-    # Compute per-sentence scores
-    results = []
+    # Compute per-sentence scores. The BLT pass is a neural forward per
+    # sentence over the whole corpus, so rows stream to disk as they are
+    # produced and an interrupted run resumes at the first one it had not
+    # written.
+    fingerprint = config_fingerprint(
+        {
+            "corpus": sentences_path,
+            "num_sentences": len(sentences),
+            "threshold": DEFAULT_THRESHOLD,
+            "tok_aug": aug_path,
+            "tok_ret": ret_path,
+        }
+    )
+    writer = ResumableJsonl(
+        args.progress_jsonl,
+        fingerprint=fingerprint,
+        resume=args.resume != "never",
+        key="idx",
+    )
+    if writer.done:
+        print(f"  Resuming: {len(writer.done)}/{len(sentences)} already scored")
+
     for idx, text in enumerate(tqdm(sentences, desc="Computing fertility")):
+        if writer.is_done(idx):
+            continue
         text = text.strip()
         if not text:
             continue
 
         # Phase 1: best of augmented & retrained
-        fert_aug, ntok_aug, nw_aug = compute_tokenizer_fertility(tok_aug, text)
-        fert_ret, ntok_ret, nw_ret = compute_tokenizer_fertility(tok_ret, text)
+        fert_aug, _, _ = compute_tokenizer_fertility(tok_aug, text)
+        fert_ret, _, _ = compute_tokenizer_fertility(tok_ret, text)
         phase1_best = min(fert_aug, fert_ret)
         phase1_source = "augmented" if fert_aug <= fert_ret else "retrained"
 
@@ -218,7 +258,7 @@ def main():
         # Regression = BLT fertility is higher (worse) than Phase 1 best
         delta = fert_blt - phase1_best
 
-        results.append({
+        writer.append({
             "idx": idx,
             "text": text,
             "n_words": n_words,
@@ -230,6 +270,8 @@ def main():
             "n_patches": n_patches,
             "delta": round(delta, 4),
         })
+    writer.close()
+    results = writer.all_records()
 
     # Sort by delta descending — biggest regressions first
     results.sort(key=lambda r: r["delta"], reverse=True)

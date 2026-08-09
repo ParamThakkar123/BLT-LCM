@@ -17,6 +17,7 @@ Outputs:
   - Console table of fertility (λ) per morpheme class
 """
 
+import argparse
 import sys
 import io
 import json
@@ -24,11 +25,14 @@ import os
 import re
 import logging
 import time
-from datetime import datetime, timezone
 from collections import defaultdict
 
 # Fix Windows console encoding
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from lcm_scripts.checkpoint_utils import ResumableJsonl, config_fingerprint
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
 
@@ -49,6 +53,18 @@ logger = logging.getLogger("fertility_audit")
 logger.info("=" * 60)
 logger.info("Fertility audit script started")
 logger.info("=" * 60)
+
+# ── CLI ──────────────────────────────────────────────────────────────────────
+
+_parser = argparse.ArgumentParser(description=__doc__)
+_parser.add_argument(
+    "--resume",
+    default=os.environ.get("FERTILITY_RESUME", "auto"),
+    metavar="auto|never",
+    help="'auto' (default) continues from a partial per-word detail JSONL whose "
+    "configuration matches; 'never' discards it and starts over.",
+)
+ARGS = _parser.parse_args()
 
 # ── Indic NLP setup ──────────────────────────────────────────────────────────
 
@@ -126,10 +142,45 @@ CLASS_DISPLAY = {
 
 CORPUS_PATH = os.path.join(os.path.dirname(__file__), "..", "marathi_sentences.json")
 CORPUS_PATH = os.path.normpath(CORPUS_PATH)
+# How many Marathi sentences to materialize if the corpus file is missing.
+CORPUS_GEN_SIZE = int(os.environ.get("FERTILITY_CORPUS_SIZE", "20000"))
+
+
+def _generate_corpus_from_bhashasetu(path: str, num_sentences: int) -> list:
+    """Build ``marathi_sentences.json`` from BhashaSetu so the audit is
+    reproducible from the repository alone (the corpus file is not tracked).
+
+    Streams the Marathi column deterministically and caches the result to
+    ``path`` for subsequent runs.
+    """
+    from datasets import load_dataset
+
+    logger.info(
+        "Corpus file not found; generating %d Marathi sentences from "
+        "ParamTh/BhashaSetu (one-time, cached to %s)…",
+        num_sentences,
+        path,
+    )
+    ds = load_dataset("ParamTh/BhashaSetu", split="train", streaming=True)
+    collected = []
+    for row in ds:
+        text = (row.get("marathi") or "").strip()
+        if len(text) > 5:
+            collected.append(text)
+        if len(collected) >= num_sentences:
+            break
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(collected, fh, ensure_ascii=False)
+    logger.info("Generated and cached %d sentences to %s", len(collected), path)
+    return collected
+
 
 logger.info("Loading corpus from %s…", CORPUS_PATH)
-with open(CORPUS_PATH, "r", encoding="utf-8") as f:
-    all_sentences = json.load(f)
+if os.path.exists(CORPUS_PATH):
+    with open(CORPUS_PATH, "r", encoding="utf-8") as f:
+        all_sentences = json.load(f)
+else:
+    all_sentences = _generate_corpus_from_bhashasetu(CORPUS_PATH, CORPUS_GEN_SIZE)
 logger.info("Corpus loaded: %d sentences total", len(all_sentences))
 
 # Use a sample for efficiency — Stanza POS tagging is slower than byte-level ops.
@@ -140,26 +191,55 @@ logger.info("Processing sample: %s / %s sentences", SAMPLE_SIZE, len(all_sentenc
 
 # ── Process sentences ────────────────────────────────────────────────────────
 
-# Accumulators per class
-class_morpheme_counts = defaultdict(list)  # class -> list of morpheme counts per word
-class_word_examples = defaultdict(list)  # class -> sample words (capped)
+RESULTS_DIR = os.path.join(os.path.dirname(__file__), "..", "results")
+os.makedirs(RESULTS_DIR, exist_ok=True)
 
-detail_rows = []  # per-word JSONL records
-total_words = 0
-total_morphemes = 0
+FINGERPRINT = config_fingerprint(
+    {
+        "corpus": CORPUS_PATH,
+        "sample_size": SAMPLE_SIZE,
+        "class_labels": CLASS_LABELS,
+    }
+)
 
 BATCH_SIZE = 50  # Stanza batch size for efficiency
 logger.info("Beginning sentence processing (batch size=%d)…", BATCH_SIZE)
 batch_t0 = time.time()
 
-for batch_start in range(0, len(sentences), BATCH_SIZE):
-    batch = sentences[batch_start : batch_start + BATCH_SIZE]
+# Stanza tagging plus morphological analysis runs at a few sentences per second,
+# so a 5000-sentence audit is a long job. Results are grouped one row per
+# sentence and streamed to a progress file, so an interrupted audit resumes at
+# the first sentence it had not written. The flat per-word JSONL that downstream
+# scripts consume is rebuilt from those rows below.
+progress = ResumableJsonl(
+    os.path.join(RESULTS_DIR, "fertility_audit_progress.jsonl"),
+    fingerprint=FINGERPRINT,
+    resume=ARGS.resume != "never",
+    key="sentence_id",
+)
+if progress.done:
+    logger.info(
+        "Resuming audit: %d/%d sentences already processed",
+        len(progress.done),
+        len(sentences),
+    )
 
-    # Stanza processes a list of sentences efficiently
-    docs = [nlp(sent) for sent in batch]
+for batch_start in range(0, len(sentences), BATCH_SIZE):
+    batch_idx = [
+        i
+        for i in range(batch_start, min(batch_start + BATCH_SIZE, len(sentences)))
+        if not progress.is_done(i)
+    ]
+    if not batch_idx:
+        continue
+    batch = [sentences[i] for i in batch_idx]
+
+    # Stanza accepts a list of strings in one call, returning list[Document]
+    docs = nlp(batch)
 
     for doc_idx, doc in enumerate(docs):
-        sent_idx = batch_start + doc_idx
+        sent_idx = batch_idx[doc_idx]
+        words = []
         for sent in doc.sentences:
             for word in sent.words:
                 text = word.text
@@ -177,34 +257,18 @@ for batch_start in range(0, len(sentences), BATCH_SIZE):
                 except Exception:
                     morphemes = [text]
 
-                n_morphemes = len(morphemes)
-                cls = classify_word(upos, text, morphemes)
-
-                class_morpheme_counts[cls].append(n_morphemes)
-                total_words += 1
-                total_morphemes += n_morphemes
-
-                # Keep a few examples per class
-                if len(class_word_examples[cls]) < 20:
-                    class_word_examples[cls].append(
-                        {
-                            "word": text,
-                            "upos": upos,
-                            "morphemes": morphemes,
-                            "n_morphemes": n_morphemes,
-                        }
-                    )
-
-                detail_rows.append(
+                words.append(
                     {
-                        "sentence_id": sent_idx,
                         "word": text,
                         "upos": upos,
                         "morphemes": morphemes,
-                        "n_morphemes": n_morphemes,
-                        "class": cls,
+                        "n_morphemes": len(morphemes),
+                        "class": classify_word(upos, text, morphemes),
                     }
                 )
+        # One row per sentence, emitted even when no word qualifies, so those
+        # sentences are not re-tagged on every resume.
+        progress.append({"sentence_id": sent_idx, "words": words})
 
     # Progress
     processed = min(batch_start + BATCH_SIZE, len(sentences))
@@ -212,12 +276,39 @@ for batch_start in range(0, len(sentences), BATCH_SIZE):
         elapsed = time.time() - batch_t0
         rate = processed / elapsed if elapsed > 0 else 0
         logger.info(
-            "Processed %s/%s sentences (%s words, %.1f sent/s)",
+            "Processed %s/%s sentences (%.1f sent/s)",
             processed,
             len(sentences),
-            total_words,
             rate,
         )
+
+progress.close()
+
+# ── Flatten into the per-word records the rest of the pipeline expects ───────
+
+# Accumulators per class
+class_morpheme_counts = defaultdict(list)  # class -> list of morpheme counts per word
+class_word_examples = defaultdict(list)  # class -> sample words (capped)
+
+detail_rows = []  # per-word JSONL records
+total_words = 0
+total_morphemes = 0
+
+for row in progress.all_records():
+    sent_idx = row["sentence_id"]
+    for w in row["words"]:
+        cls = w["class"]
+        class_morpheme_counts[cls].append(w["n_morphemes"])
+        total_words += 1
+        total_morphemes += w["n_morphemes"]
+
+        # Keep a few examples per class
+        if len(class_word_examples[cls]) < 20:
+            class_word_examples[cls].append(
+                {k: w[k] for k in ("word", "upos", "morphemes", "n_morphemes")}
+            )
+
+        detail_rows.append({"sentence_id": sent_idx, **w})
 
 logger.info(
     "Sentence processing complete (%d words in %.1fs)",
@@ -268,9 +359,6 @@ for cls in CLASS_LABELS:
 logger.info("Statistics computed in %.3fs", time.time() - compute_t0)
 
 # ── Save outputs ─────────────────────────────────────────────────────────────
-
-RESULTS_DIR = os.path.join(os.path.dirname(__file__), "..", "results")
-os.makedirs(RESULTS_DIR, exist_ok=True)
 
 out_json = os.path.join(RESULTS_DIR, "fertility_by_class.json")
 with open(out_json, "w", encoding="utf-8") as f:

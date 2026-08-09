@@ -14,13 +14,19 @@ load_dotenv()
 import argparse
 import time
 import torch
-from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from datasets import load_dataset
 
 from sonar_module import SonarLite, text_to_byte_tokens
 from experiment_config import setup_logging
+from checkpoint_utils import (
+    ResumableLoader,
+    TrainingCheckpointer,
+    add_resume_args,
+    config_fingerprint,
+    seed_everything,
+)
 
 
 def stream_sentences(num_sentences=20000):
@@ -97,7 +103,9 @@ def collate_fn(batch):
 
 def train(args):
     device = torch.device(args.device)
-    os.makedirs("lcm_models", exist_ok=True)
+    os.makedirs(args.model_dir, exist_ok=True)
+    seed_everything(args.ckpt_seed)
+    fingerprint = config_fingerprint(args)
 
     writer = None
     if hasattr(args, "log_dir") and args.log_dir:
@@ -135,12 +143,32 @@ def train(args):
         sents = list(s_iter)
         print(f"Loaded {len(sents)} sentences")
         ds = SentenceDataset(sents, max_len=args.max_len)
-    loader = DataLoader(
-        ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn
+    loader = ResumableLoader(
+        ds,
+        batch_size=args.batch_size,
+        seed=args.ckpt_seed,
+        shuffle=True,
+        collate_fn=collate_fn,
     )
 
     model = SonarLite(device=device).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
+
+    ckpt = TrainingCheckpointer(
+        args.model_dir,
+        prefix="sonar",
+        fingerprint=fingerprint,
+        max_keep=args.max_checkpoints,
+        save_interval_steps=args.save_interval_steps,
+        save_interval_seconds=args.save_interval_seconds,
+    )
+    resume = ckpt.restore(ckpt.load(args.resume, map_location=device), model, opt)
+    global_step = resume.global_step
+    if resume.resumed:
+        print(
+            f"Resuming at epoch {resume.start_epoch + 1}/{args.epochs}, "
+            f"batch {resume.start_batch}"
+        )
 
     # Training hyperparams for SONAR-style objectives
     noise_prob = args.noise_prob
@@ -160,12 +188,15 @@ def train(args):
         noisy[corrupt] = 3
         return noisy, mask
 
-    for epoch in range(args.epochs):
+    for epoch in range(resume.start_epoch, args.epochs):
         model.train()
         total_loss = 0.0
         steps = 0
         start = time.time()
-        for batch in tqdm(loader):
+        skip = resume.batches_to_skip(epoch)
+        for batch_idx, batch in tqdm(
+            loader.epoch(epoch, skip=skip), initial=skip, total=len(loader)
+        ):
             # batch can be (tokens, mask) for monolingual or
             # (src_out, src_mask, tgt_out, tgt_mask) for parallel
             if isinstance(batch, tuple) and len(batch) == 2:
@@ -284,12 +315,19 @@ def train(args):
 
             total_loss += loss.item()
             steps += 1
+            global_step += 1
+            ckpt.maybe_save(
+                model,
+                opt,
+                epoch=epoch,
+                batch_in_epoch=batch_idx,
+                global_step=global_step,
+            )
 
         elapsed = time.time() - start
         avg_loss = total_loss / steps if steps > 0 else 0.0
         print(f"Epoch {epoch + 1} avg loss: {avg_loss:.4f} time: {elapsed:.1f}s")
-        path = f"lcm_models/sonar_epoch{epoch + 1}.pth"
-        torch.save(model.state_dict(), path)
+        path = ckpt.save_epoch(model, opt, epoch=epoch, global_step=global_step)
         if writer is not None:
             writer.add_scalar("train/loss", avg_loss, epoch + 1)
         if wandb_module is not None:
@@ -374,5 +412,7 @@ if __name__ == "__main__":
         default=None,
         help="epoch after which encoder is frozen (None=no freeze)",
     )
+    parser.add_argument("--model_dir", type=str, default="lcm_models")
+    add_resume_args(parser, default_interval_steps=200)
     args = parser.parse_args()
     train(args)

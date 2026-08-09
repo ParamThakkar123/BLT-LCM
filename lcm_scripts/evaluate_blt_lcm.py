@@ -4,6 +4,7 @@ Evaluate BLT-LCM model on the test split (last 20% of BhashaSetu dataset) for Ma
 Computes the average MSE loss on next sentence prediction and evaluates generated hypotheses against references using text metrics.
 """
 
+import argparse
 import torch
 from torch.utils.data import DataLoader
 from datasets import load_dataset
@@ -14,6 +15,14 @@ import os
 from run_blt_patching import text_to_byte_tokens
 from tqdm import tqdm
 
+from checkpoint_utils import (
+    ResumableJsonl,
+    add_resume_args,
+    cached_torch,
+    config_fingerprint,
+    load_model_state,
+)
+
 
 def prepare_data(is_test=False, max_sent_per_doc=20):
     ds = load_dataset("ParamTh/BhashaSetu", split="train")
@@ -21,6 +30,9 @@ def prepare_data(is_test=False, max_sent_per_doc=20):
     if is_test:
         test_start = int(total * 0.8)  # last 20%
         ds = ds.select(range(test_start, total))
+    else:
+        train_end = int(total * 0.8)  # first 80%, disjoint from test
+        ds = ds.select(range(train_end))
     docs = []
     for row in tqdm(ds, desc="Loading data"):
         text = row.get("marathi", "")
@@ -48,8 +60,8 @@ def collate(batch):
     max_len = max(s.shape[0] for s in srcs)
     emb_dim = srcs[0].shape[1]
     B = len(srcs)
-    src_p = torch.zeros(B, max_len, emb_dim)
-    tgt_p = torch.zeros(B, max_len, emb_dim)
+    src_p = torch.zeros(B, max_len, emb_dim, device=srcs[0].device, dtype=srcs[0].dtype)
+    tgt_p = torch.zeros(B, max_len, emb_dim, device=srcs[0].device, dtype=srcs[0].dtype)
     for i, (s, t) in enumerate(zip(srcs, tgts)):
         src_p[i, : s.shape[0]] = s
         tgt_p[i, : t.shape[0]] = t
@@ -57,27 +69,63 @@ def collate(batch):
 
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="Evaluate BLT-LCM on the BhashaSetu test split"
+    )
+    parser.add_argument(
+        "--checkpoint", default="lcm_models/lcm_blt_best.pth", help="LCM checkpoint"
+    )
+    parser.add_argument(
+        "--entropy_model", default="patching_scratch/entropy_model_marathi.pt"
+    )
+    parser.add_argument(
+        "--train_embed_cache",
+        default=None,
+        help="Optional cache for the encoded retrieval corpus (train split).",
+    )
+    parser.add_argument(
+        "--test_embed_cache",
+        default=None,
+        help="Optional cache for the encoded test-split document embeddings.",
+    )
+    parser.add_argument(
+        "--progress_jsonl",
+        default="outputs/evaluate_blt_lcm_progress.jsonl",
+        help="Per-batch retrieval results, streamed as they are produced. A "
+        "rerun replays this file and only evaluates the missing batches.",
+    )
+    add_resume_args(parser, training=False)
+    args = parser.parse_args()
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    fingerprint = config_fingerprint(args, extra={"stage": "evaluate_blt_lcm"})
 
     # Load BLT loader
-    entropy_model_path = "patching_scratch/entropy_model_marathi.pt"
-    blt = BLTLoader(entropy_model_path=entropy_model_path, device=str(device))
+    blt = BLTLoader(entropy_model_path=args.entropy_model, device=str(device))
 
-    # Prepare training data for closest sentence lookup (use 10% to save time)
+    # Prepare training data for closest sentence lookup
     print("Preparing training data for lookup...")
     train_docs = prepare_data(is_test=False)
-    train_sentences = []
-    for doc in train_docs[: int(len(train_docs) * 0.1)]:  # 10%
-        train_sentences.extend(doc)
+    train_sentences = [s for doc in train_docs for s in doc]
     print(f"Loaded {len(train_sentences)} training sentences")
 
     # Encode training sentences
     print("Encoding training sentences...")
-    tokenized_train = [
-        text_to_byte_tokens(sent) for sent in tqdm(train_sentences, desc="Tokenizing")
-    ]
-    train_embs = blt.encode_tokens_batch(tokenized_train)
-    train_embs = torch.stack(train_embs).to(device)
+
+    def _encode_train():
+        tokenized_train = [
+            text_to_byte_tokens(sent)
+            for sent in tqdm(train_sentences, desc="Tokenizing")
+        ]
+        return torch.stack(blt.encode_tokens_batch(tokenized_train))
+
+    train_embs = cached_torch(
+        args.train_embed_cache,
+        _encode_train,
+        fingerprint=fingerprint,
+        resume=args.resume != "never",
+        label="retrieval-corpus embeddings",
+    ).to(device)
 
     # Prepare test data
     print("Preparing test data...")
@@ -86,74 +134,113 @@ def main():
 
     # Encode test data
     print("Encoding test data with BLT...")
-    flat_sents = []
-    doc_indices = []
-    for i, sents in enumerate(test_docs):
-        for sent in sents:
-            flat_sents.append(sent)
-            doc_indices.append(i)
-    tokenized_batch = [
-        text_to_byte_tokens(sent) for sent in tqdm(flat_sents, desc="Tokenizing test")
-    ]
-    embed_list = blt.encode_tokens_batch(tokenized_batch)
 
-    # Reconstruct per-document sequences
-    embeddings_seqs = [[] for _ in range(len(test_docs))]
-    for emb, didx in zip(embed_list, doc_indices):
-        embeddings_seqs[didx].append(emb)
+    def _encode_test():
+        flat_sents = []
+        doc_indices = []
+        for i, sents in enumerate(test_docs):
+            for sent in sents:
+                flat_sents.append(sent)
+                doc_indices.append(i)
+        tokenized_batch = [
+            text_to_byte_tokens(sent)
+            for sent in tqdm(flat_sents, desc="Tokenizing test")
+        ]
+        embed_list = blt.encode_tokens_batch(tokenized_batch)
 
-    # stack per-document tensors
-    for i in range(len(embeddings_seqs)):
-        if len(embeddings_seqs[i]) == 0:
-            embeddings_seqs[i] = torch.empty((0, blt.model.dim))
-        else:
-            embeddings_seqs[i] = torch.stack(embeddings_seqs[i], dim=0)
+        # Reconstruct per-document sequences
+        seqs = [[] for _ in range(len(test_docs))]
+        for emb, didx in zip(embed_list, doc_indices):
+            seqs[didx].append(emb)
 
-    # Create dataset and dataloader
+        # stack per-document tensors
+        for i in range(len(seqs)):
+            if len(seqs[i]) == 0:
+                seqs[i] = torch.empty((0, blt.dim))
+            else:
+                seqs[i] = torch.stack(seqs[i], dim=0)
+        return seqs
+
+    embeddings_seqs = cached_torch(
+        args.test_embed_cache,
+        _encode_test,
+        fingerprint=fingerprint,
+        resume=args.resume != "never",
+        validate=lambda s: bool(s),
+        label="test document embeddings",
+    )
+
+    # Create dataset and dataloader. shuffle=False, so batch index i always
+    # covers the same examples — which is what makes per-batch resume sound.
     dataset = EmbeddingDataset(embeddings_seqs)
     dataloader = DataLoader(dataset, batch_size=8, shuffle=False, collate_fn=collate)
 
-    # Load model
-    checkpoint_path = "lcm_models/lcm_blt_best.pth"
     model = BaseLCM(
         embed_dim=embeddings_seqs[0].shape[1], model_dim=2048, n_layers=12, n_heads=16
     )
-    model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+    # Accepts both the resumable checkpoint payload and older bare state dicts.
+    model.load_state_dict(load_model_state(args.checkpoint, map_location=device))
     model.to(device)
     model.eval()
 
     mse = torch.nn.MSELoss()
-    total_loss = 0.0
-    n = 0
-    hyps = []
-    refs = []
+    writer = ResumableJsonl(
+        args.progress_jsonl,
+        fingerprint=fingerprint,
+        resume=args.resume != "never",
+        key="batch",
+        flush_every=20,
+    )
+    if writer.done:
+        print(f"Resuming evaluation: {len(writer.done)} batches already scored")
 
     print("Evaluating model on test set...")
     with torch.no_grad():
-        for src, tgt in tqdm(dataloader, desc="Evaluating"):
+        for batch_idx, (src, tgt) in enumerate(tqdm(dataloader, desc="Evaluating")):
+            if writer.is_done(batch_idx):
+                continue
             src = src.to(device)
             tgt = tgt.to(device)
             seq_len = tgt.shape[1]
             if seq_len == 0:
                 continue
+            batch_hyps = []
+            batch_loss = 0.0
+            batch_n = 0
+            # One causal pass yields every next-concept prediction at once.
+            preds = model.forward_all(src)  # [B, L, E]
             for i in range(seq_len):
-                prefix = src[:, : i + 1] if i + 1 <= src.shape[1] else src
-                pred = model(prefix, tgt[:, i : i + 1])
-                total_loss += mse(pred, tgt[:, i]).item()
-                n += 1
+                pred = preds[:, i]  # [B, E]
+                batch_loss += mse(pred, tgt[:, i]).item()
+                batch_n += 1
 
                 # Find closest training sentence for each in batch
-                pred_emb = pred.squeeze(1)  # [B, E]
-                for b in range(pred_emb.shape[0]):
-                    p_emb = pred_emb[b]  # [E]
+                for b in range(pred.shape[0]):
                     similarities = torch.cosine_similarity(
-                        p_emb.unsqueeze(0), train_embs, dim=1
+                        pred[b].unsqueeze(0), train_embs, dim=1
                     )
                     best_idx = torch.argmax(similarities).item()
-                    hyp = train_sentences[best_idx]
-                    hyps.append(hyp)
+                    batch_hyps.append(train_sentences[best_idx])
+
+            writer.append(
+                {
+                    "batch": batch_idx,
+                    "loss_sum": batch_loss,
+                    "n": batch_n,
+                    "hyps": batch_hyps,
+                }
+            )
+    writer.close()
+
+    # Reassemble in batch order; `all_records` sorts by the resume key, so a run
+    # stitched together from several attempts still yields the original order.
+    rows = writer.all_records()
+    hyps = [h for r in rows for h in r["hyps"]]
+    total_loss = sum(r["loss_sum"] for r in rows)
+    n = sum(r["n"] for r in rows)
 
     # Collect refs: for each test doc, the next sentences
+    refs = []
     for doc in test_docs:
         refs.extend(doc[1:])  # Skip first, as no prediction for it
     refs = refs[: len(hyps)]  # Trim if necessary

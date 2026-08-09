@@ -17,9 +17,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+sys.path.append(os.path.dirname(__file__))
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "patching_scratch"))
 
-from run_blt_patching import VOCAB_SIZE, OFFSET, text_to_byte_tokens, byte_tokens_to_text
+from checkpoint_utils import ResumableLoader, TrainingCheckpointer
+
+from run_blt_patching import (
+    VOCAB_SIZE,
+    OFFSET,
+    text_to_byte_tokens,
+    byte_tokens_to_text,
+)
 
 PAD = 0
 BOS = 1
@@ -135,6 +143,8 @@ class BLTDecoder(nn.Module):
             list of decoded strings.
         """
         max_len = max_len or self.max_decode_len
+        # Never request positions beyond the position-embedding table.
+        max_len = min(max_len, self.max_decode_len)
         B = embeddings.shape[0]
         device = embeddings.device
 
@@ -227,6 +237,49 @@ class DecoderDataset(torch.utils.data.Dataset):
         return self.embeddings[idx], self.input_seqs[idx], self.target_seqs[idx]
 
 
+class SentenceReconDataset(torch.utils.data.Dataset):
+    """Holds sentences + teacher-forced byte (input, target) pairs.
+
+    Concepts are (re)encoded on the fly during training so the pooler stays in
+    the autograd graph; we therefore keep the sentence text, not a frozen
+    embedding, alongside the byte-token supervision.
+    """
+
+    def __init__(self, sentences: list[str], max_byte_len: int = 512):
+        self.items = []
+        for sent in sentences:
+            tokens = text_to_byte_tokens(sent)[:max_byte_len]
+            if len(tokens) == 0:
+                continue
+            self.items.append((sent, [BOS] + tokens, tokens + [EOT]))
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, idx):
+        return self.items[idx]
+
+
+def collate_sentences(batch):
+    """Collate (sentence, input_tokens, target_tokens) tuples.
+
+    Returns the raw sentence list (for on-the-fly encoding) plus padded input /
+    target tensors and a padding mask.
+    """
+    sents, inputs, targets = zip(*batch)
+    B = len(sents)
+    max_len = max(len(t) for t in inputs)
+    inp_tensor = torch.full((B, max_len), PAD, dtype=torch.long)
+    tgt_tensor = torch.full((B, max_len), -100, dtype=torch.long)  # -100 = ignore
+    pad_mask = torch.ones((B, max_len), dtype=torch.bool)
+    for i in range(B):
+        L = len(inputs[i])
+        inp_tensor[i, :L] = torch.tensor(inputs[i], dtype=torch.long)
+        tgt_tensor[i, :L] = torch.tensor(targets[i], dtype=torch.long)
+        pad_mask[i, :L] = False
+    return list(sents), inp_tensor, tgt_tensor, pad_mask
+
+
 def train_decoder(
     decoder: BLTDecoder,
     blt_loader,
@@ -238,62 +291,108 @@ def train_decoder(
     device: str = "cuda",
     log_every: int = 50,
     save_path: str = "lcm_models/blt_decoder.pth",
+    train_pooler: bool = True,
+    pooler_save_path: str = "lcm_models/blt_pooler.pth",
+    threshold: float = 1.335,
+    resume: str = "auto",
+    fingerprint: Optional[str] = None,
+    save_interval_steps: int = 200,
+    save_interval_seconds: float = 0.0,
+    max_checkpoints: int = 5,
+    seed: int = 42,
 ):
-    """Train the BLT decoder on (embedding, sentence) pairs.
+    """Jointly train the cross-attention pooler and the byte decoder.
 
-    1. Encode all sentences with BLTLoader to get embeddings.
-    2. Build teacher-forced (input, target) byte-token pairs.
-    3. Train with cross-entropy loss.
+    This is a BLT-style local autoencoder objective: the concept vector must be
+    sufficient to reconstruct the original bytes. The byte backbone (and the
+    entropy boundaries) stay FROZEN; gradients flow only into the pooler and the
+    decoder, so patch boundaries never drift during training.
+
+    Concepts are re-encoded every step via ``encode_sentences_differentiable``
+    so the pooler remains in the autograd graph. When ``train_pooler`` is False
+    the pooler is frozen and only the decoder learns (original behavior).
     """
     import time
 
-    print(f"Encoding {len(sentences)} sentences with BLT encoder...")
-    enc_batch = 64
-    embeddings = []
-    for i in range(0, len(sentences), enc_batch):
-        batch = sentences[i : i + enc_batch]
-        emb_batch = blt_loader.encode_sentences_batch(batch)
-        embeddings.extend([e.cpu() for e in emb_batch])
-
-    inputs_all, targets_all = prepare_decoder_data(sentences, max_byte_len)
-
-    valid_embs, valid_inputs, valid_targets = [], [], []
-    emb_idx = 0
-    for sent in sentences:
-        tokens = text_to_byte_tokens(sent)[:max_byte_len]
-        if len(tokens) == 0:
-            emb_idx += 1
-            continue
-        valid_embs.append(embeddings[emb_idx])
-        emb_idx += 1
-    valid_inputs = inputs_all
-    valid_targets = targets_all
-    valid_embs = valid_embs[: len(valid_inputs)]
-
-    dataset = DecoderDataset(valid_embs, valid_inputs, valid_targets)
-    loader = torch.utils.data.DataLoader(
-        dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_decoder_batch
+    # A teacher-forced sequence is [BOS] + up to max_byte_len bytes, so it must
+    # fit within the decoder's position-embedding table.
+    max_byte_len = min(max_byte_len, decoder.max_decode_len - 1)
+    dataset = SentenceReconDataset(sentences, max_byte_len=max_byte_len)
+    loader = ResumableLoader(
+        dataset,
+        batch_size=batch_size,
+        seed=seed,
+        shuffle=True,
+        collate_fn=collate_sentences,
     )
+    print(f"Training on {len(dataset)} sentences (pooler {'ON' if train_pooler else 'frozen'})")
 
     decoder = decoder.to(device)
-    optimizer = torch.optim.AdamW(decoder.parameters(), lr=lr, weight_decay=0.01)
-    total_steps = epochs * len(loader)
+
+    # Parameter groups: decoder always; pooler only if train_pooler.
+    params = list(decoder.parameters())
+    if train_pooler:
+        blt_loader.pooler.to(device)
+        blt_loader.pooler.train()
+        for p in blt_loader.pooler.parameters():
+            p.requires_grad_(True)
+        params += list(blt_loader.pooler.parameters())
+    else:
+        blt_loader.pooler.eval()
+        for p in blt_loader.pooler.parameters():
+            p.requires_grad_(False)
+
+    optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=0.01)
+    total_steps = epochs * max(len(loader), 1)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=max(total_steps, 1)
     )
 
-    best_loss = float("inf")
-    for epoch in range(epochs):
+    # The pooler is trained jointly with the decoder, so both — plus the
+    # scheduler, whose cosine position depends on total steps taken — have to be
+    # checkpointed together for a resumed run to continue the same trajectory.
+    trainable = nn.ModuleDict({"decoder": decoder, "pooler": blt_loader.pooler})
+    ckpt_dir = os.path.dirname(save_path) or "lcm_models"
+    ckpt = TrainingCheckpointer(
+        ckpt_dir,
+        prefix=os.path.splitext(os.path.basename(save_path))[0],
+        fingerprint=fingerprint,
+        max_keep=max_checkpoints,
+        save_interval_steps=save_interval_steps,
+        save_interval_seconds=save_interval_seconds,
+    )
+    rp = ckpt.restore(
+        ckpt.load(resume, map_location=device), trainable, optimizer, scheduler
+    )
+    best_loss = rp.best_score if rp.best_score is not None else float("inf")
+    global_step = rp.global_step
+    if rp.resumed:
+        print(
+            f"  [resume] continuing at epoch {rp.start_epoch + 1}/{epochs}, "
+            f"batch {rp.start_batch} (best loss so far {best_loss:.4f})"
+        )
+
+    for epoch in range(rp.start_epoch, epochs):
         decoder.train()
+        if train_pooler:
+            blt_loader.pooler.train()
         total_loss = 0.0
         n_batches = 0
         start = time.time()
 
-        for step, (emb, inp, tgt, pad_mask) in enumerate(loader):
-            emb = emb.to(device)
+        skip = rp.batches_to_skip(epoch)
+        for step, (batch_sents, inp, tgt, pad_mask) in loader.epoch(epoch, skip=skip):
             inp = inp.to(device)
             tgt = tgt.to(device)
             pad_mask = pad_mask.to(device)
+
+            # Re-encode concepts in-graph so the pooler receives gradients.
+            # The byte backbone runs under no_grad inside the loader; only the
+            # pooler is trainable here.
+            concept_list = blt_loader.encode_sentences_differentiable(
+                batch_sents, threshold=threshold
+            )
+            emb = torch.stack(concept_list).to(device)  # [B, dim]
 
             logits = decoder(emb, inp, tgt_padding_mask=pad_mask)
             loss = F.cross_entropy(
@@ -302,34 +401,57 @@ def train_decoder(
 
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(decoder.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(params, 1.0)
             optimizer.step()
             scheduler.step()
 
             total_loss += loss.item()
             n_batches += 1
+            global_step += 1
+
+            ckpt.maybe_save(
+                trainable,
+                optimizer,
+                scheduler,
+                epoch=epoch,
+                batch_in_epoch=step,
+                global_step=global_step,
+                best_score=best_loss,
+            )
 
             if (step + 1) % log_every == 0:
                 avg = total_loss / n_batches
                 print(
-                    f"  Epoch {epoch+1}/{epochs} | Step {step+1}/{len(loader)} | "
+                    f"  Epoch {epoch + 1}/{epochs} | Step {step + 1}/{len(loader)} | "
                     f"Loss: {avg:.4f} | LR: {scheduler.get_last_lr()[0]:.2e}"
                 )
 
         elapsed = time.time() - start
         avg_loss = total_loss / max(n_batches, 1)
         print(
-            f"  Epoch {epoch+1}/{epochs} DONE | "
+            f"  Epoch {epoch + 1}/{epochs} DONE | "
             f"Avg Loss: {avg_loss:.4f} | Time: {elapsed:.1f}s"
+        )
+        ckpt.save_epoch(
+            trainable,
+            optimizer,
+            scheduler,
+            epoch=epoch,
+            global_step=global_step,
+            best_score=best_loss,
         )
 
         if avg_loss < best_loss:
             best_loss = avg_loss
             if save_path:
+                # `save_path` keeps the standalone decoder format that
+                # `load_decoder` and every eval script expect; the resumable
+                # state lives alongside it under the same prefix.
                 os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
                 torch.save(
                     {
                         "model_state_dict": decoder.state_dict(),
+                        "pooler_state_dict": blt_loader.pooler.state_dict(),
                         "config": {
                             "embed_dim": decoder.embed_dim,
                             "dec_dim": decoder.dec_dim,
@@ -342,13 +464,17 @@ def train_decoder(
                     save_path,
                 )
                 print(f"  Saved best decoder to {save_path}")
+            # Persist the learned pooler as a sidecar so BLTLoader (used by
+            # train_lcm_blt / eval) can pick up the improved concept space.
+            if train_pooler and pooler_save_path:
+                blt_loader.save_pooler(pooler_save_path)
+                print(f"  Saved learned pooler to {pooler_save_path}")
 
+    blt_loader.pooler.eval()
     return decoder
 
 
-def load_decoder(
-    checkpoint_path: str, device: str = "cpu"
-) -> BLTDecoder:
+def load_decoder(checkpoint_path: str, device: str = "cpu") -> BLTDecoder:
     """Load a trained BLTDecoder from checkpoint."""
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     cfg = ckpt.get("config", {})
@@ -382,9 +508,7 @@ if __name__ == "__main__":
     parser.add_argument("--n_layers", type=int, default=6)
     parser.add_argument("--n_heads", type=int, default=8)
     parser.add_argument("--max_byte_len", type=int, default=512)
-    parser.add_argument(
-        "--save_path", type=str, default="lcm_models/blt_decoder.pth"
-    )
+    parser.add_argument("--save_path", type=str, default="lcm_models/blt_decoder.pth")
     parser.add_argument(
         "--device",
         type=str,
@@ -393,7 +517,32 @@ if __name__ == "__main__":
     parser.add_argument(
         "--fraction", type=float, default=0.25, help="Fraction of BhashaSetu to use"
     )
+    parser.add_argument(
+        "--no_train_pooler",
+        action="store_true",
+        help="Freeze the cross-attention pooler and train only the decoder",
+    )
+    parser.add_argument(
+        "--pooler_save_path",
+        type=str,
+        default="lcm_models/blt_pooler.pth",
+        help="Where to save the learned pooler sidecar (loaded by BLTLoader)",
+    )
+    parser.add_argument("--threshold", type=float, default=1.335)
+    parser.add_argument(
+        "--concept_dim",
+        type=int,
+        default=1024,
+        help="Concept dimension (default 1024, matching SONAR / the LCM). The "
+        "pooler learns to project pooled byte features to this dimension.",
+    )
+    from checkpoint_utils import add_resume_args, config_fingerprint, seed_everything
+
+    add_resume_args(parser, default_interval_steps=200)
     args = parser.parse_args()
+
+    seed_everything(args.ckpt_seed)
+    fingerprint = config_fingerprint(args)
 
     from datasets import load_dataset
     from tqdm import tqdm
@@ -411,10 +560,14 @@ if __name__ == "__main__":
 
     from blt_loader import BLTLoader
 
-    blt = BLTLoader(entropy_model_path=args.entropy_model, device=args.device)
+    blt = BLTLoader(
+        entropy_model_path=args.entropy_model,
+        device=args.device,
+        concept_dim=args.concept_dim,
+    )
 
     decoder = BLTDecoder(
-        embed_dim=blt.model.tok_embeddings.weight.shape[1],  # 256
+        embed_dim=blt.dim,  # concept dimension (default 1024)
         dec_dim=args.dec_dim,
         n_layers=args.n_layers,
         n_heads=args.n_heads,
@@ -433,6 +586,15 @@ if __name__ == "__main__":
         max_byte_len=args.max_byte_len,
         device=args.device,
         save_path=args.save_path,
+        train_pooler=not args.no_train_pooler,
+        pooler_save_path=args.pooler_save_path,
+        threshold=args.threshold,
+        resume=args.resume,
+        fingerprint=fingerprint,
+        save_interval_steps=args.save_interval_steps,
+        save_interval_seconds=args.save_interval_seconds,
+        max_checkpoints=args.max_checkpoints,
+        seed=args.ckpt_seed,
     )
 
     print("\nTesting reconstruction on sample sentences...")
@@ -448,5 +610,6 @@ if __name__ == "__main__":
             print()
         except UnicodeEncodeError:
             import sys
+
             sys.stdout.buffer.write(f"  Original: {orig[:80]}\n".encode("utf-8"))
             sys.stdout.buffer.write(f"  Decoded:  {dec[:80]}\n\n".encode("utf-8"))

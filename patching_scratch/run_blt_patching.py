@@ -16,8 +16,6 @@ Usage:
 """
 
 import argparse
-import json
-import math
 import os
 import sys
 import time
@@ -32,14 +30,26 @@ if sys.platform == "win32":
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import Dataset
+
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lcm_scripts"))
+
+from checkpoint_utils import (  # noqa: E402
+    ResumableJsonl,
+    ResumableLoader,
+    TrainingCheckpointer,
+    add_resume_args,
+    config_fingerprint,
+    seed_everything,
+)
 
 # ============================================================
 # Constants (from BLT codebase: bytelatent/tokenizers/constants.py)
 # ============================================================
 OFFSET = 4  # Byte values 0-255 map to token IDs 4-259
 VOCAB_SIZE = 260  # 256 bytes + 4 special tokens
-DEFAULT_THRESHOLD = 1.335442066192627  # Default from BLT PatcherArgs
+DEFAULT_THRESHOLD = 1.335442066192627  # Global constraint theta_g, BLT PatcherArgs
+DEFAULT_THRESHOLD_ADD = 0.0  # Approx. monotonicity constraint theta_r (BLT §2.3)
 
 
 # ============================================================
@@ -94,12 +104,32 @@ def apply_rotary_emb(q, k, cos, sin):
     return q_rot, k_rot
 
 
+def sliding_window_causal_mask(seq_len, window, device):
+    """Boolean attend-mask for causal attention limited to `window` positions.
+
+    BLT §4.2 trains the entropy model with sliding window attention of 512
+    bytes; unbounded causal attention would let the entropy at position i depend
+    on arbitrarily distant context, which is what produces the "entropy drift"
+    on repetitive text described in §4.4.
+
+    Returns [seq_len, seq_len] with True where attention is allowed:
+    position i attends to j for max(0, i-window+1) <= j <= i.
+    """
+    idx = torch.arange(seq_len, device=device)
+    delta = idx.unsqueeze(1) - idx.unsqueeze(0)  # i - j
+    return (delta >= 0) & (delta < window)
+
+
 class TransformerBlock(nn.Module):
-    def __init__(self, dim, n_heads, ffn_dim_multiplier, max_seqlen, rope_theta):
+    def __init__(
+        self, dim, n_heads, ffn_dim_multiplier, max_seqlen, rope_theta, attn_window=None
+    ):
         super().__init__()
         self.dim = dim
         self.n_heads = n_heads
         self.head_dim = dim // n_heads
+        # None => unbounded causal attention (previous behaviour).
+        self.attn_window = attn_window
 
         self.attention_norm = RMSNorm(dim)
         self.ffn_norm = RMSNorm(dim)
@@ -134,8 +164,14 @@ class TransformerBlock(nn.Module):
         cos, sin = self.rotary(seqlen)
         q, k = apply_rotary_emb(q, k, cos, sin)
 
-        # SDPA causal attention (no xformers needed)
-        attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        # SDPA causal attention (no xformers needed). With a finite window we
+        # must pass an explicit mask, since is_causal only expresses "attend to
+        # everything up to i".
+        if self.attn_window is None or self.attn_window >= seqlen:
+            attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        else:
+            mask = sliding_window_causal_mask(seqlen, self.attn_window, x.device)
+            attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
         attn_out = attn_out.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
         x = x + self.wo(attn_out)
 
@@ -149,6 +185,13 @@ class ByteEntropyModel(nn.Module):
     """
     Small byte-level causal transformer for next-byte prediction.
     Used to compute per-byte entropy for BLT patching.
+
+    Reference configuration (BLT §4.2) is 100M parameters, 14 layers, dim 512
+    and a 512-byte sliding attention window. The defaults here are a deliberate
+    scaled-down variant (dim 256, 4 layers) that trains on a single GPU; per
+    BLT Fig. 8, patching quality improves with both entropy-model size and
+    context length, with diminishing returns past ~50M parameters. Pass the
+    paper's values explicitly to reproduce it.
     """
 
     def __init__(
@@ -160,26 +203,47 @@ class ByteEntropyModel(nn.Module):
         max_seqlen=512,
         ffn_dim_multiplier=1.3,
         rope_theta=10000.0,
+        attn_window=None,
     ):
         super().__init__()
         self.max_length = max_seqlen
         self.vocab_size = vocab_size
+        self.dim = dim  # hidden width; used by the BLT local encoder / pooler
+        self.attn_window = attn_window
 
         self.tok_embeddings = nn.Embedding(vocab_size, dim)
         self.layers = nn.ModuleList(
             [
-                TransformerBlock(dim, n_heads, ffn_dim_multiplier, max_seqlen, rope_theta)
+                TransformerBlock(
+                    dim,
+                    n_heads,
+                    ffn_dim_multiplier,
+                    max_seqlen,
+                    rope_theta,
+                    attn_window=attn_window,
+                )
                 for _ in range(n_layers)
             ]
         )
         self.norm = RMSNorm(dim)
         self.output = nn.Linear(dim, vocab_size, bias=False)
 
-    def forward(self, tokens):
+    def forward(self, tokens, return_hidden=False):
+        """Run the byte transformer.
+
+        By default returns next-byte logits (used only to compute entropy for
+        patch-boundary placement). With ``return_hidden=True`` it returns the
+        final normalized byte hidden states ``[B, T, dim]`` instead — these are
+        the local-encoder features that BLT pools into patch representations
+        (BLT §3.2.2). The logits are never used as patch/concept embeddings.
+        """
         h = self.tok_embeddings(tokens)
         for layer in self.layers:
             h = layer(h)
-        return self.output(self.norm(h))
+        h = self.norm(h)
+        if return_hidden:
+            return h
+        return self.output(h)
 
 
 # ============================================================
@@ -197,45 +261,91 @@ def compute_entropy(logits):
 
 
 @torch.no_grad()
-def compute_entropies_for_tokens(tokens_2d, entropy_model, batch_size=1, device="cuda"):
+def compute_entropies_for_tokens(
+    tokens_2d, entropy_model, batch_size=1, device="cuda", context_overlap=None
+):
+    """Per-byte next-byte entropies under the entropy model.
+
+    ``tokens_2d``: [batch, seq_len] byte token IDs.
+
+    Returns [batch, seq_len] where::
+
+        out[b, t] = H( x_{t+1} | x_{<=t} )
+
+    i.e. the entropy of the model's *next-byte* distribution after reading
+    position t. Note this is offset by one from the paper's ``H(x_i)``
+    (BLT Eq. 1), which is the entropy of the distribution over x_i given
+    x_{<i} and therefore lives at ``out[i-1]``. ``entropy_patch_sentence``
+    performs that shift; do not compare ``out[i]`` against a threshold
+    directly.
+
+    Each row is processed independently. Rows longer than the model's context
+    are covered with *overlapping* windows so that every scored position keeps
+    at least ``context_overlap`` bytes of real left context — the previous
+    implementation flattened the whole batch and re-chunked it into disjoint
+    windows, which both destroyed context at window edges and let neighbouring
+    rows leak into each other.
     """
-    Compute per-byte entropies using the entropy model.
-    tokens_2d: [batch, seq_len] tensor of byte token IDs
-    Returns: [batch, seq_len] tensor of entropy values
-    """
-    all_entropies = []
     max_length = entropy_model.max_length
-    batch_numel = max_length * batch_size
-    flat = tokens_2d.flatten()
-    splits = torch.split(flat, batch_numel)
+    if context_overlap is None:
+        context_overlap = max_length // 2
+    context_overlap = max(0, min(context_overlap, max_length - 1))
+    stride = max_length - context_overlap
 
-    for split in splits:
-        actual_len = split.numel()
-        pad_size = (max_length - (actual_len % max_length)) % max_length
-        if pad_size > 0:
-            pad = torch.zeros(pad_size, dtype=split.dtype, device=split.device)
-            split = torch.cat([split, pad])
-        split = split.reshape(-1, max_length).to(device)
-
-        logits = entropy_model(split)
-        # Flatten and remove padding
-        logits = logits.reshape(-1, logits.shape[-1])[:actual_len]
-        ent = compute_entropy(logits)
-        all_entropies.append(ent.cpu())
-
-    return torch.cat(all_entropies).reshape(tokens_2d.shape)
+    rows = []
+    for row in tokens_2d:
+        seq_len = row.numel()
+        ent = torch.empty(seq_len, dtype=torch.float32)
+        start = 0
+        while start < seq_len:
+            # Window covers [win_start, win_end); we only *keep* scores for
+            # [start, win_end) so every kept position had left context.
+            win_start = max(0, start - context_overlap) if start > 0 else 0
+            win_end = min(seq_len, win_start + max_length)
+            window = row[win_start:win_end].unsqueeze(0).to(device)
+            logits = entropy_model(window)[0]
+            scores = compute_entropy(logits).cpu()
+            keep_from = start - win_start
+            ent[start:win_end] = scores[keep_from:]
+            if win_end >= seq_len:
+                break
+            start = win_start + stride if win_start + stride > start else start + 1
+        rows.append(ent)
+    return torch.stack(rows).reshape(tokens_2d.shape)
 
 
 # ============================================================
 # Entropy-based patching (from BLT: bytelatent/data/patcher.py)
 # ============================================================
-def entropy_patch_sentence(entropies_list, threshold=DEFAULT_THRESHOLD):
-    """
-    Given per-byte entropy values for a single sentence,
-    find patch boundaries where entropy > threshold.
+def entropy_patch_sentence(
+    entropies_list,
+    threshold=DEFAULT_THRESHOLD,
+    mode="global",
+    threshold_add=DEFAULT_THRESHOLD_ADD,
+):
+    """Place patch boundaries from per-byte next-byte entropies.
 
-    Follows BLT convention: positions 0 and 1 are always patch starts,
-    then any position i >= 2 where entropy[i] > threshold starts a new patch.
+    ``entropies_list`` must be the output of :func:`compute_entropies_for_tokens`,
+    i.e. ``entropies_list[t] = H(x_{t+1} | x_{<=t})``. The paper's quantity
+    ``H(x_k)`` — the entropy of the distribution over byte k given everything
+    before it (BLT Eq. 1) — is therefore ``entropies_list[k-1]``, and that is
+    what gets compared against the threshold here. Reading
+    ``entropies_list[k]`` instead (as this function previously did) shifts
+    every boundary one byte early, so the high-entropy byte lands in the
+    *middle* of a patch rather than starting one.
+
+    Two segmentation rules from BLT §2.3 are supported:
+
+    ``mode="global"``    Global constraint: start a patch at k when
+                         ``H(x_k) > threshold``.
+    ``mode="monotonic"`` Approximate monotonicity constraint: start a patch at
+                         k when ``H(x_k) - H(x_{k-1}) > threshold_add``. This
+                         detects points that break the locally-decreasing
+                         entropy within a patch, and (per §4.4) is less prone
+                         to drift when the entropy model's context changes.
+
+    Positions 0 and 1 always start patches, matching BLT's convention that the
+    first two byte positions are forced patch starts.
 
     Returns:
         boundaries: list of byte indices where patches start
@@ -250,11 +360,18 @@ def entropy_patch_sentence(entropies_list, threshold=DEFAULT_THRESHOLD):
     if seq_len > 1:
         boundaries.append(1)
 
-    # From position 2 onward, start new patch where entropy > threshold
-    # (BLT skips position 0's entropy, checks positions 1..end after the first two forced starts)
-    for i in range(2, seq_len):
-        if entropies_list[i] > threshold:
-            boundaries.append(i)
+    if mode not in ("global", "monotonic"):
+        raise ValueError(f"unknown patching mode {mode!r}; expected global|monotonic")
+
+    # From position 2 onward. H(x_k) == entropies_list[k - 1].
+    for k in range(2, seq_len):
+        h_k = entropies_list[k - 1]
+        if mode == "global":
+            is_start = h_k > threshold
+        else:
+            is_start = (h_k - entropies_list[k - 2]) > threshold_add
+        if is_start:
+            boundaries.append(k)
 
     # Compute patch lengths from boundaries
     patch_lengths = []
@@ -265,6 +382,40 @@ def entropy_patch_sentence(entropies_list, threshold=DEFAULT_THRESHOLD):
             patch_lengths.append(seq_len - boundaries[i])
 
     return boundaries, patch_lengths
+
+
+def split_on_newlines(tokens):
+    """Split a byte-token sequence into segments after each newline byte.
+
+    BLT §4.4 resets the entropy model's context at newlines for the large
+    BLT-Entropy run, because repeated structured content (multiple-choice
+    options, boilerplate) otherwise drives entropy down and yields runaway
+    patch sizes. Scoring each line with a fresh context removes that drift.
+    """
+    newline = ord("\n") + OFFSET
+    segments, current = [], []
+    for tok in tokens:
+        current.append(tok)
+        if tok == newline:
+            segments.append(current)
+            current = []
+    if current:
+        segments.append(current)
+    return segments
+
+
+@torch.no_grad()
+def entropies_with_context_reset(tokens, entropy_model, device="cuda"):
+    """Next-byte entropies computed with the context reset at each newline.
+
+    Returns a flat list aligned 1:1 with ``tokens`` (BLT §4.4).
+    """
+    out = []
+    for segment in split_on_newlines(tokens):
+        t = torch.tensor([segment], dtype=torch.long)
+        seg_ent = compute_entropies_for_tokens(t, entropy_model, device=device)[0]
+        out.extend(seg_ent.tolist())
+    return out
 
 
 # ============================================================
@@ -319,10 +470,18 @@ def train_entropy_model(
     n_layers=4,
     max_seqlen=512,
     ffn_dim_multiplier=1.3,
+    attn_window=None,
     epochs=3,
     lr=3e-4,
     batch_size=32,
     device="cuda",
+    resume="auto",
+    fingerprint=None,
+    ckpt_dir="patching_scratch",
+    save_interval_steps=200,
+    save_interval_seconds=0.0,
+    max_checkpoints=5,
+    seed=42,
 ):
     print(f"\n{'='*60}")
     print(f"Training Byte-Level Entropy Model")
@@ -339,6 +498,7 @@ def train_entropy_model(
         n_layers=n_layers,
         max_seqlen=max_seqlen,
         ffn_dim_multiplier=ffn_dim_multiplier,
+        attn_window=attn_window,
     ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -347,9 +507,10 @@ def train_entropy_model(
     dataset = ByteTextDataset(marathi_texts, max_len=max_seqlen)
     print(f"  Training chunks: {len(dataset)}")
 
-    loader = DataLoader(
+    loader = ResumableLoader(
         dataset,
         batch_size=batch_size,
+        seed=seed,
         shuffle=True,
         collate_fn=collate_fn,
         num_workers=0,
@@ -360,13 +521,35 @@ def train_entropy_model(
     total_steps = epochs * len(loader)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
 
+    # The cosine schedule's position depends on how many steps have been taken,
+    # so it rides in the checkpoint alongside the model and optimizer.
+    ckpt = TrainingCheckpointer(
+        ckpt_dir,
+        prefix="entropy_model_marathi",
+        suffix=".pt",
+        fingerprint=fingerprint,
+        max_keep=max_checkpoints,
+        save_interval_steps=save_interval_steps,
+        save_interval_seconds=save_interval_seconds,
+    )
+    rp = ckpt.restore(
+        ckpt.load(resume, map_location=device), model, optimizer, scheduler
+    )
+    global_step = rp.global_step
+    if rp.resumed:
+        print(
+            f"  [resume] continuing at epoch {rp.start_epoch + 1}/{epochs}, "
+            f"batch {rp.start_batch}"
+        )
+
     model.train()
-    for epoch in range(epochs):
+    for epoch in range(rp.start_epoch, epochs):
         total_loss = 0.0
         n_batches = 0
         start = time.time()
 
-        for step, (x, y) in enumerate(loader):
+        skip = rp.batches_to_skip(epoch)
+        for step, (x, y) in loader.epoch(epoch, skip=skip):
             x, y = x.to(device), y.to(device)
             logits = model(x)
             loss = F.cross_entropy(
@@ -381,6 +564,16 @@ def train_entropy_model(
 
             total_loss += loss.item()
             n_batches += 1
+            global_step += 1
+
+            ckpt.maybe_save(
+                model,
+                optimizer,
+                scheduler,
+                epoch=epoch,
+                batch_in_epoch=step,
+                global_step=global_step,
+            )
 
             if (step + 1) % 100 == 0:
                 print(
@@ -390,10 +583,13 @@ def train_entropy_model(
                 )
 
         elapsed = time.time() - start
-        avg_loss = total_loss / n_batches
+        avg_loss = total_loss / max(n_batches, 1)
         print(
             f"  Epoch {epoch+1}/{epochs} DONE | "
             f"Avg Loss: {avg_loss:.4f} | Time: {elapsed:.1f}s"
+        )
+        ckpt.save_epoch(
+            model, optimizer, scheduler, epoch=epoch, global_step=global_step
         )
 
     model.eval()
@@ -403,7 +599,18 @@ def train_entropy_model(
 # ============================================================
 # Main patching pipeline
 # ============================================================
-def run_patching(marathi_texts, entropy_model, threshold, device="cuda"):
+def run_patching(
+    marathi_texts,
+    entropy_model,
+    threshold,
+    device="cuda",
+    output=None,
+    resume="auto",
+    fingerprint=None,
+    mode="global",
+    threshold_add=DEFAULT_THRESHOLD_ADD,
+    reset_context_on_newline=False,
+):
     """
     Run BLT entropy-based patching on a list of Marathi sentences.
 
@@ -413,26 +620,46 @@ def run_patching(marathi_texts, entropy_model, threshold, device="cuda"):
       3. Place patch boundaries where entropy > threshold
       4. Record all patch info
 
-    Returns list of dicts (one per sentence) with full patching results.
+    Records stream straight to ``output`` as JSONL rather than accumulating in
+    memory, so an interrupted scan of a large corpus resumes at the first
+    sentence it had not yet written instead of restarting from zero. Returns the
+    full list of per-sentence results (including any replayed from a prior run).
     """
-    results = []
     entropy_model.eval()
     total_start = time.time()
 
+    writer = ResumableJsonl(
+        output or "blt_marathi_patched.jsonl",
+        fingerprint=fingerprint,
+        resume=resume != "never",
+        key="sentence_index",
+    )
+    if writer.done:
+        print(f"  Resuming patching: {len(writer.done)} sentences already written")
+
     for idx, text in enumerate(marathi_texts):
+        if writer.is_done(idx):
+            continue
         tokens = text_to_byte_tokens(text)
         if len(tokens) == 0:
             continue
 
-        # Compute per-byte entropies
-        tokens_tensor = torch.tensor([tokens], dtype=torch.long)
-        entropies = compute_entropies_for_tokens(
-            tokens_tensor, entropy_model, batch_size=1, device=device
-        )
-        entropies_list = entropies[0].tolist()
+        # Compute per-byte entropies (next-byte convention; see the docstring of
+        # compute_entropies_for_tokens for the alignment)
+        if reset_context_on_newline:
+            entropies_list = entropies_with_context_reset(
+                tokens, entropy_model, device=device
+            )
+        else:
+            tokens_tensor = torch.tensor([tokens], dtype=torch.long)
+            entropies_list = compute_entropies_for_tokens(
+                tokens_tensor, entropy_model, device=device
+            )[0].tolist()
 
         # Find patch boundaries
-        boundaries, patch_lengths = entropy_patch_sentence(entropies_list, threshold)
+        boundaries, patch_lengths = entropy_patch_sentence(
+            entropies_list, threshold, mode=mode, threshold_add=threshold_add
+        )
 
         # Build detailed patch records
         patches = []
@@ -463,12 +690,14 @@ def run_patching(marathi_texts, entropy_model, threshold, device="cuda"):
             "num_patches": len(patches),
             "avg_patch_length": round(len(tokens) / max(len(patches), 1), 2),
             "threshold_used": threshold,
+            "patching_mode": mode,
+            "threshold_add": threshold_add,
             "entropy_per_byte": [round(e, 6) for e in entropies_list],
             "patch_boundaries": boundaries,
             "patch_lengths": patch_lengths,
             "patches": patches,
         }
-        results.append(result)
+        writer.append(result)
 
         if (idx + 1) % 1000 == 0:
             elapsed = time.time() - total_start
@@ -477,6 +706,8 @@ def run_patching(marathi_texts, entropy_model, threshold, device="cuda"):
                 f"({elapsed:.1f}s elapsed)"
             )
 
+    writer.close()
+    results = writer.all_records()
     elapsed = time.time() - total_start
     print(f"  Patching complete: {len(results)} sentences in {elapsed:.1f}s")
     return results
@@ -502,7 +733,33 @@ def main():
         "--threshold",
         type=float,
         default=DEFAULT_THRESHOLD,
-        help="Entropy threshold for patch boundaries",
+        help="Global-constraint entropy threshold theta_g for patch boundaries",
+    )
+    parser.add_argument(
+        "--patching_mode",
+        choices=["global", "monotonic"],
+        default="global",
+        help="BLT §2.3 segmentation rule. 'global': H(x_k) > theta_g. "
+        "'monotonic': H(x_k) - H(x_k-1) > theta_r (approximate monotonicity).",
+    )
+    parser.add_argument(
+        "--threshold_add",
+        type=float,
+        default=DEFAULT_THRESHOLD_ADD,
+        help="theta_r for --patching_mode monotonic",
+    )
+    parser.add_argument(
+        "--reset_context_on_newline",
+        action="store_true",
+        help="Recompute entropies with the context reset at each newline "
+        "(BLT §4.4), which avoids runaway patch sizes on repetitive text.",
+    )
+    parser.add_argument(
+        "--attn_window",
+        type=int,
+        default=None,
+        help="Sliding-window attention span in bytes for the entropy model "
+        "(BLT §4.2 uses 512). Default None = unbounded causal attention.",
     )
 
     # Model architecture
@@ -535,8 +792,11 @@ def main():
         type=str,
         default="cuda" if torch.cuda.is_available() else "cpu",
     )
+    add_resume_args(parser, default_interval_steps=200)
 
     args = parser.parse_args()
+    seed_everything(args.ckpt_seed)
+    fingerprint = config_fingerprint(args)
 
     # ---- Load dataset (streaming to avoid downloading entire 7.8GB) ----
     print("Loading BhashaSetu dataset from HuggingFace (streaming)...")
@@ -564,6 +824,7 @@ def main():
             n_layers=cfg.get("n_layers", args.n_layers),
             max_seqlen=cfg.get("max_seqlen", args.max_seqlen),
             ffn_dim_multiplier=cfg.get("ffn_dim_multiplier", args.ffn_dim_multiplier),
+            attn_window=cfg.get("attn_window", args.attn_window),
         ).to(args.device)
         model.load_state_dict(checkpoint["model_state_dict"])
         model.eval()
@@ -578,10 +839,18 @@ def main():
             n_layers=args.n_layers,
             max_seqlen=args.max_seqlen,
             ffn_dim_multiplier=args.ffn_dim_multiplier,
+            attn_window=args.attn_window,
             epochs=args.train_epochs,
             lr=args.lr,
             batch_size=args.train_batch_size,
             device=args.device,
+            resume=args.resume,
+            fingerprint=fingerprint,
+            ckpt_dir=os.path.dirname(os.path.abspath(args.save_model)) or ".",
+            save_interval_steps=args.save_interval_steps,
+            save_interval_seconds=args.save_interval_seconds,
+            max_checkpoints=args.max_checkpoints,
+            seed=args.ckpt_seed,
         )
         # Save model with config for easy reloading
         if args.save_model:
@@ -595,6 +864,7 @@ def main():
                         "n_layers": args.n_layers,
                         "max_seqlen": args.max_seqlen,
                         "ffn_dim_multiplier": args.ffn_dim_multiplier,
+                        "attn_window": args.attn_window,
                     },
                 },
                 args.save_model,
@@ -605,16 +875,17 @@ def main():
             "patch_only mode requires --load_model pointing to a saved checkpoint"
         )
 
-    # ---- Run entropy-based patching ----
+    # ---- Run entropy-based patching (streams straight to args.output) ----
     print(f"\nRunning BLT entropy-based patching (threshold={args.threshold})...")
     results = run_patching(
-        marathi_texts, model, args.threshold, device=args.device
+        marathi_texts,
+        model,
+        args.threshold,
+        device=args.device,
+        output=args.output,
+        resume=args.resume,
+        fingerprint=fingerprint,
     )
-
-    # ---- Save JSONL output ----
-    with open(args.output, "w", encoding="utf-8") as f:
-        for r in results:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
     print(f"\nSaved {len(results)} patched sentences to {args.output}")
 

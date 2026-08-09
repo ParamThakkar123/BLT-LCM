@@ -40,6 +40,13 @@ from embedding_retriever import EmbeddingRetriever
 from eval_metrics import compute_bleu, compute_chrf, compute_ter
 from sonar_loader import SonarLoader
 from train_lcm_sonar import encode_docs
+from checkpoint_utils import (
+    StageTracker,
+    add_resume_args,
+    cached_torch,
+    config_fingerprint,
+    load_model_state,
+)
 
 
 def evaluate(model, docs, encoder, retriever, args, noise: float, device) -> dict[str, float | int]:
@@ -86,9 +93,17 @@ def main() -> None:
     p.add_argument("--noise_levels", type=float, nargs="+", default=list(DEFAULT_NOISE_LEVELS))
     p.add_argument("--out_csv", default=None)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument(
+        "--embed_cache",
+        default=None,
+        help="Optional cache for the SONAR encodings of the retrieval corpus, "
+        "so a rerun skips re-encoding it.",
+    )
+    add_resume_args(p, training=False)
     args = p.parse_args()
 
     device = torch.device(args.device)
+    fingerprint = config_fingerprint(args, extra={"stage": "eval_lcm_sonar"})
     docs = load_bhashasetu_documents(
         args.dataset,
         args.split,
@@ -101,19 +116,38 @@ def main() -> None:
         raise RuntimeError("No BhashaSetu documents available for SONAR-LCM evaluation")
 
     encoder = SonarLoader(device=str(device))
-    train_seqs = encode_docs(train_docs, encoder, args.encode_batch_size)
+    train_seqs = cached_torch(
+        args.embed_cache,
+        lambda: encode_docs(train_docs, encoder, args.encode_batch_size),
+        fingerprint=fingerprint,
+        resume=args.resume != "never",
+        validate=lambda s: bool(s),
+        label="SONAR retrieval-corpus encodings",
+    )
     flat_sents = [s for doc in train_docs for s in doc]
     flat_embs = torch.cat([s for s in train_seqs if s.shape[0] > 0], dim=0)
     retriever = EmbeddingRetriever(flat_sents, flat_embs)
 
     embed_dim = train_seqs[0].shape[1]
     model = BaseLCM(embed_dim=embed_dim, model_dim=args.model_dim, n_layers=args.n_layers, n_heads=args.n_heads).to(device)
-    state = torch.load(args.checkpoint, map_location=device)
-    model.load_state_dict(state)
+    # Accepts both the resumable checkpoint payload and older bare state dicts.
+    model.load_state_dict(load_model_state(args.checkpoint, map_location=device))
 
+    # Each noise level is a full retrieval decode of the eval set; memoize the
+    # ones that finish so an interrupted run does not redo them.
+    stages = StageTracker(
+        str(Path(args.checkpoint).with_name(f"eval_state_fraction{args.fraction}.json")),
+        fingerprint=fingerprint,
+        resume=args.resume != "never",
+    )
     rows = []
     for noise in args.noise_levels:
-        metrics = evaluate(model, eval_docs, encoder, retriever, args, noise, device)
+        metrics = stages.run(
+            f"noise={noise}",
+            lambda noise=noise: evaluate(
+                model, eval_docs, encoder, retriever, args, noise, device
+            ),
+        )
         row = {
             "model": "sonar_lcm",
             "fraction": args.fraction,

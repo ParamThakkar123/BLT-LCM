@@ -19,15 +19,25 @@ Outputs:
   - fixed_chunk_tolerance_sensitivity.png
 """
 
+import argparse
 import sys
 import io
 import json
 import math
+import os
 import bisect
 from collections import defaultdict, Counter
 
 # Fix Windows console encoding
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from lcm_scripts.checkpoint_utils import (
+    ResumableJsonl,
+    StageTracker,
+    config_fingerprint,
+)
 
 # ── Indic NLP setup ──────────────────────────────────────────────────────────
 
@@ -42,9 +52,25 @@ from indicnlp.morph.unsupervised_morph import UnsupervisedMorphAnalyzer
 
 morph_analyzer = UnsupervisedMorphAnalyzer("mr")
 
+# ── CLI ──────────────────────────────────────────────────────────────────────
+
+_parser = argparse.ArgumentParser(description=__doc__)
+_parser.add_argument(
+    "--resume",
+    default=os.environ.get("ABLATION_RESUME", "auto"),
+    metavar="auto|never",
+    help="'auto' (default) continues from partial per-sentence output and any "
+    "completed tolerance stages; 'never' discards them and starts over.",
+)
+_parser.add_argument("--corpus", default="marathi_sentences.json")
+_parser.add_argument("--entropy_results", default="morpheme_alignment_results.json")
+_parser.add_argument("--out_json", default="fixed_chunk_ablation_results.json")
+_parser.add_argument("--out_jsonl", default="fixed_chunk_ablation_per_sentence.jsonl")
+ARGS = _parser.parse_args()
+
 # ── Load corpus ──────────────────────────────────────────────────────────────
 
-with open("marathi_sentences.json", "r", encoding="utf-8") as f:
+with open(ARGS.corpus, "r", encoding="utf-8") as f:
     sentences = json.load(f)
 
 print(f"Loaded {len(sentences)} sentences for fixed-chunk ablation.")
@@ -176,11 +202,30 @@ def mean(vals):
 
 print("\nPart 1: Fixed-chunk boundary F1 (tolerance = +-3 bytes)...")
 
-per_sentence = []
-aggregate = {k: {"precisions": [], "recalls": [], "f1s": []} for k in CHUNK_SIZES}
+FINGERPRINT = config_fingerprint(
+    {
+        "corpus": ARGS.corpus,
+        "num_sentences": len(sentences),
+        "chunk_sizes": CHUNK_SIZES,
+        "tolerance": TOLERANCE,
+    }
+)
+
+# Gold morpheme segmentation dominates the runtime, so rows stream to disk and
+# an interrupted pass resumes at the first sentence it had not written.
+writer = ResumableJsonl(
+    ARGS.out_jsonl,
+    fingerprint=FINGERPRINT,
+    resume=ARGS.resume != "never",
+    key="sentence_id",
+)
+if writer.done:
+    print(f"Resuming Part 1: {len(writer.done)}/{len(sentences)} sentences already done")
 
 N = len(sentences)
 for idx, sent in enumerate(sentences):
+    if writer.is_done(idx):
+        continue
     seq = sent.encode("utf-8")
     gold = get_morpheme_boundaries(sent)
 
@@ -200,17 +245,26 @@ for idx, sent in enumerate(sentences):
         row[key + "_recall"] = round(r, 4)
         row[key + "_f1"] = round(f1, 4)
 
-        aggregate[k]["precisions"].append(p)
-        aggregate[k]["recalls"].append(r)
-        aggregate[k]["f1s"].append(f1)
-
-    per_sentence.append(row)
+    writer.append(row)
 
     if (idx + 1) % 5000 == 0:
         print(f"  Processed {idx + 1}/{N} sentences...")
 
+writer.close()
+per_sentence = writer.all_records()
+
+# Aggregate from the written rows so a run assembled from several attempts still
+# averages over the whole corpus.
+aggregate = {k: {"precisions": [], "recalls": [], "f1s": []} for k in CHUNK_SIZES}
+for row in per_sentence:
+    for k in CHUNK_SIZES:
+        key = f"fixed_{k}"
+        aggregate[k]["precisions"].append(row[key + "_precision"])
+        aggregate[k]["recalls"].append(row[key + "_recall"])
+        aggregate[k]["f1s"].append(row[key + "_f1"])
+
 # Load entropy-adaptive baseline
-with open("morpheme_alignment_results.json", "r", encoding="utf-8") as f:
+with open(ARGS.entropy_results, "r", encoding="utf-8") as f:
     entropy_results = json.load(f)
 
 entropy_best_tau = entropy_results["best_tau"]
@@ -275,14 +329,24 @@ print("\nPart 2: Tolerance sensitivity (tol = 0, 1, 2, 3 bytes)...")
 TOLERANCES = [0, 1, 2, 3]
 tolerance_results = {}
 
-for tol in TOLERANCES:
+# Each tolerance is another full pass over the corpus with morphological
+# analysis, so completed ones are memoized and a rerun starts at the first
+# tolerance it had not finished.
+tol_stages = StageTracker(
+    os.path.splitext(ARGS.out_json)[0] + ".tolerance_state.json",
+    fingerprint=FINGERPRINT,
+    resume=ARGS.resume != "never",
+)
+
+
+def _run_tolerance(tol):
     tol_agg = {
         "entropy_adaptive": {"precisions": [], "recalls": [], "f1s": []},
     }
     for k in CHUNK_SIZES:
         tol_agg[f"fixed_{k}"] = {"precisions": [], "recalls": [], "f1s": []}
 
-    for idx, sent in enumerate(sentences):
+    for sent in sentences:
         seq = sent.encode("utf-8")
         gold = get_morpheme_boundaries(sent)
         entropies = compute_entropy(seq)
@@ -302,14 +366,20 @@ for tol in TOLERANCES:
             tol_agg[f"fixed_{k}"]["recalls"].append(r)
             tol_agg[f"fixed_{k}"]["f1s"].append(f1)
 
-    tolerance_results[tol] = {}
-    for method_key in ["entropy_adaptive"] + [f"fixed_{k}" for k in CHUNK_SIZES]:
-        tolerance_results[tol][method_key] = {
+    return {
+        method_key: {
             "precision": round(mean(tol_agg[method_key]["precisions"]), 4),
             "recall": round(mean(tol_agg[method_key]["recalls"]), 4),
             "f1": round(mean(tol_agg[method_key]["f1s"]), 4),
         }
+        for method_key in ["entropy_adaptive"] + [f"fixed_{k}" for k in CHUNK_SIZES]
+    }
 
+
+for tol in TOLERANCES:
+    tolerance_results[tol] = tol_stages.run(
+        f"tolerance={tol}", lambda tol=tol: _run_tolerance(tol)
+    )
     print(f"  Tolerance = {tol} done.")
 
 # Print tolerance sensitivity table
@@ -334,7 +404,7 @@ print("\n" + "=" * 78)
 print("BOUNDARY EFFICIENCY (F1 per 100 boundaries)")
 print("=" * 78)
 
-entropy_boundaries = 332.86 - 1  # patches - 1 from sweep at tau=1.0
+entropy_boundaries = 332.86 - 1  # patches - 1 from sweep at tau=1.0; TODO: compute from actual sweep data instead of hardcoding
 methods_eff = [
     ("Entropy (tau=1.0)", entropy_best["f1"], entropy_boundaries),
     ("Fixed 4-byte", results["fixed_chunk_results"]["4"]["f1"],
@@ -361,12 +431,10 @@ print("=" * 78)
 
 # ── Save all results ────────────────────────────────────────────────────────
 
-with open("fixed_chunk_ablation_results.json", "w", encoding="utf-8") as f:
+with open(ARGS.out_json, "w", encoding="utf-8") as f:
     json.dump(results, f, indent=2, ensure_ascii=False)
 
-with open("fixed_chunk_ablation_per_sentence.jsonl", "w", encoding="utf-8") as f:
-    for row in per_sentence:
-        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+# Per-sentence rows already live in ARGS.out_jsonl, written incrementally above.
 
 # ── Plot 1: Bar chart comparison (tolerance = 3) ───────────────────────────
 

@@ -7,12 +7,28 @@ corpus, recording per-sentence patch counts at each threshold.
 Outputs:
   - sweep_results.jsonl   : one JSON object per sentence with patch counts
   - sweep_summary.json    : aggregate statistics per threshold
+
+Resumable: per-sentence rows stream to ``sweep_results.jsonl`` as they are
+computed, so an interrupted sweep restarts at the first sentence it had not
+written. Pass ``--resume never`` (or set ``SWEEP_RESUME=never``) to force a
+clean run.
 """
 
+import argparse
 import json
 import math
 import csv
+import os
+import sys
 from collections import defaultdict, Counter
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from lcm_scripts.checkpoint_utils import (
+    ResumableJsonl,
+    StageTracker,
+    config_fingerprint,
+)
 
 # For morpheme boundary evaluation on a small sample
 from lcm_scripts.indic_resources import configure_indic_resources
@@ -26,9 +42,25 @@ from indicnlp.morph.unsupervised_morph import UnsupervisedMorphAnalyzer
 # Initialize morph analyzer for Marathi
 morph_analyzer = UnsupervisedMorphAnalyzer("mr")
 
+# ── CLI ──────────────────────────────────────────────────────────────────────
+
+_parser = argparse.ArgumentParser(description=__doc__)
+_parser.add_argument(
+    "--resume",
+    default=os.environ.get("SWEEP_RESUME", "auto"),
+    metavar="auto|never",
+    help="'auto' (default) continues from a partial sweep_results.jsonl whose "
+    "configuration matches; 'never' discards it and starts over.",
+)
+_parser.add_argument("--corpus", default="marathi_sentences.json")
+_parser.add_argument("--out_jsonl", default="sweep_results.jsonl")
+_parser.add_argument("--out_csv", default="sweep_results.csv")
+_parser.add_argument("--out_summary", default="sweep_summary.json")
+ARGS = _parser.parse_args()
+
 # ── Load corpus ──────────────────────────────────────────────────────────────
 
-with open("marathi_sentences.json", "r", encoding="utf-8") as f:
+with open(ARGS.corpus, "r", encoding="utf-8") as f:
     sentences = json.load(f)
 
 byte_sequences = [s.encode("utf-8") for s in sentences]
@@ -50,6 +82,13 @@ for prev, counter in transitions.items():
 # ── Entropy helpers ──────────────────────────────────────────────────────────
 
 def compute_entropy(seq, default_entropy=8.0):
+    """Per-position conditional entropy: H(next_byte | prev_byte).
+    
+    NOTE: This uses a bigram co-occurrence model (empirical conditional entropy
+    from corpus statistics), NOT the neural ByteEntropyModel used in
+    run_blt_patching.py and blt_loader.py. Results from this sweep may differ
+    systematically from the neural model's entropy estimates.
+    """
     """Per-position conditional entropy: H(next_byte | prev_byte)."""
     entropies = []
     for i in range(len(seq) - 1):
@@ -88,11 +127,30 @@ EVAL_SAMPLE_SIZE = 200  # number of sentences to use when computing boundary P/R
 
 # ── Run sweep ────────────────────────────────────────────────────────────────
 
-results = []
-# Accumulators for summary statistics per threshold
-summary = {tau: {"patch_counts": [], "avg_patch_sizes": []} for tau in THRESHOLDS}
+FINGERPRINT = config_fingerprint(
+    {
+        "corpus": ARGS.corpus,
+        "num_sentences": len(sentences),
+        "thresholds": THRESHOLDS,
+        "tolerance": TOLERANCE,
+        "eval_sample_size": EVAL_SAMPLE_SIZE,
+    }
+)
+
+# Rows stream to disk as they are produced, so an interrupted sweep resumes at
+# the first sentence it had not written rather than rescanning the corpus.
+writer = ResumableJsonl(
+    ARGS.out_jsonl,
+    fingerprint=FINGERPRINT,
+    resume=ARGS.resume != "never",
+    key="sentence_id",
+)
+if writer.done:
+    print(f"Resuming sweep: {len(writer.done)}/{len(sentences)} sentences already done")
 
 for idx, seq in enumerate(byte_sequences):
+    if writer.is_done(idx):
+        continue
     entropies = compute_entropy(seq)
     row = {
         "sentence_id": idx,
@@ -108,19 +166,22 @@ for idx, seq in enumerate(byte_sequences):
         row[key + "_num_patches"] = num_patches
         row[key + "_avg_patch_size"] = round(avg_size, 2)
 
-        summary[tau]["patch_counts"].append(num_patches)
-        summary[tau]["avg_patch_sizes"].append(avg_size)
-
-    results.append(row)
+    writer.append(row)
 
     if (idx + 1) % 2000 == 0:
         print(f"  Processed {idx + 1}/{len(sentences)} sentences...")
 
-# ── Write per-sentence JSONL ─────────────────────────────────────────────────
+writer.close()
+results = writer.all_records()
 
-with open("sweep_results.jsonl", "w", encoding="utf-8") as f:
-    for row in results:
-        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+# Summary is derived from the written rows rather than accumulated in memory, so
+# a run stitched together from several attempts aggregates over everything.
+summary = {tau: {"patch_counts": [], "avg_patch_sizes": []} for tau in THRESHOLDS}
+for row in results:
+    for tau in THRESHOLDS:
+        key = f"tau_{tau}"
+        summary[tau]["patch_counts"].append(row[key + "_num_patches"])
+        summary[tau]["avg_patch_sizes"].append(row[key + "_avg_patch_size"])
 
 # ── Write per-sentence CSV (easy to inspect) ─────────────────────────────────
 
@@ -129,10 +190,10 @@ for tau in THRESHOLDS:
     csv_cols.append(f"tau_{tau}_num_patches")
     csv_cols.append(f"tau_{tau}_avg_patch_size")
 
-with open("sweep_results.csv", "w", newline="", encoding="utf-8") as f:
-    writer = csv.DictWriter(f, fieldnames=csv_cols)
-    writer.writeheader()
-    writer.writerows(results)
+with open(ARGS.out_csv, "w", newline="", encoding="utf-8") as f:
+    csv_writer = csv.DictWriter(f, fieldnames=csv_cols, extrasaction="ignore")
+    csv_writer.writeheader()
+    csv_writer.writerows(results)
 
 # ── Compute and write summary ────────────────────────────────────────────────
 
@@ -257,31 +318,47 @@ def boundaries_match(pred_boundaries, gold_boundaries, tolerance=TOLERANCE):
 eval_sample = sentences[:EVAL_SAMPLE_SIZE]
 if eval_sample:
     print(f"Evaluating boundary alignment on {len(eval_sample)} sentences...")
-    eval_aggregate = {tau: {"precisions": [], "recalls": [], "f1s": []} for tau in THRESHOLDS}
-    for idx, sent in enumerate(eval_sample):
-        seq = sent.encode("utf-8")
-        entropies = compute_entropy(seq)
-        gold = get_morpheme_boundaries(sent)
 
-        for tau in THRESHOLDS:
-            pred = get_patch_boundaries(seq, entropies, tau)
-            p, r, f1 = boundaries_match(pred, gold)
-            eval_aggregate[tau]["precisions"].append(p)
-            eval_aggregate[tau]["recalls"].append(r)
-            eval_aggregate[tau]["f1s"].append(f1)
+    def _boundary_eval():
+        aggregate = {
+            tau: {"precisions": [], "recalls": [], "f1s": []} for tau in THRESHOLDS
+        }
+        for sent in eval_sample:
+            seq = sent.encode("utf-8")
+            entropies = compute_entropy(seq)
+            gold = get_morpheme_boundaries(sent)
 
-    def mean(vals):
-        return sum(vals) / len(vals) if vals else 0.0
+            for tau in THRESHOLDS:
+                pred = get_patch_boundaries(seq, entropies, tau)
+                p, r, f1 = boundaries_match(pred, gold)
+                aggregate[tau]["precisions"].append(p)
+                aggregate[tau]["recalls"].append(r)
+                aggregate[tau]["f1s"].append(f1)
+
+        def mean(vals):
+            return sum(vals) / len(vals) if vals else 0.0
+
+        return {
+            str(tau): {
+                "boundary_precision": round(mean(aggregate[tau]["precisions"]), 4),
+                "boundary_recall": round(mean(aggregate[tau]["recalls"]), 4),
+                "boundary_f1": round(mean(aggregate[tau]["f1s"]), 4),
+            }
+            for tau in THRESHOLDS
+        }
+
+    # Morphological analysis is much slower per sentence than the byte scan, so
+    # this stage is memoized separately from the sweep itself.
+    boundary_stats = StageTracker(
+        os.path.splitext(ARGS.out_summary)[0] + ".state.json",
+        fingerprint=FINGERPRINT,
+        resume=ARGS.resume != "never",
+    ).run("boundary_eval", _boundary_eval)
 
     for tau in THRESHOLDS:
-        avg_p = mean(eval_aggregate[tau]["precisions"])
-        avg_r = mean(eval_aggregate[tau]["recalls"])
-        avg_f1 = mean(eval_aggregate[tau]["f1s"])
-        summary_out["thresholds"][str(tau)]["boundary_precision"] = round(avg_p, 4)
-        summary_out["thresholds"][str(tau)]["boundary_recall"] = round(avg_r, 4)
-        summary_out["thresholds"][str(tau)]["boundary_f1"] = round(avg_f1, 4)
+        summary_out["thresholds"][str(tau)].update(boundary_stats[str(tau)])
 
-with open("sweep_summary.json", "w", encoding="utf-8") as f:
+with open(ARGS.out_summary, "w", encoding="utf-8") as f:
     json.dump(summary_out, f, indent=2, ensure_ascii=False)
 
 # ── Print summary table ──────────────────────────────────────────────────────

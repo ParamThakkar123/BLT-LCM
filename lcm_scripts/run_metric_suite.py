@@ -25,6 +25,7 @@ import subprocess
 from typing import Dict, List, Optional
 
 from eval_metrics import compute_all
+from checkpoint_utils import StageTracker, add_resume_args, config_fingerprint
 
 
 def read_lines(path: str) -> List[str]:
@@ -135,8 +136,10 @@ def main():
         action="store_true",
         help="Fail if any checkpoint is missing a matching hypothesis file",
     )
+    add_resume_args(parser, training=False)
     args = parser.parse_args()
 
+    fingerprint = config_fingerprint(args, extra={"stage": "run_metric_suite"})
     refs = read_lines(args.ref_file)
 
     pattern = os.path.join(args.checkpoints_dir, args.checkpoint_glob)
@@ -146,6 +149,14 @@ def main():
 
     rows = []
     skipped = []
+    # COMET alone is a neural forward pass over the whole hypothesis set, per
+    # checkpoint. Memoize each checkpoint's row so an interrupted suite resumes
+    # at the first checkpoint it had not finished scoring.
+    stages = StageTracker(
+        os.path.splitext(args.out_csv)[0] + ".state.json",
+        fingerprint=fingerprint,
+        resume=args.resume != "never",
+    )
 
     for ckpt in checkpoints:
         hyp_path = checkpoint_to_hyp_path(ckpt, args.hyp_dir, args.hyp_suffix)
@@ -174,7 +185,10 @@ def main():
             skipped.append((ckpt, hyp_path))
             continue
 
-        row = evaluate_checkpoint(ckpt, hyp_path, refs, args.comet_model)
+        row = stages.run(
+            os.path.basename(ckpt),
+            lambda: evaluate_checkpoint(ckpt, hyp_path, refs, args.comet_model),
+        )
         rows.append(row)
         print(
             f"{row['checkpoint']}: chrF++={row['chrF++']:.2f} BLEU={row['BLEU']:.2f} "

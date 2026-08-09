@@ -42,7 +42,9 @@ def _get(row: dict[str, str], candidates: Iterable[str]) -> str:
     return ""
 
 
-def read_metric_rows(paths: list[str], metric: str = DEFAULT_METRIC) -> list[NoiseMetricRow]:
+def read_metric_rows(
+    paths: list[str], metric: str = DEFAULT_METRIC
+) -> list[NoiseMetricRow]:
     rows: list[NoiseMetricRow] = []
     for path in paths:
         with open(path, newline="", encoding="utf-8") as f:
@@ -50,7 +52,16 @@ def read_metric_rows(paths: list[str], metric: str = DEFAULT_METRIC) -> list[Noi
             for raw in reader:
                 model = _get(raw, ("model", "model_name", "system"))
                 noise = _get(raw, ("noise", "noise_level", "character_noise"))
-                value = _get(raw, (metric, metric.lower(), metric.replace("++", "pp"), "chrf", "chrf++"))
+                value = _get(
+                    raw,
+                    (
+                        metric,
+                        metric.lower(),
+                        metric.replace("++", "pp"),
+                        "chrf",
+                        "chrf++",
+                    ),
+                )
                 if not (model and noise and value):
                     continue
                 fraction_text = _get(raw, ("fraction", "data_fraction"))
@@ -77,27 +88,45 @@ def select_curve_rows(
     for row in rows:
         if row.model not in wanted_models:
             continue
-        if fraction is not None and (row.fraction is None or abs(row.fraction - fraction) > 1e-9):
+        if fraction is not None and (
+            row.fraction is None or abs(row.fraction - fraction) > 1e-9
+        ):
             continue
         for noise in noise_levels:
             if abs(row.noise - noise) < 1e-9:
-                selected[(row.model, noise)] = row
+                key = (row.model, noise)
+                if key in selected:
+                    print(
+                        f"Warning: duplicate {row.model}@{noise} from {selected[key].source_csv} and {row.source_csv}; keeping last"
+                    )
+                selected[key] = row
                 break
 
-    missing = [(model, noise) for model in wanted_models for noise in noise_levels if (model, noise) not in selected]
+    missing = [
+        (model, noise)
+        for model in wanted_models
+        for noise in noise_levels
+        if (model, noise) not in selected
+    ]
     if missing:
         formatted = ", ".join(f"{model}@{noise:g}" for model, noise in missing)
         raise ValueError(
             "Cannot create noisy-input degradation curve because required "
             f"model/noise metric rows are missing: {formatted}"
         )
-    return [selected[(model, noise)] for model in wanted_models for noise in noise_levels]
+    return [
+        selected[(model, noise)] for model in wanted_models for noise in noise_levels
+    ]
 
 
-def write_curve_csv(rows: list[NoiseMetricRow], out_csv: str, metric: str = DEFAULT_METRIC) -> None:
+def write_curve_csv(
+    rows: list[NoiseMetricRow], out_csv: str, metric: str = DEFAULT_METRIC
+) -> None:
     os.makedirs(os.path.dirname(out_csv) or ".", exist_ok=True)
     with open(out_csv, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["model", "noise", metric, "fraction", "source_csv"])
+        writer = csv.DictWriter(
+            f, fieldnames=["model", "noise", metric, "fraction", "source_csv"]
+        )
         writer.writeheader()
         for row in rows:
             writer.writerow(
@@ -111,7 +140,9 @@ def write_curve_csv(rows: list[NoiseMetricRow], out_csv: str, metric: str = DEFA
             )
 
 
-def plot_curve(rows: list[NoiseMetricRow], out_png: str, metric: str = DEFAULT_METRIC) -> None:
+def plot_curve(
+    rows: list[NoiseMetricRow], out_png: str, metric: str = DEFAULT_METRIC
+) -> None:
     import matplotlib.pyplot as plt
 
     os.makedirs(os.path.dirname(out_png) or ".", exist_ok=True)
@@ -122,7 +153,12 @@ def plot_curve(rows: list[NoiseMetricRow], out_png: str, metric: str = DEFAULT_M
     fig, ax = plt.subplots(figsize=(6.5, 4.0))
     for model, model_rows in by_model.items():
         model_rows = sorted(model_rows, key=lambda r: r.noise)
-        ax.plot([r.noise * 100 for r in model_rows], [r.metric_value for r in model_rows], marker="o", label=model)
+        ax.plot(
+            [r.noise * 100 for r in model_rows],
+            [r.metric_value for r in model_rows],
+            marker="o",
+            label=model,
+        )
     ax.set_xlabel("Character noise (%)")
     ax.set_ylabel(metric)
     ax.set_title("Noisy input degradation: BPE-LCM vs BLT-LCM")
@@ -135,9 +171,16 @@ def plot_curve(rows: list[NoiseMetricRow], out_png: str, metric: str = DEFAULT_M
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--inputs", nargs="+", required=True, help="Metric CSV files with model, noise, and chrF++ columns")
+    p.add_argument(
+        "--inputs",
+        nargs="+",
+        required=True,
+        help="Metric CSV files with model, noise, and chrF++ columns",
+    )
     p.add_argument("--models", nargs="+", default=list(DEFAULT_MODELS))
-    p.add_argument("--noise-levels", nargs="+", type=float, default=list(DEFAULT_NOISE_LEVELS))
+    p.add_argument(
+        "--noise-levels", nargs="+", type=float, default=list(DEFAULT_NOISE_LEVELS)
+    )
     p.add_argument("--metric", default=DEFAULT_METRIC)
     p.add_argument("--fraction", type=float, default=None)
     p.add_argument("--out-csv", default="results/noisy_input_degradation_curve.csv")
@@ -145,7 +188,9 @@ def main() -> None:
     args = p.parse_args()
 
     all_rows = read_metric_rows(args.inputs, metric=args.metric)
-    rows = select_curve_rows(all_rows, tuple(args.models), tuple(args.noise_levels), args.fraction)
+    rows = select_curve_rows(
+        all_rows, tuple(args.models), tuple(args.noise_levels), args.fraction
+    )
     write_curve_csv(rows, args.out_csv, metric=args.metric)
     plot_curve(rows, args.out_png, metric=args.metric)
     print(f"Wrote {args.out_csv} and {args.out_png}")

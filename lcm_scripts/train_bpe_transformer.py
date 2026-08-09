@@ -34,6 +34,14 @@ from bhashasetu_utils import (
     load_bhashasetu_pairs,
 )
 from eval_metrics import compute_bleu, compute_chrf, compute_ter
+from checkpoint_utils import (
+    ResumableLoader,
+    StageTracker,
+    TrainingCheckpointer,
+    add_resume_args,
+    config_fingerprint,
+    seed_everything,
+)
 
 try:
     import sentencepiece as spm
@@ -149,13 +157,22 @@ class BPETransformer(nn.Module):
 
 
 def train_sentencepiece(
-    pairs: Sequence[ParallelExample], out_dir: str, vocab_size: int
+    pairs: Sequence[ParallelExample],
+    out_dir: str,
+    vocab_size: int,
+    resume: bool = True,
 ) -> str:
     if spm is None:
         raise RuntimeError(
             "sentencepiece is required. Install project dependencies first."
         )
     os.makedirs(out_dir, exist_ok=True)
+    model_path = os.path.join(out_dir, "bhashasetu_bpe") + ".model"
+    if resume and os.path.exists(model_path):
+        # The saved model checkpoints were trained against this vocabulary;
+        # retraining it on resume would shift every token id underneath them.
+        print(f"[resume] reusing existing SentencePiece model {model_path}")
+        return model_path
     corpus_path = os.path.join(out_dir, "bpe_corpus.txt")
     with open(corpus_path, "w", encoding="utf-8") as f:
         for ex in pairs:
@@ -250,8 +267,11 @@ def main():
     p.add_argument("--wandb_project", type=str, default=None)
     p.add_argument("--wandb_name", type=str, default=None)
     p.add_argument("--wandb_entity", type=str, default=os.environ.get("WANDB_ENTITY"))
+    add_resume_args(p, default_interval_steps=200)
     args = p.parse_args()
 
+    seed_everything(args.ckpt_seed)
+    fingerprint = config_fingerprint(args)
     os.makedirs(args.out_dir, exist_ok=True)
     print(f"Loading BhashaSetu fraction={args.fraction}")
 
@@ -283,11 +303,17 @@ def main():
     if not eval_pairs:
         eval_pairs = train_pairs[: min(args.eval_examples, len(train_pairs))]
 
-    sp_model = train_sentencepiece(train_pairs, args.out_dir, args.vocab_size)
+    sp_model = train_sentencepiece(
+        train_pairs, args.out_dir, args.vocab_size, resume=args.resume != "never"
+    )
     sp = spm.SentencePieceProcessor(model_file=sp_model)
     train_ds = TranslationDataset(train_pairs, sp, args.max_len)
-    loader = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate
+    loader = ResumableLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        seed=args.ckpt_seed,
+        shuffle=True,
+        collate_fn=collate,
     )
 
     device = torch.device(args.device)
@@ -307,10 +333,33 @@ def main():
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
     criterion = nn.CrossEntropyLoss(ignore_index=PAD_ID)
 
-    for epoch in range(args.epochs):
+    ckpt = TrainingCheckpointer(
+        args.out_dir,
+        prefix=f"bpe_transformer_fraction{args.fraction}",
+        suffix=".pt",
+        fingerprint=fingerprint,
+        max_keep=args.max_checkpoints,
+        save_interval_steps=args.save_interval_steps,
+        save_interval_seconds=args.save_interval_seconds,
+    )
+    resume = ckpt.restore(ckpt.load(args.resume, map_location=device), model, opt)
+    global_step = resume.global_step
+    if resume.resumed:
+        print(
+            f"Resuming at epoch {resume.start_epoch + 1}/{args.epochs}, "
+            f"batch {resume.start_batch}"
+        )
+
+    for epoch in range(resume.start_epoch, args.epochs):
         model.train()
         total, steps = 0.0, 0
-        for src, tgt in tqdm(loader, desc=f"epoch {epoch + 1}"):
+        skip = resume.batches_to_skip(epoch)
+        for batch_idx, (src, tgt) in tqdm(
+            loader.epoch(epoch, skip=skip),
+            desc=f"epoch {epoch + 1}",
+            initial=skip,
+            total=len(loader),
+        ):
             src, tgt = src.to(device), tgt.to(device)
             opt.zero_grad()
             logits = model(src, tgt[:, :-1])
@@ -321,6 +370,14 @@ def main():
             opt.step()
             total += float(loss.item())
             steps += 1
+            global_step += 1
+            ckpt.maybe_save(
+                model,
+                opt,
+                epoch=epoch,
+                batch_in_epoch=batch_idx,
+                global_step=global_step,
+            )
         avg_loss = total / max(1, steps)
         print(f"epoch={epoch + 1} train_loss={avg_loss:.4f}")
         if wandb_module is not None:
@@ -328,17 +385,21 @@ def main():
                 wandb_module.log({"train/loss": avg_loss}, step=epoch + 1)
             except Exception:
                 pass
-        torch.save(
-            model.state_dict(),
-            os.path.join(
-                args.out_dir,
-                f"bpe_transformer_fraction{args.fraction}_epoch{epoch + 1}.pt",
-            ),
-        )
+        ckpt.save_epoch(model, opt, epoch=epoch, global_step=global_step)
 
+    # Greedy decoding the eval set is the slowest part of this script and runs
+    # once per noise level, so completed levels are memoized.
+    stages = StageTracker(
+        os.path.join(args.out_dir, f"eval_state_fraction{args.fraction}.json"),
+        fingerprint=fingerprint,
+        resume=args.resume != "never",
+    )
     rows = []
     for noise in args.noise_levels:
-        metrics = evaluate(model, sp, eval_pairs, args, noise, device)
+        metrics = stages.run(
+            f"noise={noise}",
+            lambda noise=noise: evaluate(model, sp, eval_pairs, args, noise, device),
+        )
         row = {
             "model": "bpe_transformer",
             "fraction": args.fraction,

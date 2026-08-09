@@ -21,13 +21,20 @@ import time
 
 import torch
 from tqdm import tqdm
-from torch.utils.data import DataLoader
 from datasets import load_dataset
 from run_blt_patching import text_to_byte_tokens
 from blt_loader import BLTLoader
 from base_lcm import BaseLCM
 from eval_metrics import compute_all
 from experiment_config import setup_logging
+from checkpoint_utils import (
+    ResumableLoader,
+    TrainingCheckpointer,
+    add_resume_args,
+    cached_torch,
+    config_fingerprint,
+    seed_everything,
+)
 
 
 def prepare_data(num_docs=500, max_sent_per_doc=20, fraction=1.0):
@@ -57,8 +64,18 @@ def prepare_data(num_docs=500, max_sent_per_doc=20, fraction=1.0):
 
 
 class EmbeddingDataset(torch.utils.data.Dataset):
-    def __init__(self, embeddings_seqs):
-        self.data = [seq for seq in embeddings_seqs if len(seq) >= 2]
+    def __init__(self, embeddings_seqs, eot_embedding=None):
+        # LCM §2.3.1: every training document is suffixed with the encoded
+        # "End of text." concept, so the model learns to emit it and the
+        # inference-time stop criterion has something real to match against.
+        data = []
+        for seq in embeddings_seqs:
+            if len(seq) < 2:
+                continue
+            if eot_embedding is not None:
+                seq = torch.cat([seq, eot_embedding.unsqueeze(0).to(seq.dtype)], dim=0)
+            data.append(seq)
+        self.data = data
 
     def __len__(self):
         return len(self.data)
@@ -132,21 +149,12 @@ def main():
         default="lcm_models",
         help="Directory to save model checkpoints",
     )
-    parser.add_argument(
-        "--save_interval_steps",
-        type=int,
-        default=1000,
-        help="Save periodic checkpoint every N training steps (0 to disable)",
-    )
-    parser.add_argument(
-        "--max_checkpoints",
-        type=int,
-        default=5,
-        help="Maximum number of periodic checkpoints to keep (older removed)",
-    )
+    add_resume_args(parser, default_interval_steps=1000)
     args = parser.parse_args()
 
     device = torch.device(args.device)
+    seed_everything(args.ckpt_seed)
+    fingerprint = config_fingerprint(args)
     writer = None
     if args.log_dir:
         writer = setup_logging(args.log_dir)
@@ -174,39 +182,7 @@ def main():
     torch.set_float32_matmul_precision(
         "high"
     )  # Enable TensorFloat32 for better performance
-    # Option: load precomputed embeddings to skip encoding step
-    if args.embed_cache and os.path.exists(args.embed_cache):
-        try:
-            print(f"Loading precomputed embeddings from {args.embed_cache}")
-            embeddings_seqs = torch.load(args.embed_cache)
-
-            # validate cache: must contain at least one doc with >=2 sentence embeddings
-            def _count_valid(seqs):
-                if not seqs:
-                    return 0
-                cnt = 0
-                for s in seqs:
-                    try:
-                        # torch tensor: shape[0] is number of sentence embeddings
-                        if hasattr(s, "shape") and getattr(s, "shape")[0] >= 2:
-                            cnt += 1
-                    except Exception:
-                        continue
-                return cnt
-
-            valid = _count_valid(embeddings_seqs)
-            if valid == 0:
-                print(
-                    f"Embed cache {args.embed_cache} contains no usable sequences (found {valid}). Recomputing."
-                )
-                embeddings_seqs = None
-        except Exception as e:
-            print(f"Failed to load embed cache {args.embed_cache}: {e}. Recomputing.")
-            embeddings_seqs = None
-    else:
-        embeddings_seqs = None
-
-    if embeddings_seqs is None:
+    def _encode_all():
         flat_sents = []
         doc_indices = []
         for i, sents in enumerate(docs):
@@ -223,103 +199,142 @@ def main():
             embed_list.extend([e.cpu() for e in emb_batch])
 
         # Reconstruct per-document sequences
-        embeddings_seqs = [[] for _ in range(len(docs))]
+        seqs = [[] for _ in range(len(docs))]
         for emb, didx in zip(embed_list, doc_indices):
-            embeddings_seqs[didx].append(emb)
+            seqs[didx].append(emb)
 
         # stack per-document tensors
-        for i in range(len(embeddings_seqs)):
-            if len(embeddings_seqs[i]) == 0:
-                embeddings_seqs[i] = torch.empty((0, blt.model.dim))
+        for i in range(len(seqs)):
+            if len(seqs[i]) == 0:
+                seqs[i] = torch.empty((0, blt.model.dim))
             else:
-                embeddings_seqs[i] = torch.stack(embeddings_seqs[i], dim=0)
+                seqs[i] = torch.stack(seqs[i], dim=0)
 
-        # Optionally save cache
         print(f"Encoding: {time.time() - t1:.1f}s")
         if device.type == "cuda":
             peak_vram = torch.cuda.max_memory_allocated(device) / 1024**3
             print(f"Peak VRAM after encoding: {peak_vram:.2f} GB")
             torch.cuda.reset_peak_memory_stats(device)
-        if args.embed_cache:
-            try:
-                cache_dir = os.path.dirname(args.embed_cache)
-                if cache_dir:
-                    os.makedirs(cache_dir, exist_ok=True)
-                torch.save(embeddings_seqs, args.embed_cache)
-                print(f"Saved embeddings to {args.embed_cache}")
-            except Exception as e:
-                print(f"Failed to save embeddings cache: {e}")
+        return seqs
 
-    dataset = EmbeddingDataset(embeddings_seqs)
-    dataloader = DataLoader(
-        dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate
+    def _cache_is_usable(seqs):
+        """A cache is only useful if it holds at least one trainable sequence."""
+        return bool(seqs) and any(
+            getattr(s, "shape", (0,))[0] >= 2 for s in seqs if hasattr(s, "shape")
+        )
+
+    # Encoding the corpus can dominate a short run and is fully determined by the
+    # config, so a resumed run reloads it instead of paying for it again.
+    embeddings_seqs = cached_torch(
+        args.embed_cache,
+        _encode_all,
+        fingerprint=fingerprint,
+        resume=args.resume != "never",
+        validate=_cache_is_usable,
+        label="BLT embeddings",
     )
 
+    # The stop concept must be the encoder's own embedding of "End of text.",
+    # not a learned free parameter (LCM §2.3.1).
+    eot_embedding = blt.encode_sentences_batch(["End of text."])[0].detach().cpu()
+
+    dataset = EmbeddingDataset(embeddings_seqs, eot_embedding=eot_embedding)
+    dataloader = ResumableLoader(
+        dataset,
+        batch_size=args.batch_size,
+        seed=args.ckpt_seed,
+        shuffle=True,
+        collate_fn=collate,
+    )
+
+    embed_dim = embeddings_seqs[0].shape[1]
+    max_concepts = max(int(s.shape[0]) for s in embeddings_seqs) + 2
     model = BaseLCM(
-        embed_dim=embeddings_seqs[0].shape[1], model_dim=2048, n_layers=12, n_heads=16
+        embed_dim=embed_dim,
+        model_dim=2048,
+        n_layers=12,
+        n_heads=16,
+        max_seq_len=max(128, max_concepts),
     ).to(device)
+    model.set_eot_embedding(eot_embedding)
+
+    # Fit the PreNet/PostNet robust scaler once, on a sample of the actual
+    # training concepts (LCM Eq. 4). Without this the scaler is the identity and
+    # PostNet cannot map predictions back into the encoder's coordinate scale.
+    scaler_sample = torch.cat(
+        [s for s in embeddings_seqs if s.shape[0] > 0], dim=0
+    )
+    if scaler_sample.shape[0] > 200_000:
+        idx = torch.randperm(scaler_sample.shape[0])[:200_000]
+        scaler_sample = scaler_sample[idx]
+    model.fit_normalizer(scaler_sample.to(device))
+    print(f"Fitted robust scaler on {scaler_sample.shape[0]} concept vectors")
     if wandb_module is not None:
         try:
             wandb_module.watch(model, log="all", log_freq=100)
         except Exception:
             pass
     optim = torch.optim.AdamW(model.parameters(), lr=1e-4)
-    mse = torch.nn.MSELoss()
 
+    ckpt = TrainingCheckpointer(
+        args.model_dir,
+        prefix="lcm_blt",
+        fingerprint=fingerprint,
+        max_keep=args.max_checkpoints,
+        save_interval_steps=args.save_interval_steps,
+        save_interval_seconds=args.save_interval_seconds,
+    )
+    resume = ckpt.restore(
+        ckpt.load(args.resume, map_location=device), model, optim
+    )
     # keep a single global step counter across epochs so logging steps are monotonic
-    global_step = 0
-    for epoch in range(args.epochs):
+    global_step = resume.global_step
+    best_score = resume.best_score
+    if resume.resumed:
+        print(
+            f"Resuming at epoch {resume.start_epoch + 1}/{args.epochs}, "
+            f"batch {resume.start_batch}, global step {global_step}"
+        )
+
+    for epoch in range(resume.start_epoch, args.epochs):
         model.train()
         total = 0.0
         n = 0
         start = time.time()
-        # don't reset `global_step` here ΓÇö it must be monotonically increasing for loggers
-        for src, tgt in tqdm(dataloader):
+        skip = resume.batches_to_skip(epoch)
+        # don't reset `global_step` here — it must be monotonically increasing for loggers
+        for batch_idx, (src, tgt) in tqdm(
+            dataloader.epoch(epoch, skip=skip),
+            initial=skip,
+            total=len(dataloader),
+        ):
             src = src.to(device)
             tgt = tgt.to(device)
             seq_len = tgt.shape[1]
             if seq_len == 0:
                 continue
             optim.zero_grad()
-            losses = []
-            for i in range(seq_len):
-                prefix = src[:, : i + 1] if i + 1 <= src.shape[1] else src
-                pred = model(prefix, tgt[:, i : i + 1])
-                losses.append(mse(pred, tgt[:, i]))
-            loss = torch.stack(losses).mean()
+            # One causal pass covers every position: output at t predicts the
+            # concept at t+1. The old loop re-ran the model once per position,
+            # which was O(L^2) forward passes for the same gradient.
+            preds = model.forward_all(src)
+            # Mask out padded positions so they don't pull predictions to zero.
+            valid = (tgt.abs().sum(dim=-1, keepdim=True) > 0).float()
+            loss = ((preds - tgt).pow(2) * valid).sum() / valid.sum().clamp(min=1) / tgt.shape[-1]
             loss.backward()
             optim.step()
             total += loss.item()
             n += 1
             global_step += 1
 
-            # periodic autosave: save intermediate checkpoint and cleanup old ones
-            if (
-                args.save_interval_steps > 0
-                and global_step % args.save_interval_steps == 0
-            ):
-                os.makedirs(args.model_dir, exist_ok=True)
-                ckpt_name = f"{args.model_dir}/lcm_blt_step{global_step}.pth"
-                try:
-                    torch.save(model.state_dict(), ckpt_name)
-                    # cleanup older checkpoints - keep only the most recent `max_checkpoints`
-                    if args.max_checkpoints > 0:
-                        cks = sorted(
-                            [
-                                p
-                                for p in os.listdir(args.model_dir)
-                                if p.startswith("lcm_blt_step")
-                            ]
-                        )
-                        if len(cks) > args.max_checkpoints:
-                            to_remove = cks[: len(cks) - args.max_checkpoints]
-                            for rm in to_remove:
-                                try:
-                                    os.remove(os.path.join(args.model_dir, rm))
-                                except Exception:
-                                    pass
-                except Exception as e:
-                    print(f"Failed to save periodic checkpoint {ckpt_name}: {e}")
+            ckpt.maybe_save(
+                model,
+                optim,
+                epoch=epoch,
+                batch_in_epoch=batch_idx,
+                global_step=global_step,
+                best_score=best_score,
+            )
             if writer is not None:
                 writer.add_scalar("train/step_loss", loss.item(), global_step)
                 try:
@@ -359,13 +374,19 @@ def main():
                     pass
 
         elapsed = time.time() - start
-        print(f"Epoch {epoch + 1} avg loss: {total / n:.4f} time: {elapsed:.1f}s")
+        avg_loss = total / n if n > 0 else float("nan")
+        print(f"Epoch {epoch + 1} avg loss: {avg_loss:.4f} time: {elapsed:.1f}s")
         if device.type == "cuda":
             peak_vram = torch.cuda.max_memory_allocated(device) / 1024**3
             print(f"Peak VRAM epoch {epoch + 1}: {peak_vram:.2f} GB")
             torch.cuda.reset_peak_memory_stats(device)
-        os.makedirs(args.model_dir, exist_ok=True)
-        torch.save(model.state_dict(), f"{args.model_dir}/lcm_blt_epoch{epoch + 1}.pth")
+        ckpt.save_epoch(
+            model,
+            optim,
+            epoch=epoch,
+            global_step=global_step,
+            best_score=best_score,
+        )
 
         # per-epoch logging
         if writer is not None:
@@ -399,14 +420,6 @@ def main():
                         break
                 except Exception:
                     continue
-            if monitor_score is not None:
-                best_path = f"{args.model_dir}/lcm_blt_best.pth"
-                prev_best = getattr(main, "_best_score", None)
-                if prev_best is None or monitor_score > prev_best:
-                    os.makedirs(args.model_dir, exist_ok=True)
-                    torch.save(model.state_dict(), best_path)
-                    setattr(main, "_best_score", monitor_score)
-
             # also send eval metrics to wandb if enabled, using monotonic step
             if wandb_module is not None:
                 try:
@@ -415,11 +428,23 @@ def main():
                     pass
         else:
             monitor_score = -(total / n if n > 0 else float("inf"))
-            best_path = f"{args.model_dir}/lcm_blt_best.pth"
-            prev_best = getattr(main, "_best_score", None)
-            if prev_best is None or monitor_score > prev_best:
-                os.makedirs(args.model_dir, exist_ok=True)
-                torch.save(model.state_dict(), best_path)
+
+        # `best_score` rides along in the checkpoint, so a resumed run keeps
+        # comparing against the best epoch of the *whole* run rather than
+        # treating the first epoch after the restart as an automatic winner.
+        if monitor_score is not None and (
+            best_score is None or monitor_score > best_score
+        ):
+            best_score = monitor_score
+            ckpt.save_best(
+                model,
+                optim,
+                epoch=epoch,
+                batch_in_epoch=0,
+                epoch_completed=True,
+                global_step=global_step,
+                best_score=best_score,
+            )
     # close writers
     if writer is not None:
         try:

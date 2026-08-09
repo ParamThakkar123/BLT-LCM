@@ -10,17 +10,27 @@ Patch boundary vs. morpheme boundary alignment study.
 Outputs:
   - morpheme_alignment_results.json   : per-tau P/R/F1 + per-sentence details
   - morpheme_f1_vs_tau.png            : publication-ready plot
+
+Resumable: per-sentence rows stream to ``morpheme_alignment_per_sentence.jsonl``
+as they are computed, so an interrupted run restarts at the first sentence it
+had not written. Pass ``--resume never`` to force a clean run.
 """
 
+import argparse
 import sys
 import io
 import json
 import math
+import os
 import bisect
 from collections import defaultdict, Counter
 
 # Fix Windows console encoding
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from lcm_scripts.checkpoint_utils import ResumableJsonl, config_fingerprint
 
 # ── Indic NLP setup ──────────────────────────────────────────────────────────
 
@@ -37,7 +47,21 @@ morph_analyzer = UnsupervisedMorphAnalyzer("mr")
 
 # ── Load corpus ──────────────────────────────────────────────────────────────
 
-with open("marathi_sentences.json", "r", encoding="utf-8") as f:
+_parser = argparse.ArgumentParser(description=__doc__)
+_parser.add_argument(
+    "--resume",
+    default=os.environ.get("ALIGNMENT_RESUME", "auto"),
+    metavar="auto|never",
+    help="'auto' (default) continues from a partial per-sentence JSONL whose "
+    "configuration matches; 'never' discards it and starts over.",
+)
+_parser.add_argument("--corpus", default="marathi_sentences.json")
+_parser.add_argument("--out_jsonl", default="morpheme_alignment_per_sentence.jsonl")
+_parser.add_argument("--out_json", default="morpheme_alignment_results.json")
+_parser.add_argument("--out_plot", default="morpheme_f1_vs_tau.png")
+ARGS = _parser.parse_args()
+
+with open(ARGS.corpus, "r", encoding="utf-8") as f:
     all_sentences = json.load(f)
 
 # Use all 50K sentences
@@ -178,11 +202,30 @@ def boundaries_match(pred_boundaries, gold_boundaries, tolerance=TOLERANCE):
 
 print("Computing morpheme boundaries and alignment metrics...")
 
-per_sentence = []
-aggregate = {tau: {"precisions": [], "recalls": [], "f1s": []} for tau in THRESHOLDS}
+FINGERPRINT = config_fingerprint(
+    {
+        "corpus": ARGS.corpus,
+        "num_sentences": len(sentences),
+        "thresholds": THRESHOLDS,
+        "tolerance": TOLERANCE,
+    }
+)
+
+# Morphological analysis is the slow part here; rows stream to disk so an
+# interrupted run resumes at the first sentence it had not written.
+writer = ResumableJsonl(
+    ARGS.out_jsonl,
+    fingerprint=FINGERPRINT,
+    resume=ARGS.resume != "never",
+    key="sentence_id",
+)
+if writer.done:
+    print(f"Resuming: {len(writer.done)}/{len(sentences)} sentences already done")
 
 N = len(sentences)
 for idx, sent in enumerate(sentences):
+    if writer.is_done(idx):
+        continue
     seq = sent.encode("utf-8")
     entropies = compute_entropy(seq)
     gold = get_morpheme_boundaries(sent)
@@ -203,14 +246,23 @@ for idx, sent in enumerate(sentences):
         row[key + "_recall"] = round(r, 4)
         row[key + "_f1"] = round(f1, 4)
 
-        aggregate[tau]["precisions"].append(p)
-        aggregate[tau]["recalls"].append(r)
-        aggregate[tau]["f1s"].append(f1)
-
-    per_sentence.append(row)
+    writer.append(row)
 
     if (idx + 1) % 5000 == 0:
         print(f"  Processed {idx + 1}/{N} sentences...")
+
+writer.close()
+per_sentence = writer.all_records()
+
+# Aggregate from the written rows rather than an in-memory accumulator, so a run
+# stitched together from several attempts still averages over the full corpus.
+aggregate = {tau: {"precisions": [], "recalls": [], "f1s": []} for tau in THRESHOLDS}
+for row in per_sentence:
+    for tau in THRESHOLDS:
+        key = f"tau_{tau}"
+        aggregate[tau]["precisions"].append(row[key + "_precision"])
+        aggregate[tau]["recalls"].append(row[key + "_recall"])
+        aggregate[tau]["f1s"].append(row[key + "_f1"])
 
 # ── Aggregate results ────────────────────────────────────────────────────────
 
@@ -244,13 +296,11 @@ for tau in THRESHOLDS:
 
 results["best_tau"] = best_tau
 results["best_f1"] = round(best_f1, 4)
-with open("morpheme_alignment_results.json", "w", encoding="utf-8") as f:
+with open(ARGS.out_json, "w", encoding="utf-8") as f:
     json.dump(results, f, indent=2, ensure_ascii=False)
 
-# Write per-sentence detail to separate JSONL (keeps main JSON small)
-with open("morpheme_alignment_per_sentence.jsonl", "w", encoding="utf-8") as f:
-    for row in per_sentence:
-        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+# Per-sentence detail already lives in ARGS.out_jsonl, written incrementally by
+# the resumable writer above.
 
 # ── Print results table ─────────────────────────────────────────────────────
 
@@ -308,6 +358,7 @@ ax.spines["top"].set_visible(False)
 ax.spines["right"].set_visible(False)
 
 plt.tight_layout()
-plt.savefig("morpheme_f1_vs_tau.png", dpi=300, bbox_inches="tight")
-print("\nPlot saved: morpheme_f1_vs_tau.png")
-print("Results saved: morpheme_alignment_results.json")
+plt.savefig(ARGS.out_plot, dpi=300, bbox_inches="tight")
+print(f"\nPlot saved: {ARGS.out_plot}")
+print(f"Results saved: {ARGS.out_json}")
+print(f"Per-sentence detail: {ARGS.out_jsonl}")

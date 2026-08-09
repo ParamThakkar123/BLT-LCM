@@ -31,6 +31,12 @@ from bhashasetu_utils import (
     load_bhashasetu_pairs,
 )
 from eval_metrics import compute_bleu, compute_chrf, compute_ter
+from checkpoint_utils import (
+    StageTracker,
+    add_resume_args,
+    config_fingerprint,
+    seed_everything,
+)
 
 
 def build_prompt(source: str) -> str:
@@ -126,7 +132,11 @@ def main():
     p.add_argument("--wandb_project", type=str, default=None)
     p.add_argument("--wandb_name", type=str, default=None)
     p.add_argument("--wandb_entity", type=str, default=os.environ.get("WANDB_ENTITY"))
+    add_resume_args(p, default_interval_steps=200)
     args = p.parse_args()
+
+    seed_everything(args.ckpt_seed)
+    fingerprint = config_fingerprint(args)
 
     from transformers import (
         AutoModelForCausalLM,
@@ -221,11 +231,30 @@ def main():
         learning_rate=args.lr,
         bf16=torch.cuda.is_available(),
         logging_steps=20,
-        save_strategy="epoch",
+        # Step-based saving so a killed run loses at most `save_interval_steps`
+        # of work; "epoch" could throw away hours on an 8B fine-tune.
+        save_strategy="steps",
+        save_steps=args.save_interval_steps,
+        save_total_limit=args.max_checkpoints or None,
+        seed=args.ckpt_seed,
         report_to="none",
     )
     trainer = Trainer(model=model, args=train_args, train_dataset=train_ds)
-    trainer.train()
+
+    # HF Trainer does its own checkpointing; hand it the resume decision.
+    # `True` makes it pick the newest checkpoint-* under out_dir, restoring
+    # optimizer, scheduler, RNG and the dataloader position.
+    if args.resume == "never":
+        resume_from = None
+    elif args.resume == "auto":
+        resume_from = any(
+            d.startswith("checkpoint-") for d in os.listdir(args.out_dir)
+        ) or None
+    else:
+        resume_from = args.resume
+    if resume_from:
+        print(f"[resume] continuing Trainer run from {args.out_dir}")
+    trainer.train(resume_from_checkpoint=resume_from)
 
     if wandb_module is not None:
         try:
@@ -243,19 +272,33 @@ def main():
     rows = []
     refs = [ex.target for ex in eval_pairs]
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    for noise in args.noise_levels:
+    # Autoregressive generation over the eval set with an 8B model is the most
+    # expensive stage here, so each completed noise level is memoized.
+    stages = StageTracker(
+        os.path.join(args.out_dir, f"eval_state_fraction{args.fraction}.json"),
+        fingerprint=fingerprint,
+        resume=args.resume != "never",
+    )
+
+    def _eval_noise(noise):
         sources = [
             add_character_noise(ex.source, noise, seed=i)
             for i, ex in enumerate(eval_pairs)
         ]
         hyps = generate(model, tokenizer, sources, args.max_new_tokens, device)
+        return {
+            "BLEU": compute_bleu(hyps, refs),
+            "chrF++": compute_chrf(hyps, refs),
+            "TER": compute_ter(hyps, refs),
+        }
+
+    for noise in args.noise_levels:
+        metrics = stages.run(f"noise={noise}", lambda noise=noise: _eval_noise(noise))
         row = {
             "model": "bpe_llama8b",
             "fraction": args.fraction,
             "noise": noise,
-            "BLEU": compute_bleu(hyps, refs),
-            "chrF++": compute_chrf(hyps, refs),
-            "TER": compute_ter(hyps, refs),
+            **metrics,
         }
         print(row)
         rows.append(row)

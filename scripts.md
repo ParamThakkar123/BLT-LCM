@@ -16,7 +16,185 @@ uv sync                 # install dependencies
 
 ---
 
+## 0.5 Checkpointing & resume
+
+Every long-running script in this repo can be killed and restarted, and will
+continue from where it stopped. **Just re-run the exact same command** — resume
+is on by default.
+
+```bash
+# Start a run
+python lcm_scripts/train_lcm_blt.py --entropy_model patching_scratch/entropy_model_marathi.pt \
+  --fraction 0.25 --epochs 5 --model_dir lcm_models/blt_lcm_25
+
+# ... job is preempted / node dies / you hit Ctrl-C ...
+
+# Re-run the identical command; it picks up mid-epoch where it left off
+python lcm_scripts/train_lcm_blt.py --entropy_model patching_scratch/entropy_model_marathi.pt \
+  --fraction 0.25 --epochs 5 --model_dir lcm_models/blt_lcm_25
+```
+
+### Flags
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--resume auto` | default | Continue from this run's own checkpoint / partial output if one exists **and the configuration matches**. |
+| `--resume never` | | Ignore and discard partial state; start clean. |
+| `--resume PATH` | | Resume from a specific checkpoint file. |
+| `--save_interval_steps N` | 200 (1000 for `train_lcm_blt.py`) | Write a resumable checkpoint every N optimizer steps. `0` disables. |
+| `--save_interval_seconds S` | 0 (off) | Also checkpoint every S seconds of wall-clock. Useful against a Slurm time limit. |
+| `--max_checkpoints N` | 5 | Per-epoch snapshots to retain. |
+| `--ckpt_seed N` | 42 | Seed for per-epoch batch shuffling. |
+
+Evaluation and corpus-analysis scripts take `--resume` only — they have no
+optimizer state, and resume by record or by stage instead.
+
+### What resume actually restores
+
+Training scripts checkpoint the **model, optimizer, LR scheduler, epoch, step
+counter, best-score-so-far, and all RNG states**. Batch order for epoch *N* is a
+pure function of `(--ckpt_seed, N)`, so a resumed run replays the same
+permutation and skips the batches it already trained on. The result is exact:
+`tests/test_checkpoint_utils.py` asserts that a run killed mid-epoch and resumed
+ends on **bit-identical weights** to an uninterrupted run.
+
+Three resume granularities are in play, depending on the script:
+
+* **Training loops** (`train_*.py`, `finetune_lcm.py`, `blt_decoder.py`,
+  `run_blt_patching.py`) — mid-epoch, at `--save_interval_steps` granularity.
+* **Per-record scans** (`sweep_entropy_threshold.py`,
+  `morpheme_boundary_alignment.py`, `fixed_chunk_ablation.py`,
+  `fertility_audit.py`, `error_analysis_100.py`, `extract_marathi.py`, the
+  patching pass of `run_blt_patching.py`, the decode pass of `eval_lcm_blt.py`)
+  — rows stream to JSONL as they are produced; a rerun replays the file and
+  computes only what is missing.
+* **Per-stage memoization** (per-noise-level evaluation, `run_metric_suite.py`,
+  `eval_runner.py`) — each finished stage's metrics are cached in a JSON
+  sidecar, so an interrupted evaluation does not re-decode levels it finished.
+
+Expensive frozen-encoder passes are cached too. Pass `--embed_cache PATH` (on
+`train_lcm_blt.py`, `train_lcm_blt_mt.py`, `train_lcm_sonar.py`,
+`train_base_lcm.py`, `finetune_lcm.py`, `eval_lcm_blt.py`, `eval_lcm_sonar.py`)
+and a resumed run reloads the encodings instead of recomputing them.
+
+### Configuration changes are refused, not silently mixed
+
+Resume state is keyed to a fingerprint of the run's settings (learning rate,
+fraction, epochs, architecture, …; output paths and logging toggles are
+excluded, so redirecting `--out_dir` or turning W&B on/off is fine). Resuming
+into a run whose hyperparameters changed **errors out** rather than splicing two
+configurations into one set of results:
+
+```
+RuntimeError: Checkpoint lcm_models/lcm_blt_last.pth was written by a different
+configuration (fingerprint a1b2… != c3d4…). Re-run with the original flags,
+point --resume at a different checkpoint, or pass --resume never to start a
+fresh run.
+```
+
+### Files written
+
+```
+<model_dir>/<prefix>_last.pth      # rolling checkpoint — the resume target
+<model_dir>/<prefix>_best.pth      # best-scoring checkpoint so far
+<model_dir>/<prefix>_epoch{N}.pth  # per-epoch snapshots (pruned to --max_checkpoints)
+<output>.meta.json                 # fingerprint sidecar for JSONL scans
+<output>.state.json                # memoized stage results
+```
+
+Checkpoints are written to a `.tmp` file and then atomically renamed, so a
+process killed mid-write leaves the previous checkpoint intact rather than a
+truncated one. Checkpoint files now carry optimizer/RNG state alongside the
+weights; loaders accept both that payload and the bare `state_dict` files older
+runs produced, so existing `lcm_models/*.pth` artifacts keep working.
+
+---
+
+## 0.6 Paper-fidelity notes
+
+The implementations follow **BLT** (Pagnoni et al., 2024) and **LCM** (Barrault
+et al., 2024). `tests/test_paper_fidelity.py` pins the specific claims below;
+run it after any change to the model code.
+
+### BLT
+
+* **Patch boundaries.** `entropy_patch_sentence` starts a patch at byte *k* when
+  `H(x_k) > θ_g`, where `H(x_k)` is the entropy of the distribution over byte
+  *k* given everything before it (Eq. 1). Because
+  `compute_entropies_for_tokens` returns *next-byte* entropies
+  (`out[t] = H(x_{t+1} | x_{<=t})`), that is index `k-1`. Positions 0 and 1 are
+  always patch starts.
+* **Both segmentation rules** from §2.3 are available:
+  `--patching_mode global` (default, `H(x_k) > θ_g`) and
+  `--patching_mode monotonic` with `--threshold_add` (`H(x_k) − H(x_{k−1}) > θ_r`).
+  `--reset_context_on_newline` recomputes entropies per line (§4.4), which stops
+  repetitive text from producing runaway patch sizes.
+* **Sliding-window attention** for the entropy model via `--attn_window`
+  (§4.2 uses 512). Default is unbounded causal attention. Entropy-model defaults
+  here (dim 256, 4 layers) are a scaled-down variant of the paper's 100M/14-layer
+  model; per Fig. 8, quality rises with both size and context.
+* **Hash n-gram embeddings** (§3.2.1, Eqs. 2–4, Appendix C) are implemented in
+  `blt_local_encoder.HashNGramEmbedder`: rolling polynomial hash over n ∈ 3..8
+  into per-n tables, summed onto the byte embedding and normalised by
+  `len(ngram_sizes) + 1`. Disable with `use_hash_ngrams=False` to reproduce the
+  Table 8 ablation.
+* **The local encoder is a separate trainable network** (`BLTLocalEncoder`), not
+  the entropy model. The entropy model is frozen and supplies boundaries only.
+* **The patch sequence reaches a latent transformer** (`BLTLatentTransformer`,
+  §3.1) before being pooled into a sentence concept, so the per-patch compute
+  step the paper is about actually runs.
+
+### LCM
+
+* **Base-LCM is decoder-only** (§2.3.1): the concept sequence passes through
+  causal self-attention. Use `model.forward_all(src)` to get a prediction at
+  every position in one pass; `model(src)` returns the next concept only.
+* **PreNet/PostNet implement Eqs. (1)–(4)**: a median/IQR `RobustScaler` fitted
+  **once** on sampled concepts and frozen in buffers, with `denormalize` applied
+  *after* the PostNet projection so outputs are in raw encoder coordinates. Call
+  `model.fit_normalizer(sample)` before training — the training scripts do this
+  automatically.
+* **End-of-text** is a buffer holding `encode("End of text.")`, installed via
+  `model.set_eot_embedding(...)`, and training documents are suffixed with it.
+  Generation stops on `cos(x̂_n, eot) > s_eot` **or** `cos(x̂_n, x̂_{n−1}) > s_prev`
+  (both default 0.9). Generation raises if the EOT concept was never set.
+* **Diffusion and quantized variants** are in `lcm_scripts/diffusion_lcm.py`
+  (`TwoTowerDiffusionLCM`, `OneTowerDiffusionLCM`) and
+  `lcm_scripts/quant_lcm.py` (`QuantLCM` + `ResidualVectorQuantizer`). They
+  provide cosine/quadratic/sigmoid noise schedules with zero-terminal-SNR
+  rescaling, classifier-free guidance, guidance rescaling and epsilon-scaling.
+  The paper finds these outperform the MSE Base-LCM, which regresses to the
+  *mean* of plausible continuations.
+
+> **Checkpoint compatibility.** BaseLCM checkpoints produced before it became
+> decoder-only have an incompatible parameter layout and must be retrained;
+> `finetune_lcm.py` reports this explicitly rather than loading garbage.
+> Likewise, patching statistics computed before the boundary fix are shifted by
+> one byte — re-run the patching and morpheme-alignment analyses.
+
+---
+
 ## 1. BLT-LCM
+
+### 1.0 Learn the concept space (pooler + generative decoder) — do this first
+
+BLT concept embeddings are produced by a cross-attention **pooler** over byte
+hidden states, and predicted concepts are turned back into text by a generative
+**BLTDecoder** (not nearest-neighbor retrieval). Both are trained jointly with a
+byte-reconstruction objective (the byte backbone/entropy boundaries stay frozen):
+
+```bash
+python lcm_scripts/blt_decoder.py \
+  --entropy_model patching_scratch/entropy_model_marathi.pt \
+  --num_sentences 50000 --epochs 10 \
+  --pooler_save_path lcm_models/blt_pooler.pth \
+  --save_path lcm_models/blt_decoder.pth
+# Outputs → lcm_models/blt_pooler.pth  (loaded by all BLT training/eval via --pooler)
+#           lcm_models/blt_decoder.pth (generative decoder for eval)
+```
+
+Train the pooler+decoder BEFORE encoding LCM embeddings, and regenerate any
+`--embed_cache` afterwards (concept vectors change when the pooler changes).
 
 ### 1.1 Pre-encode BLT embeddings (cache step, ~hours per fraction)
 
@@ -69,26 +247,38 @@ uv run lcm_scripts/train_lcm_blt.py \
   --wandb_name blt_lcm_80
 ```
 
-### 1.3 Evaluate BLT-LCM (NN retrieval → BLEU / chrF++ / TER / METEOR / COMET)
+### 1.3 Evaluate BLT-LCM (generative decoding → BLEU / chrF++ / TER / METEOR / COMET)
+
+Predicted concepts are decoded to text with the trained `BLTDecoder`
+(`--decode_method generative`, the default). Pass the same `--pooler`/`--decoder`
+produced in step 1.0 and used to train the LCM. `--decode_method retrieval` is
+available only as a nearest-neighbor baseline.
 
 ```bash
-# 25%  —  noise 0.0, 0.1, 0.2
+# 25%  (concept next-sentence task)
 uv run lcm_scripts/eval_lcm_blt.py \
   --lcm_checkpoint lcm_models/blt_lcm_25/lcm_blt_best.pth \
   --entropy_model patching_scratch/entropy_model_marathi.pt \
-  --embed_cache embeddings/blt_embeddings_frac025.pth \
+  --pooler lcm_models/blt_pooler.pth \
+  --decoder lcm_models/blt_decoder.pth \
   --fraction 0.25 --out_csv results/blt_lcm_25_metrics.csv
-# Note: intrinsic eval uses clean data only; for noisy input evaluation
-# use the per-document prefix approach below:
+```
 
-# 25%  —  evaluate with noise 0.1, 0.2 (via custom eval)
-uv run lcm_scripts/eval_lcm_blt.py \
-  --lcm_checkpoint lcm_models/blt_lcm_25/lcm_blt_best.pth \
+### 1.5 English → Marathi translation (the MT task, with source-noise levels)
+
+This is the actual translation task (English source → Marathi target), evaluated
+across 0/10/20% source-side character noise. It trains `BaseLCM` to map the
+source concept to the target concept, then decodes to Marathi generatively.
+
+```bash
+uv run lcm_scripts/train_lcm_blt_mt.py \
   --entropy_model patching_scratch/entropy_model_marathi.pt \
-  --embed_cache embeddings/blt_embeddings_frac025.pth \
-  --fraction 0.25 --out_csv results/blt_lcm_25_clean.csv
-# For noise 0.1 / 0.2 re-run the evaluation with modified eval code or
-# use the evaluate_blt_lcm.py pipeline which runs eval_runner with noisy_probs.
+  --pooler lcm_models/blt_pooler.pth \
+  --decoder lcm_models/blt_decoder.pth \
+  --fraction 0.25 --epochs 3 \
+  --noise_levels 0.0 0.1 0.2 \
+  --out_csv results/blt_lcm_mt_25.csv
+# CSV columns: model, fraction, noise, BLEU, chrF++, TER, METEOR, COMET
 ```
 
 ### 1.4 BLT-LCM full evaluation suite (BLEU / chrF++ / METEOR / COMET / TER)

@@ -8,7 +8,6 @@ lcm_models/
 *.jsonl
 *.json
 .mypy_cache/
-uv.lock
 blt_lcm_marathi.egg-info/
 runs/
 data/
@@ -35,3 +34,10 @@ neurips_paper/references.bib
 
 # Apptainer container image
 *.sif
+
+# Vendored/third-party tooling and downloaded archives (do not commit — they
+# bloat the repo). Singularity is a container runtime pulled in for HPC builds.
+singularity/
+*.tar.gz
+go*.linux-amd64.tar.gz
+singularity-*.tar.gz
