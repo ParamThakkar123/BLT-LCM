@@ -110,6 +110,49 @@ runs produced, so existing `lcm_models/*.pth` artifacts keep working.
 
 ---
 
+## 0.55 Which device a run is on
+
+Every script prints the device it resolved, as its first line of real output,
+before it loads a model or touches the dataset:
+
+```
+[device] cuda:0 | NVIDIA A100-SXM4-40GB | 39.4 GiB | capability 8.0 | torch 2.5.1+cu121 | CUDA 12.1
+```
+
+```
+[device] cpu | 64 cores | 32 threads | torch 2.5.1+cu121 | CUDA 12.1
+[device] WARNING: running on CPU even though a CUDA device is available -- pass --device cuda to use it.
+```
+
+`lcm_scripts/device_utils.py` provides this (`report_device`), and each entry
+point calls it right where it resolves its device. Two cases are called out
+explicitly, because both otherwise look exactly like a healthy run until the
+run is far slower than expected:
+
+* **CPU while a GPU is present** — usually a stale `--device cpu`.
+* **`--device cuda` where `torch.cuda.is_available()` is False** — the driver,
+  the torch build, or the Slurm `--gres` allocation. The request is reported
+  back unchanged rather than silently downgraded to CPU: an unnoticed CPU
+  fallback on a cluster is worse than a clear failure.
+
+`CUDA_VISIBLE_DEVICES` is echoed whenever it is set.
+
+The Slurm scripts additionally report what the *node* offered, via
+`scripts/report_gpu.sh`, which every `scripts/*.sh` job sources after its start
+banner:
+
+```
+GPU allocation:
+  0, NVIDIA A100-SXM4-40GB, 40960 MiB, 535.104.05
+  CUDA_VISIBLE_DEVICES=0
+  SLURM_JOB_GPUS=0
+```
+
+Comparing the two lines separates "Slurm gave the job no GPU" from "torch could
+not use the GPU it was given".
+
+---
+
 ## 0.6 Paper-fidelity notes
 
 The implementations follow **BLT** (Pagnoni et al., 2024) and **LCM** (Barrault

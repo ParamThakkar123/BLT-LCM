@@ -15,6 +15,7 @@ import os
 from run_blt_patching import text_to_byte_tokens
 from tqdm import tqdm
 
+from device_utils import report_device
 from checkpoint_utils import (
     ResumableJsonl,
     add_resume_args,
@@ -97,7 +98,7 @@ def main():
     add_resume_args(parser, training=False)
     args = parser.parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = report_device()
     fingerprint = config_fingerprint(args, extra={"stage": "evaluate_blt_lcm"})
 
     # Load BLT loader

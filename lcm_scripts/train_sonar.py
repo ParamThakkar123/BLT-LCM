@@ -20,6 +20,7 @@ from datasets import load_dataset
 
 from sonar_module import SonarLite, text_to_byte_tokens
 from experiment_config import setup_logging
+from device_utils import report_device
 from checkpoint_utils import (
     ResumableLoader,
     TrainingCheckpointer,
@@ -102,7 +103,7 @@ def collate_fn(batch):
 
 
 def train(args):
-    device = torch.device(args.device)
+    device = report_device(args.device)
     os.makedirs(args.model_dir, exist_ok=True)
     seed_everything(args.ckpt_seed)
     fingerprint = config_fingerprint(args)

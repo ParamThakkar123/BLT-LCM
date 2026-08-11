@@ -34,6 +34,8 @@ set -a && source .env && set +a
 echo "Job started:  $(date)"
 START=$(date +%s)
 
+source "$REPO_DIR/scripts/report_gpu.sh"
+
 uv run --frozen lcm_scripts/run_metric_suite.py \
     --checkpoints_dir "lcm_models/${RUN_NAME}" \
     --checkpoint_glob "lcm_blt_best.pth" \

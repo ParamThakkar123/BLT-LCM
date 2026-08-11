@@ -20,7 +20,9 @@ import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(REPO_ROOT / "patching_scratch"))
+sys.path.append(str(REPO_ROOT / "lcm_scripts"))
 
+from device_utils import report_device  # noqa: E402
 from run_blt_patching import (  # noqa: E402
     DEFAULT_THRESHOLD,
     ByteEntropyModel,
@@ -107,7 +109,7 @@ def main() -> None:
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
-    device = torch.device(args.device)
+    device = report_device(args.device)
     model_path = REPO_ROOT / args.model
     checkpoint = torch.load(model_path, map_location=device, weights_only=False)
     if isinstance(checkpoint, ByteEntropyModel):

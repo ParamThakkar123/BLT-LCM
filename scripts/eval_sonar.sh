@@ -37,6 +37,8 @@ _cuda_lib=$(ldconfig -p 2>/dev/null | awk '/libcudart\.so\.12/{print $NF}' | hea
 echo "Job started:  $(date)"
 START=$(date +%s)
 
+source "$REPO_DIR/scripts/report_gpu.sh"
+
 apptainer exec --nv \
     --bind "$REPO_DIR:/workspace" \
     --pwd /workspace \

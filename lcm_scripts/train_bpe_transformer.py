@@ -34,6 +34,7 @@ from bhashasetu_utils import (
     load_bhashasetu_pairs,
 )
 from eval_metrics import compute_bleu, compute_chrf, compute_ter
+from device_utils import report_device
 from checkpoint_utils import (
     ResumableLoader,
     StageTracker,
@@ -316,7 +317,7 @@ def main():
         collate_fn=collate,
     )
 
-    device = torch.device(args.device)
+    device = report_device(args.device)
     model = BPETransformer(
         sp.get_piece_size(),
         args.d_model,

@@ -59,6 +59,7 @@ from blt_decoder import load_decoder
 from base_lcm import BaseLCM
 from eval_metrics import compute_all
 from bhashasetu_utils import load_bhashasetu_pairs, add_character_noise
+from device_utils import report_device
 from checkpoint_utils import (
     ResumableLoader,
     StageTracker,
@@ -131,7 +132,7 @@ def main():
     add_resume_args(parser, default_interval_steps=200)
     args = parser.parse_args()
 
-    device = torch.device(args.device)
+    device = report_device(args.device)
     fingerprint = config_fingerprint(args)
     if not args.comet_model:
         print(

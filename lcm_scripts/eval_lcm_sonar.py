@@ -40,6 +40,7 @@ from embedding_retriever import EmbeddingRetriever
 from eval_metrics import compute_bleu, compute_chrf, compute_ter
 from sonar_loader import SonarLoader
 from train_lcm_sonar import encode_docs
+from device_utils import report_device
 from checkpoint_utils import (
     StageTracker,
     add_resume_args,
@@ -102,7 +103,7 @@ def main() -> None:
     add_resume_args(p, training=False)
     args = p.parse_args()
 
-    device = torch.device(args.device)
+    device = report_device(args.device)
     fingerprint = config_fingerprint(args, extra={"stage": "eval_lcm_sonar"})
     docs = load_bhashasetu_documents(
         args.dataset,

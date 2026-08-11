@@ -34,6 +34,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.font_manager import FontProperties
 
+from device_utils import report_device
 from blt_loader import BLTLoader
 from run_blt_patching import (
     text_to_byte_tokens,
@@ -150,6 +151,8 @@ def main():
     args = ap.parse_args()
 
     # --- Neural entropy model + Indic NLP morphology ---
+    # One sentence, so CPU is the sensible default here.
+    report_device(args.device, warn_cpu=False)
     blt = BLTLoader(entropy_model_path=args.entropy_model, device=args.device)
     from lcm_scripts.indic_resources import configure_indic_resources
     from indicnlp import loader as indic_loader

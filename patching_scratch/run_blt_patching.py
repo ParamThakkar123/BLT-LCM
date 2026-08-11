@@ -34,6 +34,7 @@ from torch.utils.data import Dataset
 
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lcm_scripts"))
 
+from device_utils import report_device
 from checkpoint_utils import (  # noqa: E402
     ResumableJsonl,
     ResumableLoader,
@@ -795,6 +796,7 @@ def main():
     add_resume_args(parser, default_interval_steps=200)
 
     args = parser.parse_args()
+    report_device(args.device)
     seed_everything(args.ckpt_seed)
     fingerprint = config_fingerprint(args)
 

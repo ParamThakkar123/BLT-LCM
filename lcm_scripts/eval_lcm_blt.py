@@ -33,6 +33,7 @@ from blt_loader import BLTLoader
 from blt_decoder import load_decoder
 from embedding_retriever import EmbeddingRetriever
 from eval_metrics import compute_all
+from device_utils import report_device
 from checkpoint_utils import (
     ResumableJsonl,
     add_resume_args,
@@ -117,7 +118,7 @@ def main():
     add_resume_args(parser, training=False)
     args = parser.parse_args()
 
-    device = torch.device(args.device)
+    device = report_device(args.device)
     fingerprint = config_fingerprint(args, extra={"stage": "eval_lcm_blt"})
 
     # --- Load data ---

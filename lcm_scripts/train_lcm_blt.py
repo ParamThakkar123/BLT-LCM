@@ -29,6 +29,7 @@ from diffusion_lcm import OneTowerDiffusionLCM, TwoTowerDiffusionLCM
 from quant_lcm import QuantLCM
 from eval_metrics import compute_all
 from experiment_config import setup_logging
+from device_utils import report_device
 from checkpoint_utils import (
     ResumableLoader,
     TrainingCheckpointer,
@@ -201,7 +202,7 @@ def main():
     add_resume_args(parser, default_interval_steps=1000)
     args = parser.parse_args()
 
-    device = torch.device(args.device)
+    device = report_device(args.device)
     seed_everything(args.ckpt_seed)
     fingerprint = config_fingerprint(args)
     writer = None

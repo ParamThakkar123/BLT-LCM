@@ -12,6 +12,7 @@ from tqdm import tqdm
 from base_lcm import BaseLCM
 from data_loader import LCMDataset, collate_fn
 from blt_loader import BLTLoader
+from device_utils import report_device
 from checkpoint_utils import (
     ResumableLoader,
     TrainingCheckpointer,
@@ -23,7 +24,7 @@ from checkpoint_utils import (
 
 
 def train_base_lcm(args):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = report_device()
     seed_everything(args.ckpt_seed)
     fingerprint = config_fingerprint(args)
 

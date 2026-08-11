@@ -31,6 +31,7 @@ from bhashasetu_utils import (
     load_bhashasetu_pairs,
 )
 from eval_metrics import compute_bleu, compute_chrf, compute_ter
+from device_utils import report_device
 from checkpoint_utils import (
     StageTracker,
     add_resume_args,
@@ -135,6 +136,9 @@ def main():
     add_resume_args(p, default_interval_steps=200)
     args = p.parse_args()
 
+    # The Trainer picks the training device itself, so report once up front
+    # rather than at the generation stage half a run later.
+    report_device()
     seed_everything(args.ckpt_seed)
     fingerprint = config_fingerprint(args)
 

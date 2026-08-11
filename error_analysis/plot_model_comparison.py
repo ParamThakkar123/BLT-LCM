@@ -49,9 +49,10 @@ if not os.path.exists(DATA_PATH):
         text_to_byte_tokens, ByteEntropyModel,
         compute_entropies_for_tokens, entropy_patch_sentence, DEFAULT_THRESHOLD,
     )
+    from device_utils import report_device
 
     REPO_ROOT = os.path.join(PROJECT_ROOT, "..")
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = str(report_device())
 
     tok_aug = Tokenizer.from_file(os.path.join(REPO_ROOT, "Tokeniser_Augmented", "tokenizer.json"))
     tok_ret = Tokenizer.from_file(os.path.join(REPO_ROOT, "Tokeniser_Retrained", "tokenizer.json"))

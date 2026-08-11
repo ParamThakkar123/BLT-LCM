@@ -20,6 +20,7 @@ import torch.nn.functional as F
 sys.path.append(os.path.dirname(__file__))
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "patching_scratch"))
 
+from device_utils import report_device
 from checkpoint_utils import ResumableLoader, TrainingCheckpointer
 
 from run_blt_patching import (
@@ -577,6 +578,7 @@ if __name__ == "__main__":
     add_resume_args(parser, default_interval_steps=200)
     args = parser.parse_args()
 
+    report_device(args.device)
     seed_everything(args.ckpt_seed)
     fingerprint = config_fingerprint(args)
 

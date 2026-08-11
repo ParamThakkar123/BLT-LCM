@@ -31,6 +31,7 @@ import torch
 from tokenizers import Tokenizer
 from tqdm import tqdm
 
+from device_utils import report_device
 from checkpoint_utils import ResumableJsonl, config_fingerprint, load_model_state
 
 from run_blt_patching import (
@@ -175,8 +176,7 @@ def main():
     )
     args = parser.parse_args()
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Device: {device}")
+    device = str(report_device())
 
     # Load Phase 1 tokenizers
     print("Loading Phase 1 tokenizers...")

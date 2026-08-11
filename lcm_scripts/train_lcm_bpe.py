@@ -27,6 +27,7 @@ from torch.utils.data import Dataset
 from tqdm import tqdm
 
 from base_lcm import BaseLCM
+from device_utils import report_device
 from checkpoint_utils import (
     ResumableLoader,
     ResumePoint,
@@ -329,7 +330,7 @@ def main():
 
     os.makedirs(args.out_dir, exist_ok=True)
     run = maybe_init_wandb(args)
-    device = torch.device(args.device)
+    device = report_device(args.device)
 
     docs = load_bhashasetu_documents(
         args.dataset, args.split, args.fraction, args.max_sent_per_doc, args.text_col

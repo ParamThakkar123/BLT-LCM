@@ -24,6 +24,7 @@ from torch.utils.data import Dataset
 from tqdm import tqdm
 
 from base_lcm import BaseLCM
+from device_utils import report_device
 from checkpoint_utils import (
     ResumableLoader,
     ResumePoint,
@@ -224,7 +225,7 @@ def main():
     )
     train_docs, eval_docs = split_train_eval_documents(docs, args.eval_docs)
 
-    device = torch.device(args.device)
+    device = report_device(args.device)
     fingerprint = config_fingerprint(args)
     encoder = SonarLoader(device=str(device))
     # SONAR encoding is frozen and config-determined, so a resumed run reloads it.
