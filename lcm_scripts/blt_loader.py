@@ -18,6 +18,7 @@ Meta 2024):
 Both the entropy model's logits and its hidden states are unused downstream.
 """
 
+import numpy as np
 import torch
 import sys
 import os
@@ -31,6 +32,7 @@ from run_blt_patching import (
     DEFAULT_THRESHOLD_ADD,
     text_to_byte_tokens,
     byte_tokens_to_text,
+    compute_entropy,
     compute_entropies_for_tokens,
     entropy_patch_sentence,
 )
@@ -40,6 +42,7 @@ from blt_local_encoder import (
     DEFAULT_HASH_VOCAB,
     DEFAULT_NGRAM_SIZES,
     BLTSentenceEncoder,
+    build_patch_index,
 )
 
 
@@ -161,25 +164,155 @@ class BLTLoader:
             threshold_add=self.threshold_add,
         )
 
-    def _encode(self, tokens_batch, threshold):
+    def _boundary_mask(self, ent, lengths, threshold):
+        """Vectorised form of :func:`entropy_patch_sentence` over a padded batch.
+
+        ``ent``: [B, T] with ``ent[b, t] = H(x_{t+1} | x_{<=t})``; ``lengths``:
+        [B] real byte counts. Returns [B, T] bool, True where a patch starts.
+
+        The scalar version walks every byte in Python and forces a device sync
+        per sentence to get there. Same rule, same off-by-one handling
+        (``H(x_k) == ent[k - 1]``), no loop and no sync.
+        """
+        B, T = ent.shape
+        device = ent.device
+        starts = torch.zeros(B, T, dtype=torch.bool, device=device)
+        # BLT convention: the first two byte positions always start patches.
+        starts[:, 0] = True
+        if T > 1:
+            starts[:, 1] = True
+        if T > 2:
+            if self.patching_mode == "global":
+                starts[:, 2:] = ent[:, 1 : T - 1] > threshold
+            elif self.patching_mode == "monotonic":
+                starts[:, 2:] = (ent[:, 1 : T - 1] - ent[:, 0 : T - 2]) > self.threshold_add
+            else:
+                raise ValueError(
+                    f"unknown patching mode {self.patching_mode!r}; expected global|monotonic"
+                )
+        positions = torch.arange(T, device=device).unsqueeze(0)
+        return starts & (positions < lengths.unsqueeze(1))
+
+    @torch.no_grad()
+    def compute_patch_specs(
+        self, tokens_batch, threshold=DEFAULT_THRESHOLD, chunk_size=128
+    ):
+        """Patch ``(boundaries, patch_lengths)`` for many sequences, batched.
+
+        The entropy model is frozen and the text never changes, so these depend
+        only on ``(tokens, threshold)`` and are worth computing once and caching
+        rather than recomputing every training step. Sequences are grouped by
+        length before padding so short sentences do not ride along with long
+        ones, and the whole chunk goes through the entropy model in a single
+        forward.
+
+        Returns a list aligned with ``tokens_batch``.
+        """
+        n = len(tokens_batch)
+        specs: list = [None] * n
+        max_length = self.model.max_length
+        # Length-sorted chunks keep padding waste low; results are written back
+        # by original index so the caller's order is preserved.
+        order = sorted(range(n), key=lambda i: len(tokens_batch[i]))
+
+        for c0 in range(0, n, chunk_size):
+            idxs = order[c0 : c0 + chunk_size]
+            rows = [tokens_batch[i] for i in idxs]
+            T = max((len(r) for r in rows), default=0)
+            if T == 0:
+                for i in idxs:
+                    specs[i] = ([], [])
+                continue
+
+            padded = np.zeros((len(rows), T), dtype=np.int64)
+            for j, r in enumerate(rows):
+                if r:
+                    padded[j, : len(r)] = r
+            tokens_t = torch.from_numpy(padded).to(self.device)
+
+            if T <= max_length:
+                # The entropy model is causal, so trailing padding cannot affect
+                # the scores at any real position.
+                ent = compute_entropy(self.model(tokens_t))  # [B, T]
+            else:
+                # Longer than the model's context: fall back to the overlapping
+                # sliding-window path, which has to run row by row.
+                ent = torch.zeros(len(rows), T, device=self.device)
+                for j, r in enumerate(rows):
+                    row = torch.tensor([r], dtype=torch.long, device=self.device)
+                    ent[j, : len(r)] = compute_entropies_for_tokens(
+                        row, self.model, device=self.device
+                    )[0].to(self.device)
+
+            lengths = torch.tensor(
+                [len(r) for r in rows], dtype=torch.long, device=self.device
+            )
+            starts = self._boundary_mask(ent, lengths, threshold)
+            # One sync for the whole chunk instead of one per sentence.
+            starts_np = starts.cpu().numpy()
+            for j, i in enumerate(idxs):
+                length = len(rows[j])
+                b = np.flatnonzero(starts_np[j, :length])
+                specs[i] = (
+                    b.tolist(),
+                    np.diff(np.append(b, length)).tolist(),
+                )
+        return specs
+
+    def encode_from_specs(self, tokens_batch, patch_specs) -> torch.Tensor:
+        """Batched bytes -> concepts using precomputed patch specs.
+
+        Runs the trainable stack in the CURRENT autograd context, so gradients
+        reach it whenever it is in ``train()`` mode and grad is enabled. Returns
+        a ``[B, dim]`` tensor.
+        """
+        B = len(tokens_batch)
+        if B == 0:
+            return torch.zeros(0, self.dim, device=self.device)
+        T = max((len(t) for t in tokens_batch), default=0)
+        if T == 0:
+            return torch.zeros(B, self.dim, device=self.device)
+
+        padded = np.zeros((B, T), dtype=np.int64)
+        for j, t in enumerate(tokens_batch):
+            if t:
+                padded[j, : len(t)] = t
+        tokens_t = torch.from_numpy(padded).to(self.device)
+        index = build_patch_index(patch_specs, self.device)
+        return self.encoder.forward_batch(tokens_t, index)
+
+    def _encode(self, tokens_batch, threshold, patch_specs=None, chunk_size=256):
         """bytes -> boundaries (frozen) -> local encoder + latent transformer.
 
         Runs the trainable stack in the CURRENT autograd context, so gradients
         reach it whenever it is in ``train()`` mode and grad is enabled.
+
+        Pass ``patch_specs`` from :meth:`compute_patch_specs` to skip the frozen
+        entropy-model pass entirely — during training the boundaries are the
+        same every epoch, so recomputing them is pure waste.
+
+        Callers such as ``train_base_lcm`` hand this the whole corpus in one
+        call, so the work is split into ``chunk_size`` sentences at a time; a
+        single padded tensor over tens of thousands of sentences would not fit.
+        Chunks are formed over length-sorted input so one long sentence does not
+        pad a chunk of short ones out to its length.
         """
-        embeddings = []
-        for tokens in tokens_batch:
-            if len(tokens) == 0:
-                embeddings.append(torch.zeros(self.dim, device=self.device))
-                continue
-            boundaries, patch_lengths = self._boundaries(tokens, threshold)
-            tokens_tensor = torch.tensor(
-                [tokens], dtype=torch.long, device=self.device
+        n = len(tokens_batch)
+        if n == 0:
+            return []
+        if patch_specs is None:
+            patch_specs = self.compute_patch_specs(tokens_batch, threshold)
+
+        order = sorted(range(n), key=lambda i: len(tokens_batch[i]))
+        out: list = [None] * n
+        for c0 in range(0, n, chunk_size):
+            idxs = order[c0 : c0 + chunk_size]
+            concepts = self.encode_from_specs(
+                [tokens_batch[i] for i in idxs], [patch_specs[i] for i in idxs]
             )
-            embeddings.append(
-                self.encoder(tokens_tensor, boundaries, patch_lengths)
-            )
-        return embeddings
+            for j, i in enumerate(idxs):
+                out[i] = concepts[j]
+        return out
 
     @torch.no_grad()
     def encode_tokens_batch(self, tokens_batch, threshold=DEFAULT_THRESHOLD):
@@ -208,16 +341,32 @@ class BLTLoader:
             return torch.empty(0, self.dim, device=self.device)
         return torch.stack(embs)
 
-    def encode_sentences_differentiable(self, sentences, threshold=DEFAULT_THRESHOLD):
+    def encode_sentences_differentiable(
+        self, sentences, threshold=DEFAULT_THRESHOLD, patch_specs=None
+    ):
         """Encode sentences with gradients flowing to the trainable encoder.
 
         The entropy model stays frozen (boundaries are computed under
         ``no_grad``), but the local encoder, pooler and latent transformer run
         in-graph, so their parameters receive gradients in ``train()`` mode.
         Returns a list of ``[dim]`` concept tensors.
+
+        ``patch_specs`` skips the boundary pass; see :meth:`compute_patch_specs`.
         """
         tokens_batch = [text_to_byte_tokens(s) for s in sentences]
-        return self._encode(tokens_batch, threshold)
+        return self._encode(tokens_batch, threshold, patch_specs=patch_specs)
+
+    def encode_tokens_differentiable(
+        self, tokens_batch, threshold=DEFAULT_THRESHOLD, patch_specs=None
+    ):
+        """Like :meth:`encode_sentences_differentiable` for pre-tokenized input.
+
+        Returns a ``[B, dim]`` tensor rather than a list, since callers in the
+        training loop stack it immediately anyway.
+        """
+        if patch_specs is None:
+            patch_specs = self.compute_patch_specs(tokens_batch, threshold)
+        return self.encode_from_specs(tokens_batch, patch_specs)
 
     def save_pooler(self, path: str):
         """Persist the trainable byte-side encoder stack (self-describing).

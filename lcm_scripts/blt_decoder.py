@@ -99,7 +99,13 @@ class BLTDecoder(nn.Module):
         Args:
             embeddings: [B, embed_dim] sentence embeddings from BLT encoder.
             tgt_tokens: [B, T] target byte token ids (BOS-prefixed).
-            tgt_padding_mask: [B, T] True for padded positions.
+            tgt_padding_mask: [B, T] True for padded positions. Only needed for
+                LEFT-padded targets. With right padding it is redundant — the
+                causal mask already stops a real position from attending to the
+                padding that follows it — and passing it anyway is expensive:
+                ``nn.MultiheadAttention`` then merges the two masks into a dense
+                ``[B * n_heads, T, T]`` float tensor per layer and loses the
+                fused attention kernel. Leave it None for right-padded batches.
 
         Returns:
             logits: [B, T, vocab_size]
@@ -239,11 +245,15 @@ class DecoderDataset(torch.utils.data.Dataset):
 
 
 class SentenceReconDataset(torch.utils.data.Dataset):
-    """Holds sentences + teacher-forced byte (input, target) pairs.
+    """Holds byte tokens + teacher-forced byte (input, target) pairs.
 
     Concepts are (re)encoded on the fly during training so the pooler stays in
-    the autograd graph; we therefore keep the sentence text, not a frozen
-    embedding, alongside the byte-token supervision.
+    the autograd graph; we therefore keep the sentence's byte tokens, not a
+    frozen embedding, alongside the byte-token supervision.
+
+    Patch boundaries depend only on the (fixed) text and the frozen entropy
+    model, so they are computed once by :meth:`attach_patch_specs` and carried
+    through the loader instead of being recomputed every epoch.
     """
 
     def __init__(self, sentences: list[str], max_byte_len: int = 512):
@@ -252,23 +262,38 @@ class SentenceReconDataset(torch.utils.data.Dataset):
             tokens = text_to_byte_tokens(sent)[:max_byte_len]
             if len(tokens) == 0:
                 continue
-            self.items.append((sent, [BOS] + tokens, tokens + [EOT]))
+            self.items.append((tokens, [BOS] + tokens, tokens + [EOT]))
+        self.patch_specs: Optional[list] = None
+
+    @property
+    def token_lists(self) -> list[list[int]]:
+        return [tokens for tokens, _, _ in self.items]
+
+    def attach_patch_specs(self, specs: list):
+        """Cache one ``(boundaries, patch_lengths)`` pair per retained sentence."""
+        if len(specs) != len(self.items):
+            raise ValueError(
+                f"expected {len(self.items)} patch specs, got {len(specs)}"
+            )
+        self.patch_specs = specs
 
     def __len__(self):
         return len(self.items)
 
     def __getitem__(self, idx):
-        return self.items[idx]
+        tokens, inp, tgt = self.items[idx]
+        spec = self.patch_specs[idx] if self.patch_specs is not None else None
+        return tokens, inp, tgt, spec
 
 
 def collate_sentences(batch):
-    """Collate (sentence, input_tokens, target_tokens) tuples.
+    """Collate (byte_tokens, input_tokens, target_tokens, patch_spec) tuples.
 
-    Returns the raw sentence list (for on-the-fly encoding) plus padded input /
-    target tensors and a padding mask.
+    Returns the byte-token lists and their cached patch specs (for batched
+    on-the-fly encoding) plus padded input / target tensors and a padding mask.
     """
-    sents, inputs, targets = zip(*batch)
-    B = len(sents)
+    token_lists, inputs, targets, specs = zip(*batch)
+    B = len(token_lists)
     max_len = max(len(t) for t in inputs)
     inp_tensor = torch.full((B, max_len), PAD, dtype=torch.long)
     tgt_tensor = torch.full((B, max_len), -100, dtype=torch.long)  # -100 = ignore
@@ -278,7 +303,7 @@ def collate_sentences(batch):
         inp_tensor[i, :L] = torch.tensor(inputs[i], dtype=torch.long)
         tgt_tensor[i, :L] = torch.tensor(targets[i], dtype=torch.long)
         pad_mask[i, :L] = False
-    return list(sents), inp_tensor, tgt_tensor, pad_mask
+    return list(token_lists), inp_tensor, tgt_tensor, pad_mask, list(specs)
 
 
 def train_decoder(
@@ -301,6 +326,7 @@ def train_decoder(
     save_interval_seconds: float = 0.0,
     max_checkpoints: int = 5,
     seed: int = 42,
+    amp: bool = False,
 ):
     """Jointly train the cross-attention pooler and the byte decoder.
 
@@ -315,10 +341,26 @@ def train_decoder(
     """
     import time
 
+    amp_device = "cuda" if str(device).startswith("cuda") else "cpu"
+    if amp and amp_device != "cuda":
+        print("  [amp] no CUDA device; running in fp32")
+        amp = False
+
     # A teacher-forced sequence is [BOS] + up to max_byte_len bytes, so it must
     # fit within the decoder's position-embedding table.
     max_byte_len = min(max_byte_len, decoder.max_decode_len - 1)
     dataset = SentenceReconDataset(sentences, max_byte_len=max_byte_len)
+
+    # Patch boundaries come from the FROZEN entropy model and fixed text, so
+    # they are identical on every epoch and every step. Computing them once here
+    # takes the entropy model out of the training loop entirely.
+    t0 = time.time()
+    print(f"Precomputing patch boundaries for {len(dataset)} sentences...")
+    dataset.attach_patch_specs(
+        blt_loader.compute_patch_specs(dataset.token_lists, threshold=threshold)
+    )
+    print(f"  done in {time.time() - t0:.1f}s")
+
     loader = ResumableLoader(
         dataset,
         batch_size=batch_size,
@@ -382,23 +424,33 @@ def train_decoder(
         start = time.time()
 
         skip = rp.batches_to_skip(epoch)
-        for step, (batch_sents, inp, tgt, pad_mask) in loader.epoch(epoch, skip=skip):
-            inp = inp.to(device)
-            tgt = tgt.to(device)
-            pad_mask = pad_mask.to(device)
+        for step, (batch_tokens, inp, tgt, _pad_mask, specs) in loader.epoch(
+            epoch, skip=skip
+        ):
+            inp = inp.to(device, non_blocking=True)
+            tgt = tgt.to(device, non_blocking=True)
 
-            # Re-encode concepts in-graph so the pooler receives gradients.
-            # The byte backbone runs under no_grad inside the loader; only the
-            # pooler is trainable here.
-            concept_list = blt_loader.encode_sentences_differentiable(
-                batch_sents, threshold=threshold
-            )
-            emb = torch.stack(concept_list).to(device)  # [B, dim]
+            # Re-encode concepts in-graph so the pooler receives gradients, as a
+            # single batched forward. Boundaries were precomputed above, so the
+            # frozen entropy model never runs here.
+            # bf16 needs no GradScaler, and cross_entropy is autocast-promoted
+            # back to fp32, so the loss stays numerically well behaved.
+            with torch.autocast(
+                device_type=amp_device, dtype=torch.bfloat16, enabled=amp
+            ):
+                emb = blt_loader.encode_tokens_differentiable(
+                    batch_tokens, threshold=threshold, patch_specs=specs
+                )  # [B, dim]
 
-            logits = decoder(emb, inp, tgt_padding_mask=pad_mask)
-            loss = F.cross_entropy(
-                logits.view(-1, decoder.vocab_size), tgt.view(-1), ignore_index=-100
-            )
+                # No tgt_padding_mask: `inp` is right-padded and the decoder's
+                # mask is causal, so real positions never see the padding, and
+                # padded positions are excluded from the loss by ignore_index.
+                # Passing it would force a dense [B * heads, T, T] merged mask
+                # per layer and disable the fused attention kernel.
+                logits = decoder(emb, inp)
+                loss = F.cross_entropy(
+                    logits.view(-1, decoder.vocab_size), tgt.view(-1), ignore_index=-100
+                )
 
             optimizer.zero_grad()
             loss.backward()
@@ -531,6 +583,13 @@ if __name__ == "__main__":
     )
     parser.add_argument("--threshold", type=float, default=1.335)
     parser.add_argument(
+        "--amp",
+        action="store_true",
+        help="Run the forward/backward in bfloat16 autocast on CUDA. Roughly "
+        "halves step time on Ampere and newer at a small numerical cost; the "
+        "loss itself is still accumulated in fp32.",
+    )
+    parser.add_argument(
         "--encoder_dim", type=int, default=256, help="Local encoder byte width"
     )
     parser.add_argument("--encoder_layers", type=int, default=1)
@@ -647,6 +706,7 @@ if __name__ == "__main__":
         save_interval_seconds=args.save_interval_seconds,
         max_checkpoints=args.max_checkpoints,
         seed=args.ckpt_seed,
+        amp=args.amp,
     )
 
     print("\nTesting reconstruction on sample sentences...")

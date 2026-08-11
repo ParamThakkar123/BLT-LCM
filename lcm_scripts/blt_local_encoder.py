@@ -24,8 +24,9 @@ The entropy model stays frozen and is used solely for boundary placement; every
 module here is trainable.
 """
 
-from typing import List, Optional, Sequence
+from typing import List, NamedTuple, Optional, Sequence
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -241,6 +242,74 @@ class PatchCrossAttentionPooler(nn.Module):
         return self.out_proj(ctx)
 
 
+class PatchIndex(NamedTuple):
+    """Flat gather plan for every patch in a batch of sentences.
+
+    Patch boundaries are ragged, which is why the encoder used to run one
+    sentence at a time. Precomputing the gather as flat index tensors lets a
+    whole batch of sentences be pooled in a single cross-attention call:
+
+        owner[p]      row of the byte batch patch ``p`` belongs to
+        slot[p]       position of patch ``p`` within its own sentence
+        byte_idx[p]   byte offsets to gather for patch ``p`` (0 where padded)
+        key_mask[p]   True at the real bytes of patch ``p``
+        max_patches   longest patch sequence in the batch
+
+    ``owner``/``slot`` also scatter the pooled patches back into the padded
+    ``[B, max_patches, concept_dim]`` sequence the latent transformer consumes.
+    """
+
+    owner: torch.Tensor
+    slot: torch.Tensor
+    byte_idx: torch.Tensor
+    key_mask: torch.Tensor
+    max_patches: int
+
+
+def build_patch_index(patch_specs, device) -> PatchIndex:
+    """Build a :class:`PatchIndex` from per-sentence ``(boundaries, lengths)``.
+
+    Entirely vectorised: the per-patch work is numpy arithmetic and the result
+    reaches the GPU in four transfers, regardless of how many patches there are.
+    """
+    counts = np.array([len(b) for b, _ in patch_specs], dtype=np.int64)
+    total = int(counts.sum())
+    if total == 0:
+        empty_i = torch.zeros(0, dtype=torch.long, device=device)
+        return PatchIndex(
+            owner=empty_i,
+            slot=empty_i,
+            byte_idx=torch.zeros(0, 0, dtype=torch.long, device=device),
+            key_mask=torch.zeros(0, 0, dtype=torch.bool, device=device),
+            max_patches=0,
+        )
+
+    starts = np.concatenate(
+        [np.asarray(b, dtype=np.int64) for b, _ in patch_specs if len(b)]
+    )
+    lens = np.concatenate(
+        [np.asarray(l, dtype=np.int64) for _, l in patch_specs if len(l)]
+    )
+    owner = np.repeat(np.arange(len(counts), dtype=np.int64), counts)
+    # Position of each patch inside its own sentence: a global arange minus the
+    # start offset of the sentence that owns it.
+    offsets = np.concatenate([np.zeros(1, dtype=np.int64), np.cumsum(counts)[:-1]])
+    slot = np.arange(total, dtype=np.int64) - np.repeat(offsets, counts)
+
+    max_l = int(lens.max())
+    ar = np.arange(max_l, dtype=np.int64)[None, :]
+    key_mask = ar < lens[:, None]
+    byte_idx = np.where(key_mask, starts[:, None] + ar, 0)
+
+    return PatchIndex(
+        owner=torch.from_numpy(owner).to(device),
+        slot=torch.from_numpy(slot).to(device),
+        byte_idx=torch.from_numpy(byte_idx).to(device),
+        key_mask=torch.from_numpy(key_mask).to(device),
+        max_patches=int(counts.max()),
+    )
+
+
 def local_block_causal_mask(seq_len: int, window: int, device) -> torch.Tensor:
     """Causal mask restricted to a fixed window of preceding bytes (BLT §3.2).
 
@@ -337,18 +406,44 @@ class BLTLocalEncoder(nn.Module):
         ``tokens``: [1, T]. Returns [P, concept_dim] — the patch *sequence*,
         not a pooled sentence vector.
         """
-        hidden = self.byte_hidden(tokens)[0]  # [T, dim]
-        if not boundaries:
-            return torch.zeros(0, self.concept_dim, device=tokens.device)
-        patches = [hidden[s : s + l] for s, l in zip(boundaries, patch_lengths)]
-        max_lp = max(p.shape[0] for p in patches)
-        P = len(patches)
-        padded = torch.zeros(P, max_lp, self.dim, device=tokens.device, dtype=hidden.dtype)
-        key_mask = torch.zeros(P, max_lp, dtype=torch.bool, device=tokens.device)
-        for i, p in enumerate(patches):
-            padded[i, : p.shape[0]] = p
-            key_mask[i, : p.shape[0]] = True
-        return self.pooler(padded, key_mask)
+        reps, _ = self.forward_batch(tokens, build_patch_index(
+            [(list(boundaries), list(patch_lengths))], tokens.device
+        ))
+        return reps[0]
+
+    def forward_batch(self, tokens: torch.Tensor, index: PatchIndex):
+        """Encode a whole batch of sentences into padded patch sequences.
+
+        ``tokens``: [B, T] right-padded byte ids. Right-padding is safe because
+        the local attention mask is causal, so a real byte never attends to the
+        padding that follows it.
+
+        Returns ``(patch_reps, patch_mask)`` with shapes [B, P, concept_dim] and
+        [B, P], where P is the longest patch sequence in the batch.
+
+        Every patch cross-attends only over its own bytes, so pooling the whole
+        batch in one call is numerically identical to pooling each sentence
+        separately — it just stops leaving the GPU idle between sentences.
+        """
+        B = tokens.shape[0]
+        device = tokens.device
+        P = index.max_patches
+        if P == 0:
+            return (
+                torch.zeros(B, 0, self.concept_dim, device=device),
+                torch.zeros(B, 0, dtype=torch.bool, device=device),
+            )
+
+        hidden = self.byte_hidden(tokens)  # [B, T, dim]
+        # [total_P, max_L, dim]: one row per patch, gathered across the batch.
+        patch_hidden = hidden[index.owner.unsqueeze(1), index.byte_idx]
+        patch_reps = self.pooler(patch_hidden, index.key_mask)  # [total_P, concept_dim]
+
+        out = patch_reps.new_zeros(B, P, self.concept_dim)
+        out[index.owner, index.slot] = patch_reps
+        mask = torch.zeros(B, P, dtype=torch.bool, device=device)
+        mask[index.owner, index.slot] = True
+        return out, mask
 
 
 class BLTLatentTransformer(nn.Module):
@@ -394,7 +489,19 @@ class BLTLatentTransformer(nn.Module):
         """``patch_reps``: [P, concept_dim] -> [P, concept_dim]."""
         if patch_reps.shape[0] == 0:
             return patch_reps
-        x = self.in_proj(patch_reps).unsqueeze(0)  # [1, P, model_dim]
+        return self.forward_batch(patch_reps.unsqueeze(0))[0]
+
+    def forward_batch(self, patch_reps: torch.Tensor) -> torch.Tensor:
+        """``patch_reps``: [B, P, concept_dim] -> [B, P, concept_dim].
+
+        Shorter sentences are right-padded to P. The attention mask is causal,
+        so a real patch never attends to the padding after it and the batched
+        result matches the per-sentence one; the rows sitting on padded
+        positions are garbage and the caller masks them out when pooling.
+        """
+        if patch_reps.shape[1] == 0:
+            return patch_reps
+        x = self.in_proj(patch_reps)  # [B, P, model_dim]
         P = x.shape[1]
         pos = torch.arange(min(P, self.max_patches), device=x.device)
         if P > self.max_patches:
@@ -404,7 +511,7 @@ class BLTLatentTransformer(nn.Module):
         causal = torch.tril(torch.ones(P, P, dtype=torch.bool, device=x.device))
         for layer in self.layers:
             x = layer(x, attn_mask=causal)
-        return self.out_proj(self.norm(x))[0]
+        return self.out_proj(self.norm(x))
 
 
 class BLTSentenceEncoder(nn.Module):
@@ -451,12 +558,34 @@ class BLTSentenceEncoder(nn.Module):
         self, tokens: torch.Tensor, boundaries: List[int], patch_lengths: List[int]
     ) -> torch.Tensor:
         """Return the sentence concept vector [concept_dim]."""
-        patch_reps = self.encoder(tokens, boundaries, patch_lengths)
-        if patch_reps.shape[0] == 0:
-            return torch.zeros(self.concept_dim, device=tokens.device)
-        out = self.latent(patch_reps)
+        index = build_patch_index(
+            [(list(boundaries), list(patch_lengths))], tokens.device
+        )
+        return self.forward_batch(tokens, index)[0]
+
+    def forward_batch(self, tokens: torch.Tensor, index: PatchIndex) -> torch.Tensor:
+        """Encode a batch of right-padded sentences into concepts [B, concept_dim].
+
+        This is the path training should use: one local-encoder forward, one
+        pooling call and one latent-transformer forward for the entire batch,
+        instead of a Python loop that runs all three per sentence.
+        """
+        B = tokens.shape[0]
+        device = tokens.device
+        patch_reps, mask = self.encoder.forward_batch(tokens, index)
+        if patch_reps.shape[1] == 0:
+            return torch.zeros(B, self.concept_dim, device=device)
+
+        out = self.latent.forward_batch(patch_reps)  # [B, P, concept_dim]
+
         # Pool the contextualised patch sequence into one concept. The last
-        # position summarises the whole sentence under the causal mask; mean
-        # pooling is used alongside it for a more stable signal early in
-        # training.
-        return 0.5 * (out[-1] + out.mean(dim=0))
+        # *real* position summarises the whole sentence under the causal mask;
+        # mean pooling is used alongside it for a more stable signal early in
+        # training. Both ignore the padded patch slots.
+        m = mask.unsqueeze(-1).to(out.dtype)
+        counts = mask.sum(dim=1)  # [B]
+        mean = (out * m).sum(dim=1) / counts.clamp_min(1).unsqueeze(-1).to(out.dtype)
+        last = out[torch.arange(B, device=device), (counts - 1).clamp_min(0)]
+        concept = 0.5 * (last + mean)
+        # Sentences with no patches at all contribute a zero concept.
+        return concept * (counts > 0).unsqueeze(-1).to(out.dtype)
