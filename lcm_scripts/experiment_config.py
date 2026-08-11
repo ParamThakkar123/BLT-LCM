@@ -115,6 +115,9 @@ def new_run_dir(base: str = "runs") -> str:
 
 
 if __name__ == "__main__":
+    from device_utils import report_device
+
+    report_device()
     print(
         "experiment_config helpers: save_config/load_config/setup_logging/check_vram_safety"
     )

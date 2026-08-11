@@ -119,10 +119,10 @@ class SonarLite(nn.Module):
         self.embed_dim = embed_dim
         self.token_emb_dim = token_emb_dim
         self.max_decode_len = max_decode_len
-        self.device = (
-            device
-            if device is not None
-            else ("cuda" if torch.cuda.is_available() else "cpu")
+        from device_utils import report_device
+
+        self.device = str(
+            report_device(device, label="SonarLite", warn_cpu=False)
         )
 
         self.encoder = SimpleTransformerEncoder(
@@ -323,7 +323,8 @@ class SonarLite(nn.Module):
 
 
 if __name__ == "__main__":
-    # quick smoke test
+    # quick smoke test -- pinned to CPU, so CPU is not a fallback here.
+    # SonarLite reports the device itself on construction.
     model = SonarLite(device="cpu")
     sents = ["हॅलो, तुम्हाला कसे आहात?", "ही एक चाचणी वाक्य आहे."]
     emb = model.encode_sentences(sents)

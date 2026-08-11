@@ -19,6 +19,9 @@ if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from lcm_scripts.device_utils import report_cpu_only
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -317,6 +320,7 @@ def main():
     parser.add_argument("--num_example_sentences", type=int, default=10,
                         help="Number of example sentences for the patches table")
     args = parser.parse_args()
+    report_cpu_only("matplotlib rendering from the patched JSONL")
 
     os.makedirs(args.results_dir, exist_ok=True)
 

@@ -185,7 +185,10 @@ def main() -> None:
     p.add_argument("--fraction", type=float, default=None)
     p.add_argument("--out-csv", default="results/noisy_input_degradation_curve.csv")
     p.add_argument("--out-png", default="results/noisy_input_degradation_curve.png")
+    from device_utils import report_cpu_only
+
     args = p.parse_args()
+    report_cpu_only("CSV aggregation and matplotlib rendering")
 
     all_rows = read_metric_rows(args.inputs, metric=args.metric)
     rows = select_curve_rows(

@@ -35,6 +35,7 @@ from run_blt_patching import (
     entropy_patch_sentence,
 )
 from run_blt_patching import ByteEntropyModel
+from device_utils import report_device
 from blt_local_encoder import (
     DEFAULT_HASH_VOCAB,
     DEFAULT_NGRAM_SIZES,
@@ -64,6 +65,10 @@ class BLTLoader:
         self.device = device
         self.patching_mode = patching_mode
         self.threshold_add = threshold_add
+        if verbose:
+            # The caller usually reports its own device already; this confirms the
+            # loader was handed the same one rather than quietly defaulting.
+            report_device(device, label="BLTLoader", warn_cpu=False)
         # Resolve path relative to the repo root when not absolute
         if not os.path.isabs(entropy_model_path) and not os.path.exists(
             entropy_model_path

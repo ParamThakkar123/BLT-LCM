@@ -15,8 +15,14 @@ import sys
 import io
 import json
 import math
+import os
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from lcm_scripts.device_utils import report_cpu_only
+
+report_cpu_only("matplotlib rendering from existing result files")
 
 import matplotlib
 matplotlib.use("Agg")

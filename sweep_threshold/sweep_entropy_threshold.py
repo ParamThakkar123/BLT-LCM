@@ -31,6 +31,7 @@ from lcm_scripts.checkpoint_utils import (
 )
 
 # For morpheme boundary evaluation on a small sample
+from lcm_scripts.device_utils import report_cpu_only
 from lcm_scripts.indic_resources import configure_indic_resources
 from indicnlp import loader
 
@@ -57,6 +58,7 @@ _parser.add_argument("--out_jsonl", default="sweep_results.jsonl")
 _parser.add_argument("--out_csv", default="sweep_results.csv")
 _parser.add_argument("--out_summary", default="sweep_summary.json")
 ARGS = _parser.parse_args()
+report_cpu_only("bigram entropy model and Indic NLP morphology, both pure python")
 
 # ── Load corpus ──────────────────────────────────────────────────────────────
 

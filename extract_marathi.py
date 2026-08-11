@@ -25,6 +25,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from datasets import load_dataset
 
 from lcm_scripts.checkpoint_utils import ResumableJsonl, config_fingerprint
+from lcm_scripts.device_utils import report_cpu_only
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--dataset", default="ParamTh/BhashaSetu")
@@ -44,6 +45,7 @@ parser.add_argument(
     "configuration matches; 'never' discards it and starts over.",
 )
 args = parser.parse_args()
+report_cpu_only("dataset streaming, no model involved")
 
 fingerprint = config_fingerprint(
     {

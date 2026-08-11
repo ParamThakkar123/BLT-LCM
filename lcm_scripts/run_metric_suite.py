@@ -25,6 +25,7 @@ import subprocess
 from typing import Dict, List, Optional
 
 from eval_metrics import compute_all
+from device_utils import report_device
 from checkpoint_utils import StageTracker, add_resume_args, config_fingerprint
 
 
@@ -138,6 +139,8 @@ def main():
     )
     add_resume_args(parser, training=False)
     args = parser.parse_args()
+    # BLEU/chrF++/TER/METEOR are CPU string metrics; COMET runs a model here.
+    report_device(label="metrics", warn_cpu=False)
 
     fingerprint = config_fingerprint(args, extra={"stage": "run_metric_suite"})
     refs = read_lines(args.ref_file)

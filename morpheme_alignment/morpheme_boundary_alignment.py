@@ -34,6 +34,7 @@ from lcm_scripts.checkpoint_utils import ResumableJsonl, config_fingerprint
 
 # ── Indic NLP setup ──────────────────────────────────────────────────────────
 
+from lcm_scripts.device_utils import report_cpu_only
 from lcm_scripts.indic_resources import configure_indic_resources
 from indicnlp import loader
 
@@ -60,6 +61,7 @@ _parser.add_argument("--out_jsonl", default="morpheme_alignment_per_sentence.jso
 _parser.add_argument("--out_json", default="morpheme_alignment_results.json")
 _parser.add_argument("--out_plot", default="morpheme_f1_vs_tau.png")
 ARGS = _parser.parse_args()
+report_cpu_only("Indic NLP morphology and boundary scoring")
 
 with open(ARGS.corpus, "r", encoding="utf-8") as f:
     all_sentences = json.load(f)

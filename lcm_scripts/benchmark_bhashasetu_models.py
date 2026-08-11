@@ -16,6 +16,7 @@ from pathlib import Path
 
 sys.path.append(os.path.dirname(__file__))
 
+from device_utils import report_device
 from bhashasetu_utils import DEFAULT_FRACTIONS, DEFAULT_NOISE_LEVELS
 
 
@@ -69,6 +70,8 @@ def main():
     p.add_argument("--wandb_name", type=str, default=None)
     p.add_argument("--wandb_entity", type=str, default=os.environ.get("WANDB_ENTITY"))
     args = p.parse_args()
+    # Each sub-job reports its own device; this is the orchestrator's view.
+    report_device(args.device, label="orchestrator")
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

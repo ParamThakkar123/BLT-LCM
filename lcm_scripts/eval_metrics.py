@@ -249,4 +249,8 @@ def compute_all(
 
 
 if __name__ == "__main__":
+    from device_utils import report_device
+
     print("eval_metrics module. Use compute_all(hyps, refs)")
+    # BLEU/chrF++/TER/METEOR are CPU string metrics; COMET runs a model here.
+    report_device(label="COMET", warn_cpu=False)

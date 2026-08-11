@@ -33,6 +33,7 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from lcm_scripts.checkpoint_utils import ResumableJsonl, config_fingerprint
+from lcm_scripts.device_utils import report_device
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
 
@@ -81,6 +82,10 @@ morph_analyzer = UnsupervisedMorphAnalyzer("mr")
 # ── Stanza setup ─────────────────────────────────────────────────────────────
 
 import stanza
+
+# Stanza's POS tagger is the one neural component here and picks up a GPU on its
+# own; the Indic NLP morphology below is pure python.
+report_device(logger=logger, label="Stanza POS", warn_cpu=False)
 
 logger.info("Downloading Stanza model for Marathi (if needed)…")
 stanza.download("mr", verbose=False)

@@ -30,7 +30,10 @@ def main() -> None:
     p.add_argument("--metrics", nargs="+", default=["chrF++", "BLEU"])
     p.add_argument("--out_csv", default="results/three_way_lcm_comparison.csv")
     p.add_argument("--strict", action="store_true", help="Fail unless every noise level has all requested models")
+    from device_utils import report_cpu_only
+
     args = p.parse_args()
+    report_cpu_only("CSV aggregation")
 
     rows = [r for r in read_rows(args.inputs) if abs(float(r.get("fraction", "nan")) - args.fraction) < 1e-9]
     grouped: dict[str, dict[str, dict[str, str]]] = defaultdict(dict)

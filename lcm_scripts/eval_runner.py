@@ -17,6 +17,7 @@ from typing import List, Optional
 
 from bhashasetu_utils import add_character_noise
 from eval_metrics import compute_all
+from device_utils import report_device
 from checkpoint_utils import StageTracker, add_resume_args, config_fingerprint
 
 
@@ -107,6 +108,8 @@ if __name__ == "__main__":
     )
     add_resume_args(parser, training=False)
     args = parser.parse_args()
+    # BLEU/chrF++/TER are CPU string metrics; COMET runs a model on this device.
+    report_device(label="metrics", warn_cpu=False)
 
     with open(args.hyp_file, encoding="utf-8") as f:
         hyps = [l.strip() for l in f if l.strip()]

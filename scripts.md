@@ -112,8 +112,10 @@ runs produced, so existing `lcm_models/*.pth` artifacts keep working.
 
 ## 0.55 Which device a run is on
 
-Every script prints the device it resolved, as its first line of real output,
-before it loads a model or touches the dataset:
+**Every script in this repository reports its device**, as its first line of
+real output, before it loads a model or touches the dataset.
+
+Scripts that put tensors on a device print what they resolved:
 
 ```
 [device] cuda:0 | NVIDIA A100-SXM4-40GB | 39.4 GiB | capability 8.0 | torch 2.5.1+cu121 | CUDA 12.1
@@ -124,10 +126,39 @@ before it loads a model or touches the dataset:
 [device] WARNING: running on CPU even though a CUDA device is available -- pass --device cuda to use it.
 ```
 
-`lcm_scripts/device_utils.py` provides this (`report_device`), and each entry
-point calls it right where it resolves its device. Two cases are called out
-explicitly, because both otherwise look exactly like a healthy run until the
-run is far slower than expected:
+Scripts that do no tensor work — plotting, CSV aggregation, dataset streaming,
+the pure-python corpus scans — say so, with the reason, so the line reads as a
+fact about the script rather than a missing GPU:
+
+```
+[device] cpu | 64 cores | CPU-only: matplotlib rendering from existing result files
+[device] cpu | 64 cores | CPU-only: bigram entropy model and Indic NLP morphology, both pure python
+```
+
+These never import torch, so the report costs nothing in a script that only
+draws a figure.
+
+`lcm_scripts/device_utils.py` provides both (`report_device` and
+`report_cpu_only`), and each entry point calls one of them where it resolves
+its device. Coverage:
+
+| | |
+| --- | --- |
+| Training / evaluation / patching | `report_device(args.device)` at the top of `main()` |
+| Metric suites (`run_metric_suite.py`, `eval_runner.py`, `eval_metrics.py`) | `report_device(label="metrics")` — BLEU/chrF++/TER are CPU string metrics, COMET runs a model |
+| `fertility_audit.py` | `report_device(label="Stanza POS", logger=logger)` — Stanza's tagger is the neural part |
+| Plotting / aggregation / streaming | `report_cpu_only(reason)` |
+| `BLTLoader`, `SonarLoader`, `SonarLite` | report at construction, confirming they were handed the device the script announced |
+| `tests/` | a session fixture in `tests/conftest.py` prints once per run |
+
+The remaining files under `lcm_scripts/` (`base_lcm.py`, `diffusion_lcm.py`,
+`quant_lcm.py`, `blt_local_encoder.py`, `checkpoint_utils.py`, …) are
+importable modules with no entry point and no device of their own — they live
+on whatever device the caller moves them to, and that caller has already
+reported it.
+
+Two cases are called out explicitly, because both otherwise look exactly like a
+healthy run until the run is far slower than expected:
 
 * **CPU while a GPU is present** — usually a stale `--device cpu`.
 * **`--device cuda` where `torch.cuda.is_available()` is False** — the driver,

@@ -31,6 +31,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
     sys.path.append(REPO_ROOT)
 
+from lcm_scripts.device_utils import report_cpu_only
 from lcm_scripts.eval_metrics import compute_chrf
 
 
@@ -381,6 +382,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+    report_cpu_only("chrF++ scoring and matplotlib rendering")
     classes = DEFAULT_CLASSES + (["other"] if args.include_other else [])
 
     fertility_classes = load_fertility_summary(args.fertility_json)

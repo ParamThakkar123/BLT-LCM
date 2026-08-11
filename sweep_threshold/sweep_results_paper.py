@@ -8,6 +8,13 @@ Does NOT modify any existing files.
 
 import json
 import math
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from lcm_scripts.device_utils import report_cpu_only
+
+report_cpu_only("table formatting from existing sweep results")
 
 # ── Load data ────────────────────────────────────────────────────────────────
 

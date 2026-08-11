@@ -36,6 +36,7 @@ import csv
 import json
 import logging
 import os
+import sys
 from collections import defaultdict
 from statistics import mean, median, pstdev
 from typing import Any
@@ -46,6 +47,9 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("patch_compression")
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from lcm_scripts.device_utils import report_cpu_only
 
 import matplotlib
 
@@ -391,6 +395,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    report_cpu_only("BPE tokenization and per-class aggregation", logger=log)
     log.info("Starting patch compression analysis, output_dir=%s", args.output_dir)
     os.makedirs(args.output_dir, exist_ok=True)
 

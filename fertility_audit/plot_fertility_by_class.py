@@ -24,7 +24,12 @@ import numpy as np
 
 # ── Load results ─────────────────────────────────────────────────────────────
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from lcm_scripts.device_utils import report_cpu_only
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+report_cpu_only("matplotlib rendering from existing result files")
 with open(os.path.join(SCRIPT_DIR, "fertility_by_class.json"), "r", encoding="utf-8") as f:
     data = json.load(f)
 

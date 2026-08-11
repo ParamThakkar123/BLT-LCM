@@ -41,6 +41,7 @@ from lcm_scripts.checkpoint_utils import (
 
 # ── Indic NLP setup ──────────────────────────────────────────────────────────
 
+from lcm_scripts.device_utils import report_cpu_only
 from lcm_scripts.indic_resources import configure_indic_resources
 from indicnlp import loader
 
@@ -67,6 +68,7 @@ _parser.add_argument("--entropy_results", default="morpheme_alignment_results.js
 _parser.add_argument("--out_json", default="fixed_chunk_ablation_results.json")
 _parser.add_argument("--out_jsonl", default="fixed_chunk_ablation_per_sentence.jsonl")
 ARGS = _parser.parse_args()
+report_cpu_only("fixed-length chunking and boundary scoring")
 
 # ── Load corpus ──────────────────────────────────────────────────────────────
 

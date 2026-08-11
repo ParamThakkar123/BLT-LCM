@@ -5,6 +5,11 @@ Reads from failure_sentences_100.jsonl and category_summary.json.
 
 import json
 import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from lcm_scripts.device_utils import report_cpu_only
+
 import matplotlib.pyplot as plt
 import matplotlib
 import numpy as np
@@ -13,6 +18,8 @@ matplotlib.rcParams["font.size"] = 11
 matplotlib.rcParams["figure.dpi"] = 150
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+report_cpu_only("matplotlib rendering from existing result files")
 
 with open(os.path.join(SCRIPT_DIR, "failure_sentences_100.jsonl"), "r", encoding="utf-8") as f:
     failures = [json.loads(line) for line in f if line.strip()]

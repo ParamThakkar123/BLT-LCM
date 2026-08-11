@@ -27,7 +27,9 @@ class SonarLoader:
         batch_size: int = 8,
         decoder_card: str = SONAR_DECODER_CARD,
     ):
-        self.device = torch.device(device)
+        from device_utils import report_device
+
+        self.device = report_device(device, label="SonarLoader", warn_cpu=False)
         self.encoder_card = encoder_card
         self.decoder_card = decoder_card
         self.batch_size = batch_size
