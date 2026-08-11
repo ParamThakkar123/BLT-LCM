@@ -62,6 +62,7 @@ test = [
 # splits nobody uses (e.g. emscripten). Add a marker here before running on a
 # new platform -- macOS in particular is NOT covered.
 [tool.uv]
+index-strategy = "unsafe-best-match"
 environments = [
     "sys_platform == 'linux'",
     "sys_platform == 'win32'",

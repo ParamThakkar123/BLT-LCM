@@ -108,6 +108,25 @@ uv pip install -e ".[test]"
 pytest tests/
 ```
 
+## Notebooks
+
+`notebooks/` has one Jupyter notebook per task and per script in this
+repository — setup, entropy patching, BLT-LCM, every baseline, the analyses and
+figures, Slurm submission, and guided tours of the importable modules. Each one
+wraps its script's real CLI flags in an editable parameter cell, runs it with
+live streaming output, and renders whatever it produced.
+
+```bash
+uv pip install jupyterlab ipykernel pandas   # pandas is optional
+uv run jupyter lab
+```
+
+Start at [`notebooks/00_setup/00_environment_check.ipynb`](notebooks/00_setup/00_environment_check.ipynb);
+[`notebooks/README.md`](notebooks/README.md) is the full index. The notebooks
+are wrappers, not a fork of the pipeline — they invoke the same scripts
+documented in [`scripts.md`](scripts.md) with the same flags, so a command
+previewed in a notebook can be pasted into a submission script unchanged.
+
 
 ## Tokenization and Statistics
 
