@@ -164,16 +164,35 @@ def test_batch_rows_do_not_leak_into_each_other(entropy_model, sentence_entropie
 
 
 def test_long_sequences_keep_left_context(entropy_model):
-    """Positions beyond the first window must still be scored with real context."""
+    """Positions beyond the first window must still be scored with real context.
+
+    The contract is a *lower* bound: every scored position keeps at least
+    ``context_overlap`` (= max_length // 2) bytes of real left context. It is
+    not an exact amount — a window scores ``max_length - context_overlap``
+    positions, so context grows from the bound to the full window across them.
+    Asserting an exact w // 2 would pin the window schedule to advancing one
+    byte at a time, which costs a forward pass per byte.
+    """
     toks = [(i % 200) + OFFSET for i in range(1100)]
     full = compute_entropies_for_tokens(
         torch.tensor([toks]), entropy_model, device="cpu"
     )[0]
     assert full.shape[0] == 1100
     w = entropy_model.max_length
-    probe = torch.tensor([toks[600 - w // 2 : 601]])
-    ref = compute_entropies_for_tokens(probe, entropy_model, device="cpu")[0][-1]
-    assert torch.allclose(full[600], ref, atol=1e-4)
+    for pos in (600, 1099):
+        # Find how much left context actually produced this position's score.
+        matched = None
+        for ctx in range(min(pos, w - 1), 0, -1):
+            probe = torch.tensor([toks[pos - ctx : pos + 1]])
+            ref = compute_entropies_for_tokens(probe, entropy_model, device="cpu")[0][-1]
+            if torch.allclose(full[pos], ref, atol=1e-6):
+                matched = ctx
+                break
+        assert matched is not None, f"position {pos} matched no windowing of the prefix"
+        assert matched >= w // 2, (
+            f"position {pos} was scored with only {matched} bytes of left "
+            f"context, below the {w // 2} the windowing promises"
+        )
 
 
 def test_sliding_window_mask_shape():

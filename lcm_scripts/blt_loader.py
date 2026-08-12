@@ -45,6 +45,39 @@ from blt_local_encoder import (
     build_patch_index,
 )
 
+# Padded bytes (batch x padded length) per forward. Batching by *sentence count*
+# makes the real cost depend on the longest sentence that happens to land in the
+# batch -- one 1,600-byte sentence among 256 short ones pads every row out to
+# 1,600 and the encoder pays for ~8x the bytes that exist. Batching by padded
+# byte count instead keeps every forward the same size regardless of the length
+# distribution, which is what makes the footprint predictable.
+DEFAULT_TOKEN_BUDGET = 131_072
+# A ceiling on rows per forward as well, so a batch of very short sentences does
+# not turn into tens of thousands of rows of per-sentence overhead.
+DEFAULT_MAX_ROWS = 1024
+
+
+def _budgeted_chunks(order, lengths, token_budget, max_rows):
+    """Group length-sorted indices into chunks under a padded-token budget.
+
+    ``order`` must be sorted by ascending length, so the padded width of a chunk
+    is the length of its last member and the running cost is exact.
+    """
+    chunk: list = []
+    width = 0
+    for i in order:
+        cand_width = max(width, lengths[i])
+        if chunk and (
+            (len(chunk) + 1) * cand_width > token_budget or len(chunk) >= max_rows
+        ):
+            yield chunk
+            chunk, width = [i], lengths[i]
+        else:
+            chunk.append(i)
+            width = cand_width
+    if chunk:
+        yield chunk
+
 
 class BLTLoader:
     def __init__(
@@ -194,8 +227,96 @@ class BLTLoader:
         return starts & (positions < lengths.unsqueeze(1))
 
     @torch.no_grad()
+    def _windowed_entropies(self, tokens_t, lengths, token_budget):
+        """Entropies for rows longer than the entropy model's context, batched.
+
+        Same overlapping-window scheme as
+        :func:`compute_entropies_for_tokens` -- every scored position keeps
+        ``max_length // 2`` bytes of real left context, and where two windows
+        overlap the later one's scores win -- but every window in the chunk is
+        cut once and pushed through the model in batched forwards. The scalar
+        version runs one batch-of-one forward per window and copies each result
+        to the host, so it pays a device sync per window and leaves the GPU
+        idle between them.
+
+        ``tokens_t``: [B, T] padded ids. Returns [B, T] on the same device.
+        """
+        B, T = tokens_t.shape
+        max_length = self.model.max_length
+        overlap = max_length // 2
+
+        # (row, win_start, win_end, dest_start, dest_end); destinations are
+        # trimmed to be disjoint, which reproduces the scalar version's
+        # "later window overwrites the overlap" ordering without duplicate
+        # writes into the output.
+        plan: list = []
+        for b, seq_len in enumerate(lengths):
+            windows = []
+            start = 0
+            while start < seq_len:
+                win_start = max(0, start - overlap) if start > 0 else 0
+                win_end = min(seq_len, win_start + max_length)
+                windows.append((win_start, win_end, start))
+                if win_end >= seq_len:
+                    break
+                # Each window scores `stride` new positions; see the matching
+                # note in compute_entropies_for_tokens.
+                start = win_end
+            for j, (win_start, win_end, dest_start) in enumerate(windows):
+                dest_end = (
+                    win_end
+                    if j + 1 == len(windows)
+                    else min(win_end, windows[j + 1][2])
+                )
+                if dest_end > dest_start:
+                    plan.append((b, win_start, win_end, dest_start, dest_end))
+
+        ent = torch.zeros(B, T, device=self.device)
+        if not plan:
+            return ent
+
+        arr = np.asarray(plan, dtype=np.int64)
+        rows, win_starts, win_ends, dest_starts, dest_ends = arr.T
+        n = len(plan)
+
+        # Cut every window out of the padded batch in one gather. The entropy
+        # model is causal, so the zero padding after a short window cannot
+        # affect the scores at its real positions.
+        ar = np.arange(max_length, dtype=np.int64)[None, :]
+        win_lens = (win_ends - win_starts)[:, None]
+        gather = np.where(ar < win_lens, win_starts[:, None] + ar, 0)
+        windows_t = tokens_t[
+            torch.from_numpy(rows).to(self.device).unsqueeze(1),
+            torch.from_numpy(gather).to(self.device),
+        ]
+
+        sub = max(1, token_budget // max_length)
+        scores = torch.empty(n, max_length, device=self.device)
+        for s0 in range(0, n, sub):
+            scores[s0 : s0 + sub] = compute_entropy(self.model(windows_t[s0 : s0 + sub]))
+
+        # Scatter each window's kept span back into its row, in one write.
+        counts = dest_ends - dest_starts
+        offsets = np.cumsum(counts) - counts
+        within = np.arange(int(counts.sum()), dtype=np.int64) - np.repeat(offsets, counts)
+        dest_flat = np.repeat(rows * T + dest_starts, counts) + within
+        src_flat = (
+            np.repeat(np.arange(n, dtype=np.int64) * max_length, counts)
+            + np.repeat(dest_starts - win_starts, counts)
+            + within
+        )
+        ent.view(-1)[torch.from_numpy(dest_flat).to(self.device)] = scores.view(-1)[
+            torch.from_numpy(src_flat).to(self.device)
+        ]
+        return ent
+
+    @torch.no_grad()
     def compute_patch_specs(
-        self, tokens_batch, threshold=DEFAULT_THRESHOLD, chunk_size=128
+        self,
+        tokens_batch,
+        threshold=DEFAULT_THRESHOLD,
+        token_budget=DEFAULT_TOKEN_BUDGET,
+        max_rows=DEFAULT_MAX_ROWS,
     ):
         """Patch ``(boundaries, patch_lengths)`` for many sequences, batched.
 
@@ -213,10 +334,10 @@ class BLTLoader:
         max_length = self.model.max_length
         # Length-sorted chunks keep padding waste low; results are written back
         # by original index so the caller's order is preserved.
-        order = sorted(range(n), key=lambda i: len(tokens_batch[i]))
+        sizes = [len(t) for t in tokens_batch]
+        order = sorted(range(n), key=lambda i: sizes[i])
 
-        for c0 in range(0, n, chunk_size):
-            idxs = order[c0 : c0 + chunk_size]
+        for idxs in _budgeted_chunks(order, sizes, token_budget, max_rows):
             rows = [tokens_batch[i] for i in idxs]
             T = max((len(r) for r in rows), default=0)
             if T == 0:
@@ -235,14 +356,11 @@ class BLTLoader:
                 # the scores at any real position.
                 ent = compute_entropy(self.model(tokens_t))  # [B, T]
             else:
-                # Longer than the model's context: fall back to the overlapping
-                # sliding-window path, which has to run row by row.
-                ent = torch.zeros(len(rows), T, device=self.device)
-                for j, r in enumerate(rows):
-                    row = torch.tensor([r], dtype=torch.long, device=self.device)
-                    ent[j, : len(r)] = compute_entropies_for_tokens(
-                        row, self.model, device=self.device
-                    )[0].to(self.device)
+                # Longer than the model's context: overlapping sliding windows,
+                # cut for the whole chunk at once.
+                ent = self._windowed_entropies(
+                    tokens_t, [len(r) for r in rows], token_budget
+                )
 
             lengths = torch.tensor(
                 [len(r) for r in rows], dtype=torch.long, device=self.device
@@ -281,7 +399,15 @@ class BLTLoader:
         index = build_patch_index(patch_specs, self.device)
         return self.encoder.forward_batch(tokens_t, index)
 
-    def _encode(self, tokens_batch, threshold, patch_specs=None, chunk_size=256):
+    def encode_to_tensor(
+        self,
+        tokens_batch,
+        threshold=DEFAULT_THRESHOLD,
+        patch_specs=None,
+        token_budget=DEFAULT_TOKEN_BUDGET,
+        max_rows=DEFAULT_MAX_ROWS,
+        show_progress=False,
+    ) -> torch.Tensor:
         """bytes -> boundaries (frozen) -> local encoder + latent transformer.
 
         Runs the trainable stack in the CURRENT autograd context, so gradients
@@ -292,35 +418,72 @@ class BLTLoader:
         same every epoch, so recomputing them is pure waste.
 
         Callers such as ``train_base_lcm`` hand this the whole corpus in one
-        call, so the work is split into ``chunk_size`` sentences at a time; a
-        single padded tensor over tens of thousands of sentences would not fit.
-        Chunks are formed over length-sorted input so one long sentence does not
-        pad a chunk of short ones out to its length.
+        call, so the work is split into forwards of at most ``token_budget``
+        padded bytes; a single padded tensor over tens of thousands of sentences
+        would not fit. Chunks are formed over length-sorted input so one long
+        sentence does not pad a chunk of short ones out to its length — which
+        means the caller should pass the WHOLE corpus rather than pre-slicing it
+        into fixed batches, since a pre-sliced batch can only be sorted within
+        itself and still pays for its own longest member.
+
+        Returns ``[n, dim]`` in the caller's original order.
         """
         n = len(tokens_batch)
         if n == 0:
-            return []
+            return torch.zeros(0, self.dim, device=self.device)
         if patch_specs is None:
-            patch_specs = self.compute_patch_specs(tokens_batch, threshold)
+            patch_specs = self.compute_patch_specs(
+                tokens_batch, threshold, token_budget=token_budget, max_rows=max_rows
+            )
 
-        order = sorted(range(n), key=lambda i: len(tokens_batch[i]))
-        out: list = [None] * n
-        for c0 in range(0, n, chunk_size):
-            idxs = order[c0 : c0 + chunk_size]
+        sizes = [len(t) for t in tokens_batch]
+        order = sorted(range(n), key=lambda i: sizes[i])
+        chunks = list(_budgeted_chunks(order, sizes, token_budget, max_rows))
+        if show_progress:
+            from tqdm import tqdm
+
+            chunks = tqdm(chunks, desc="encoding batches")
+
+        out = None
+        for idxs in chunks:
             concepts = self.encode_from_specs(
                 [tokens_batch[i] for i in idxs], [patch_specs[i] for i in idxs]
             )
-            for j, i in enumerate(idxs):
-                out[i] = concepts[j]
-        return out
+            if out is None:
+                out = concepts.new_zeros(n, concepts.shape[-1])
+            out[torch.as_tensor(idxs, device=concepts.device)] = concepts
+        return out if out is not None else torch.zeros(n, self.dim, device=self.device)
+
+    def _encode(self, tokens_batch, threshold, patch_specs=None, **kwargs):
+        """List-returning form of :meth:`encode_to_tensor`, for existing callers."""
+        if not tokens_batch:
+            return []
+        return list(
+            self.encode_to_tensor(
+                tokens_batch, threshold, patch_specs=patch_specs, **kwargs
+            ).unbind(0)
+        )
 
     @torch.no_grad()
-    def encode_tokens_batch(self, tokens_batch, threshold=DEFAULT_THRESHOLD):
+    def encode_tokens_batch(self, tokens_batch, threshold=DEFAULT_THRESHOLD, **kwargs):
         """Encode tokenized sentences to BLT concept embeddings (inference).
 
-        Returns a list of ``[dim]`` tensors. No gradients.
+        Returns a list of ``[dim]`` tensors. No gradients. Extra keyword
+        arguments go to :meth:`encode_to_tensor` (``token_budget``,
+        ``max_rows``, ``show_progress``).
         """
-        return self._encode(tokens_batch, threshold)
+        return self._encode(tokens_batch, threshold, **kwargs)
+
+    @torch.no_grad()
+    def encode_tokens_to_tensor(
+        self, tokens_batch, threshold=DEFAULT_THRESHOLD, **kwargs
+    ) -> torch.Tensor:
+        """:meth:`encode_tokens_batch` returning a single ``[n, dim]`` tensor.
+
+        Preferred when the caller is going to stack or move the result anyway:
+        one device transfer instead of one per sentence.
+        """
+        return self.encode_to_tensor(tokens_batch, threshold, **kwargs)
 
     def encode_sentences_batch(self, sentences, threshold=DEFAULT_THRESHOLD):
         """Encode raw text sentences to BLT concept embeddings (inference).

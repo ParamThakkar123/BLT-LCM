@@ -291,7 +291,6 @@ def compute_entropies_for_tokens(
     if context_overlap is None:
         context_overlap = max_length // 2
     context_overlap = max(0, min(context_overlap, max_length - 1))
-    stride = max_length - context_overlap
 
     rows = []
     for row in tokens_2d:
@@ -310,7 +309,18 @@ def compute_entropies_for_tokens(
             ent[start:win_end] = scores[keep_from:]
             if win_end >= seq_len:
                 break
-            start = win_start + stride if win_start + stride > start else start + 1
+            # Everything up to win_end is now scored, so the next window starts
+            # there and reaches back ``context_overlap`` bytes for its context;
+            # each window therefore contributes ``stride`` new positions.
+            #
+            # This used to read `win_start + stride if win_start + stride >
+            # start else start + 1`. With the default overlap of max_length // 2,
+            # win_start is start - overlap and stride is max_length - overlap, so
+            # win_start + stride == start exactly -- never greater. The guard
+            # fired every time and the window crawled forward ONE BYTE per
+            # iteration, running a full max_length forward pass per byte: ~600
+            # forwards for an 850-byte sequence instead of 3.
+            start = win_end
         rows.append(ent)
     return torch.stack(rows).reshape(tokens_2d.shape)
 

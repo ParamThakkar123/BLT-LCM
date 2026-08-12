@@ -52,6 +52,11 @@ PAPER_HASH_VOCAB = 500_000
 DEFAULT_NGRAM_SIZES = (3, 4, 5)
 DEFAULT_HASH_VOCAB = 100_000
 
+# Elements per intermediate tensor in the patch pooler (~256 MiB at fp32). The
+# pooler holds a handful of tensors this size at once; patches are independent,
+# so exceeding the budget costs an extra loop iteration, never accuracy.
+_POOL_ELEM_BUDGET = 1 << 26
+
 
 def hash_embedding_bytes(
     dim: int,
@@ -338,11 +343,47 @@ class _TransformerLayer(nn.Module):
         self.w3 = nn.Linear(dim, hidden, bias=False)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None):
+    def _attend(self, h, attn_mask, is_causal):
+        """Self-attention through SDPA, reusing ``self.attn``'s parameters.
+
+        ``nn.MultiheadAttention`` cannot be called with an explicit mask without
+        broadcasting it to ``[B * n_heads, T, T]`` and taking the unfused path,
+        so a batch of long byte sequences materialises a tensor quadratic in T
+        *and* linear in the batch -- 21 GiB at B=256, T=1600, 8 heads. Driving
+        SDPA directly lets a plain causal mask stay implicit (flash / memory
+        efficient backends, no T x T tensor at all), and keeps an explicit mask
+        broadcast at [1, 1, T, T] instead of one copy per sequence and head.
+
+        The projections are ``self.attn``'s own weights, so this is the same
+        function it computes and existing checkpoints still load.
+        """
+        B, T, D = h.shape
+        n_heads = self.attn.num_heads
+        head_dim = D // n_heads
+        qkv = F.linear(h, self.attn.in_proj_weight, self.attn.in_proj_bias)
+        # in_proj packs [q; k; v] along the output dim, each of width D.
+        q, k, v = qkv.view(B, T, 3, n_heads, head_dim).permute(2, 0, 3, 1, 4)
+        out = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            dropout_p=self.attn.dropout if self.training else 0.0,
+            is_causal=is_causal,
+        )
+        return self.attn.out_proj(out.transpose(1, 2).reshape(B, T, D))
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+        is_causal: bool = False,
+    ):
+        """``attn_mask``: bool, True where attention is allowed (SDPA's own
+        convention, and the one :func:`local_block_causal_mask` produces).
+        ``is_causal=True`` applies a plain causal mask without building one."""
         h = self.attn_norm(x)
-        # nn.MultiheadAttention takes True = "not allowed to attend".
-        mask = ~attn_mask if attn_mask is not None else None
-        a, _ = self.attn(h, h, h, attn_mask=mask, need_weights=False)
+        a = self._attend(h, attn_mask, is_causal)
         x = x + self.dropout(a)
         h = self.ffn_norm(x)
         return x + self.dropout(self.w2(F.silu(self.w1(h)) * self.w3(h)))
@@ -387,15 +428,38 @@ class BLTLocalEncoder(nn.Module):
         )
         self.norm = nn.LayerNorm(dim)
         self.pooler = PatchCrossAttentionPooler(dim, concept_dim=concept_dim, n_heads=n_heads)
+        # Not a buffer: masks are derived from shape alone and must not travel
+        # in the state dict.
+        self._mask_cache: dict = {}
+
+    def _local_mask(self, seq_len: int, device) -> torch.Tensor:
+        """Cached banded mask. Rebuilding it per layer per batch is pure waste."""
+        key = (seq_len, str(device))
+        cached = self._mask_cache.get(key)
+        if cached is None:
+            cached = local_block_causal_mask(seq_len, self.window, device)
+            # A [1, 1, T, T] view broadcasts across batch and heads inside SDPA.
+            cached = cached.view(1, 1, seq_len, seq_len)
+            self._mask_cache = {key: cached}  # only the current shape is useful
+        return cached
 
     def byte_hidden(self, tokens: torch.Tensor) -> torch.Tensor:
         """``tokens``: [B, T] -> contextual byte hidden states [B, T, dim]."""
         x = self.byte_emb(tokens)
         if self.hash_ngrams is not None:
             x = self.hash_ngrams(tokens, x)
-        mask = local_block_causal_mask(tokens.shape[1], self.window, tokens.device)
-        for layer in self.layers:
-            x = layer(x, attn_mask=mask)
+        seq_len = tokens.shape[1]
+        # When the whole sequence fits in one window the banded mask *is* the
+        # plain causal mask, so SDPA can apply it implicitly and never build a
+        # T x T tensor. Batches are length-bucketed upstream, so this is the
+        # path nearly every batch takes.
+        if seq_len <= self.window:
+            for layer in self.layers:
+                x = layer(x, is_causal=True)
+        else:
+            mask = self._local_mask(seq_len, tokens.device)
+            for layer in self.layers:
+                x = layer(x, attn_mask=mask)
         return self.norm(x)
 
     def forward(
@@ -436,8 +500,23 @@ class BLTLocalEncoder(nn.Module):
 
         hidden = self.byte_hidden(tokens)  # [B, T, dim]
         # [total_P, max_L, dim]: one row per patch, gathered across the batch.
-        patch_hidden = hidden[index.owner.unsqueeze(1), index.byte_idx]
-        patch_reps = self.pooler(patch_hidden, index.key_mask)  # [total_P, concept_dim]
+        # Every patch is padded to the longest patch anywhere in the batch, so a
+        # single low-entropy stretch inflates the gather for all of them; the
+        # projections inside the pooler then hold several copies of it. Patches
+        # pool independently, so slicing the patch axis is exact and caps the
+        # gather at a fixed footprint instead of one set by the worst patch.
+        total_p, max_l = index.byte_idx.shape
+        step = max(1, _POOL_ELEM_BUDGET // max(1, max_l * self.dim))
+        if step >= total_p:
+            patch_hidden = hidden[index.owner.unsqueeze(1), index.byte_idx]
+            patch_reps = self.pooler(patch_hidden, index.key_mask)
+        else:
+            chunks = []
+            for p0 in range(0, total_p, step):
+                owner = index.owner[p0 : p0 + step].unsqueeze(1)
+                patch_hidden = hidden[owner, index.byte_idx[p0 : p0 + step]]
+                chunks.append(self.pooler(patch_hidden, index.key_mask[p0 : p0 + step]))
+            patch_reps = torch.cat(chunks, dim=0)  # [total_P, concept_dim]
 
         out = patch_reps.new_zeros(B, P, self.concept_dim)
         out[index.owner, index.slot] = patch_reps
@@ -508,9 +587,10 @@ class BLTLatentTransformer(nn.Module):
             # Clamp rather than crash on unusually long sentences.
             pos = torch.cat([pos, pos[-1].repeat(P - self.max_patches)])
         x = x + self.pos_emb(pos).unsqueeze(0)
-        causal = torch.tril(torch.ones(P, P, dtype=torch.bool, device=x.device))
+        # Plain causal: let SDPA apply it implicitly rather than allocating a
+        # P x P mask that then gets broadcast per sequence and head.
         for layer in self.layers:
-            x = layer(x, attn_mask=causal)
+            x = layer(x, is_causal=True)
         return self.out_proj(self.norm(x))
 
 

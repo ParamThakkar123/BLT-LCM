@@ -240,23 +240,22 @@ def main():
                 flat_sents.append(sent)
                 doc_indices.append(i)
         print(f"Encoding {len(flat_sents)} sentences from {len(docs)} documents")
-        embed_list = []
-        batch_size = 256  # Increased from 64 to 256 for faster processing
-        for i in tqdm(range(0, len(flat_sents), batch_size), desc="encoding batches"):
-            batch = flat_sents[i : i + batch_size]
-            tokenized_batch = [text_to_byte_tokens(sent) for sent in batch]
-            emb_batch = blt.encode_tokens_batch(tokenized_batch)
-            embed_list.extend([e.cpu() for e in emb_batch])
+        tokenized = [text_to_byte_tokens(sent) for sent in flat_sents]
+        # The whole corpus goes in at once so the loader can length-sort across
+        # all of it and size each forward by padded byte count. Slicing into
+        # fixed-size batches here would cap sorting at one slice, and every
+        # slice would be padded out to its own longest sentence.
+        embeds = blt.encode_tokens_to_tensor(tokenized, show_progress=True).cpu()
 
         # Reconstruct per-document sequences
         seqs = [[] for _ in range(len(docs))]
-        for emb, didx in zip(embed_list, doc_indices):
-            seqs[didx].append(emb)
+        for row, didx in enumerate(doc_indices):
+            seqs[didx].append(embeds[row])
 
         # stack per-document tensors
         for i in range(len(seqs)):
             if len(seqs[i]) == 0:
-                seqs[i] = torch.empty((0, blt.model.dim))
+                seqs[i] = torch.empty((0, blt.dim))
             else:
                 seqs[i] = torch.stack(seqs[i], dim=0)
 
