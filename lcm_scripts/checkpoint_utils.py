@@ -36,7 +36,9 @@ import hashlib
 import json
 import os
 import random
+import re
 import shutil
+import sys
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Iterator, Optional, Sequence
@@ -580,6 +582,45 @@ def iter_epoch(loader, skip: int = 0) -> Iterator[tuple[int, Any]]:
         yield i, batch
 
 
+def default_loader_kwargs() -> dict:
+    """Sensible DataLoader defaults for this repo's collate functions.
+
+    Every collate function here builds per-item tensors from Python lists, so
+    with the previous ``num_workers=0`` default that work ran in the training
+    process, serialized against the GPU step. Overlapping it with a couple of
+    workers is close to free on Linux.
+
+    Windows has no ``fork``, so each worker re-imports torch and re-pickles the
+    dataset; for the small in-memory datasets here that setup cost outweighs
+    the overlap, and workers stay off. ``CPU_COUNT``-aware so a single-core
+    allocation does not oversubscribe itself.
+    """
+    if torch is None:  # pragma: no cover
+        return {}
+    override = os.environ.get("BLT_LCM_NUM_WORKERS")
+    if override is not None:
+        try:
+            workers = max(0, int(override))
+        except ValueError:
+            workers = 0
+    elif sys.platform == "win32":
+        workers = 0
+    else:
+        workers = min(4, max(0, (os.cpu_count() or 1) - 1))
+
+    kwargs: dict = {
+        "num_workers": workers,
+        "pin_memory": torch.cuda.is_available(),
+    }
+    if workers > 0:
+        # Deliberately NOT persistent_workers: ResumableLoader builds a fresh
+        # DataLoader per epoch for reproducible ordering, so persistent workers
+        # would be kept alive by a loader nobody iterates again -- a process
+        # leak per epoch rather than a saving.
+        kwargs["prefetch_factor"] = 2
+    return kwargs
+
+
 class ResumableLoader:
     """DataLoader factory whose batch order depends only on ``(seed, epoch)``.
 
@@ -603,7 +644,7 @@ class ResumableLoader:
         self.seed = seed
         self.shuffle = shuffle
         self.collate_fn = collate_fn
-        self.loader_kwargs = loader_kwargs
+        self.loader_kwargs = {**default_loader_kwargs(), **loader_kwargs}
 
     def __len__(self) -> int:
         n = len(self.dataset)
@@ -649,7 +690,18 @@ class ResumableJsonl:
     Records land on disk as they are produced, and the trailing partial line
     that a hard kill can leave behind is dropped during replay, so the file is
     always valid JSONL.
+
+    Nothing that has been written is kept in memory. Replay pulls only the
+    resume key out of each existing row and repairs a torn tail by truncating
+    it, so reopening a multi-gigabyte output costs one line of memory and no
+    rewrite. Use :meth:`iter_records` to stream the rows back;
+    :meth:`all_records` materialises them and is only appropriate for outputs
+    that comfortably fit in memory.
     """
+
+    # Rows to cross-check the key-extraction fast path against a real JSON
+    # parse before trusting it for the rest of the file.
+    _FASTPATH_PROOF_ROWS = 64
 
     def __init__(
         self,
@@ -666,14 +718,13 @@ class ResumableJsonl:
         self.flush_every = max(1, int(flush_every))
         self.verbose = verbose
         self.done: set[int] = set()
-        self.records: list[dict] = []
         self._since_flush = 0
+        self._closed = False
         _ensure_parent(path)
 
         reuse = resume and os.path.exists(path) and self._fingerprint_matches()
         if reuse:
-            self.records = self._replay()
-            self.done = {int(r[key]) for r in self.records if key in r}
+            self.done = self._replay()
             if verbose and self.done:
                 print(f"[resume] {path}: {len(self.done)} records already written")
         elif os.path.exists(path):
@@ -707,27 +758,80 @@ class ResumableJsonl:
 
     # -- replay ------------------------------------------------------------ #
 
-    def _replay(self) -> list[dict]:
-        """Read back complete rows, discarding a truncated final line."""
-        rows: list[dict] = []
-        with open(self.path, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rows.append(json.loads(line))
-                except json.JSONDecodeError:
-                    # Only the last line can be torn; anything earlier means the
-                    # file is not ours to resume.
+    def _scan(self, fast: bool) -> tuple[set[int], int, bool]:
+        """One pass over the existing file.
+
+        Returns ``(done indices, bytes of complete rows, fast path held)``. With
+        ``fast=True`` the resume key is lifted straight out of the raw line by
+        regex, which avoids building a dict per row; the first
+        ``_FASTPATH_PROOF_ROWS`` are still parsed properly and compared, so a
+        file where that key also occurs nested (and the regex could read the
+        wrong number) demotes itself to full parsing instead of resuming from a
+        bogus index.
+        """
+        pattern = re.compile(
+            rb'"' + re.escape(self.key.encode("utf-8")) + rb'"\s*:\s*(-?\d+)'
+        )
+        done: set[int] = set()
+        offset = 0
+        proved = 0
+
+        with open(self.path, "rb") as f:
+            for raw in f:
+                if not raw.endswith(b"\n"):
+                    # A hard kill mid-write: only the final line can be torn.
                     if self.verbose:
                         print(f"[resume] {self.path}: dropped incomplete trailing row")
                     break
-        # Rewrite without the torn line so future appends stay parseable.
-        atomic_write_text(
-            "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows), self.path
-        )
-        return rows
+                stripped = raw.strip()
+                if not stripped:
+                    offset += len(raw)
+                    continue
+
+                match = pattern.search(stripped) if fast else None
+                if match is not None and proved >= self._FASTPATH_PROOF_ROWS:
+                    done.add(int(match.group(1)))
+                    offset += len(raw)
+                    continue
+
+                try:
+                    row = json.loads(stripped)
+                except json.JSONDecodeError:
+                    if self.verbose:
+                        print(f"[resume] {self.path}: dropped incomplete trailing row")
+                    break
+
+                index = row.get(self.key)
+                if fast and match is not None:
+                    if index is None or int(match.group(1)) != int(index):
+                        return done, offset, False  # caller rescans without it
+                    proved += 1
+                if index is not None:
+                    done.add(int(index))
+                offset += len(raw)
+
+        return done, offset, True
+
+    def _replay(self) -> set[int]:
+        """Learn which indices are already written, repairing a torn tail.
+
+        Only the resume key is retained. The file is left exactly as it is
+        unless its final line was torn, in which case it is truncated to the
+        last complete row -- rewriting a multi-gigabyte output on every resume
+        just to drop one bad line is far more expensive than the scan itself.
+        """
+        done, offset, fast_ok = self._scan(fast=True)
+        if not fast_ok:
+            if self.verbose:
+                print(
+                    f"[resume] {self.path}: {self.key!r} also occurs nested; "
+                    "falling back to full JSON parsing to replay"
+                )
+            done, offset, _ = self._scan(fast=False)
+
+        if offset != os.path.getsize(self.path):
+            os.truncate(self.path, offset)
+        return done
 
     # -- writing ----------------------------------------------------------- #
 
@@ -735,8 +839,8 @@ class ResumableJsonl:
         return int(index) in self.done
 
     def append(self, record: dict) -> None:
+        """Write one record. The record is not retained after it hits the file."""
         self._fh.write(json.dumps(record, ensure_ascii=False) + "\n")
-        self.records.append(record)
         if self.key in record:
             self.done.add(int(record[self.key]))
         self._since_flush += 1
@@ -744,14 +848,19 @@ class ResumableJsonl:
             self.flush()
 
     def flush(self) -> None:
+        if self._closed:
+            return
         self._fh.flush()
         os.fsync(self._fh.fileno())
         self._since_flush = 0
 
     def close(self) -> None:
+        if self._closed:
+            return
         try:
             self.flush()
         finally:
+            self._closed = True
             self._fh.close()
 
     def __enter__(self) -> "ResumableJsonl":
@@ -760,11 +869,34 @@ class ResumableJsonl:
     def __exit__(self, *_exc) -> None:
         self.close()
 
+    # -- reading back ------------------------------------------------------ #
+
+    def iter_records(self) -> Iterator[dict]:
+        """Stream every record written across all runs, in file order.
+
+        Rows are read back from disk one at a time, so a caller that only needs
+        to aggregate (counts, sums, a few examples) never holds the corpus in
+        memory. File order is append order, which is ascending ``key`` for a
+        single run but interleaves resumed runs at their restart points; sort
+        downstream if you need strict key order on a resumed output.
+        """
+        self.flush()
+        with open(self.path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    yield json.loads(line)
+
     def all_records(self, sort: bool = True) -> list[dict]:
-        """Every record written across all runs, ordered by ``key``."""
-        if sort and all(self.key in r for r in self.records):
-            return sorted(self.records, key=lambda r: int(r[self.key]))
-        return list(self.records)
+        """Every record written across all runs, ordered by ``key``.
+
+        This materialises the whole output; for large scans prefer
+        :meth:`iter_records`.
+        """
+        rows = list(self.iter_records())
+        if sort and all(self.key in r for r in rows):
+            rows.sort(key=lambda r: int(r[self.key]))
+        return rows
 
 
 # --------------------------------------------------------------------------- #

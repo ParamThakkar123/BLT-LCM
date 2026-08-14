@@ -1,5 +1,6 @@
 # Lightweight evaluation metric wrappers (BLEU, chrF, METEOR, TER, COMET optional)
 import warnings
+from functools import lru_cache
 from typing import List, Tuple, Dict, Optional, Union, Sequence
 
 try:
@@ -133,12 +134,52 @@ def compute_meteor(hyps: List[str], refs: List[str]) -> float:
     return float(100.0 * sum(scores) / len(scores))
 
 
+@lru_cache(maxsize=4)
+def _load_comet_model(model_name: str):
+    """Load (and download if needed) a COMET checkpoint, once per process.
+
+    These checkpoints are XLM-R-large sized. Callers that score several
+    conditions -- ``train_lcm_blt_mt.py`` runs one evaluation per noise level --
+    used to reload ~2.3 GB of weights for each of them, because loading lived
+    inside ``compute_comet``.
+    """
+    try:
+        if download_model is not None and load_from_checkpoint is not None:
+            return load_from_checkpoint(download_model(model_name))
+    except Exception:
+        pass
+    if load_from_checkpoint is not None:
+        try:
+            return load_from_checkpoint(model_name)
+        except Exception:
+            return None
+    return None
+
+
+def _comet_gpu_count(device: Optional[str]) -> int:
+    """How many GPUs to hand COMET's ``predict``.
+
+    ``gpus=0`` used to be hardcoded, which pinned an XLM-R-large forward pass
+    over the whole eval set to the CPU regardless of what the run was using.
+    """
+    if device is None:
+        try:
+            import torch
+
+            return 1 if torch.cuda.is_available() else 0
+        except Exception:
+            return 0
+    return 1 if str(device).startswith("cuda") else 0
+
+
 def compute_comet(
     hyps: List[str],
     refs: List[str],
     srcs: Optional[List[str]] = None,
     model_name: Optional[str] = None,
     model_obj: Optional[object] = None,
+    device: Optional[str] = None,
+    batch_size: int = 32,
 ) -> float:
     """COMET system score.
 
@@ -147,6 +188,9 @@ def compute_comet(
     sources does not "skip" the source -- it feeds the model an out-of-distribution
     input and yields numbers that look plausible but are not COMET scores. We
     therefore refuse to score rather than emit an invalid value.
+
+    ``device`` selects where COMET runs; ``None`` uses a GPU when torch reports
+    one. Scoring runs no gradients, so it is purely a throughput choice.
     """
     if not _HAS_COMET:
         warnings.warn("comet not installed; COMET unavailable")
@@ -166,25 +210,13 @@ def compute_comet(
         )
         return float("nan")
 
-    model = None
     if model_obj is not None:
         model = model_obj
     else:
         if model_name is None:
             warnings.warn("No COMET model name/path provided; skipping COMET")
             return float("nan")
-        # download_model returns a *path*, then load_from_checkpoint loads it
-        try:
-            if download_model is not None and load_from_checkpoint is not None:
-                model_path = download_model(model_name)
-                model = load_from_checkpoint(model_path)
-        except Exception:
-            model = None
-        if model is None and load_from_checkpoint is not None:
-            try:
-                model = load_from_checkpoint(model_name)
-            except Exception:
-                model = None
+        model = _load_comet_model(model_name)
 
     if model is None:
         warnings.warn("Failed to load COMET model; skipping COMET")
@@ -194,7 +226,9 @@ def compute_comet(
         samples = [
             {"src": s, "mt": h, "ref": r} for s, h, r in zip(srcs, hyps, refs)
         ]
-        res = model.predict(samples, batch_size=32, gpus=0)
+        res = model.predict(
+            samples, batch_size=batch_size, gpus=_comet_gpu_count(device)
+        )
 
         if isinstance(res, tuple):
             # comet returns (scores_list, system_score)
@@ -219,12 +253,17 @@ def compute_all(
     comet_model_name: Optional[str] = None,
     comet_model_obj: Optional[object] = None,
     include_meteor: bool = True,
+    device: Optional[str] = None,
+    comet_batch_size: int = 32,
 ) -> Dict[str, float]:
     """Compute the full metric suite.
 
     ``srcs`` should be the *clean* source sentences of the eval set. It is only
     used by COMET, which is source-aware; without it COMET is reported as NaN
     rather than silently scored against empty sources.
+
+    ``device`` is passed to COMET (the only metric here that runs a model);
+    BLEU/chrF++/TER/METEOR are CPU string metrics either way.
     """
     # METEOR/COMET require List[str] refs; extract first reference if multi-ref
     if refs and isinstance(refs[0], list):
@@ -244,6 +283,8 @@ def compute_all(
         srcs=srcs,
         model_name=comet_model_name,
         model_obj=comet_model_obj,
+        device=device,
+        batch_size=comet_batch_size,
     )
     return out
 

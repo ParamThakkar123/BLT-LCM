@@ -183,7 +183,7 @@ class BLTLoader:
             except Exception as e:  # pragma: no cover - defensive
                 print(f"[BLTLoader] Could not load pooler from {pooler_path}: {e}")
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def _boundaries(self, tokens, threshold):
         """Patch boundaries for one byte sequence. Entropy model only, frozen."""
         tokens_tensor = torch.tensor([tokens], dtype=torch.long, device=self.device)
@@ -226,7 +226,7 @@ class BLTLoader:
         positions = torch.arange(T, device=device).unsqueeze(0)
         return starts & (positions < lengths.unsqueeze(1))
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def _windowed_entropies(self, tokens_t, lengths, token_budget):
         """Entropies for rows longer than the entropy model's context, batched.
 
@@ -310,7 +310,7 @@ class BLTLoader:
         ]
         return ent
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def compute_patch_specs(
         self,
         tokens_batch,
@@ -464,6 +464,14 @@ class BLTLoader:
             ).unbind(0)
         )
 
+    # NOTE: these two stay on `no_grad` rather than `inference_mode`. Their
+    # output is training *data* -- train_lcm_blt.py and finetune_lcm.py encode
+    # the corpus here and then feed those tensors through a model they
+    # backpropagate through. An inference tensor cannot be saved for backward,
+    # so promoting these would raise "Inference tensors cannot be saved for
+    # backward" on the first optimizer step of any run that did not happen to
+    # round-trip the cache through torch.save. The internal, terminal paths
+    # above (boundaries, entropies, patch specs) do use inference_mode.
     @torch.no_grad()
     def encode_tokens_batch(self, tokens_batch, threshold=DEFAULT_THRESHOLD, **kwargs):
         """Encode tokenized sentences to BLT concept embeddings (inference).

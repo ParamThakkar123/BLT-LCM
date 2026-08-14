@@ -132,7 +132,101 @@ class BLTDecoder(nn.Module):
         logits = self.output_head(self.output_norm(out))
         return logits
 
-    @torch.no_grad()
+    # -- incremental decoding ---------------------------------------------- #
+
+    def _supports_incremental(self) -> bool:
+        """Whether every layer has the shape the KV-cached path assumes.
+
+        The fast path reaches into ``nn.TransformerDecoderLayer``'s own
+        projections rather than reimplementing them, so it is valid only for
+        the pre-norm, packed-qkv configuration this class builds. Anything else
+        falls back to the reference implementation.
+        """
+        for layer in self.decoder.layers:
+            if not getattr(layer, "norm_first", False):
+                return False
+            for attn in (layer.self_attn, layer.multihead_attn):
+                if not getattr(attn, "_qkv_same_embed_dim", False):
+                    return False
+                if attn.in_proj_weight is None:
+                    return False
+        return True
+
+    def _project_memory(self, memory: torch.Tensor):
+        """Per-layer cross-attention K/V for the (fixed) memory, computed once.
+
+        The memory is a single projected concept vector and never changes
+        across decoding steps, so re-projecting it every step in every layer is
+        pure waste.
+        """
+        cache = []
+        B, S, _ = memory.shape
+        for layer in self.decoder.layers:
+            attn = layer.multihead_attn
+            D = attn.embed_dim
+            heads = attn.num_heads
+            hd = D // heads
+            wq, wk, wv = attn.in_proj_weight.split(D, dim=0)
+            if attn.in_proj_bias is not None:
+                _, bk, bv = attn.in_proj_bias.split(D, dim=0)
+            else:
+                bk = bv = None
+            k = F.linear(memory, wk, bk).view(B, S, heads, hd).transpose(1, 2)
+            v = F.linear(memory, wv, bv).view(B, S, heads, hd).transpose(1, 2)
+            cache.append((wq, attn.in_proj_bias, k, v))
+        return cache
+
+    def _decode_step(self, x, step, self_kv, mem_kv):
+        """One incremental decoder step over a single position.
+
+        ``x``: [B, 1, dec_dim] embedded current token. ``self_kv`` holds the
+        preallocated per-layer key/value caches; only row ``step`` is written
+        each call. Returns [B, 1, dec_dim].
+
+        This computes exactly what ``nn.TransformerDecoderLayer`` computes in
+        eval mode (pre-norm; dropout is identity), reusing that layer's own
+        parameters -- so existing checkpoints load and score identically.
+        """
+        for i, layer in enumerate(self.decoder.layers):
+            attn = layer.self_attn
+            D = attn.embed_dim
+            heads = attn.num_heads
+            hd = D // heads
+            B = x.shape[0]
+
+            # -- masked self-attention over the cached prefix --
+            h = layer.norm1(x)
+            qkv = F.linear(h, attn.in_proj_weight, attn.in_proj_bias)
+            q, k, v = qkv.view(B, 1, 3, heads, hd).permute(2, 0, 3, 1, 4)
+            k_cache, v_cache = self_kv[i]
+            k_cache[:, :, step : step + 1] = k
+            v_cache[:, :, step : step + 1] = v
+            # Attending to exactly positions 0..step *is* the causal mask, so
+            # no T x T mask has to be built or applied.
+            a = F.scaled_dot_product_attention(
+                q, k_cache[:, :, : step + 1], v_cache[:, :, : step + 1]
+            )
+            x = x + attn.out_proj(a.transpose(1, 2).reshape(B, 1, D))
+
+            # -- cross-attention to the (precomputed) memory --
+            h = layer.norm2(x)
+            wq, bias, mk, mv = mem_kv[i]
+            bq = bias.split(D, dim=0)[0] if bias is not None else None
+            qc = F.linear(h, wq, bq).view(B, 1, heads, hd).transpose(1, 2)
+            c = F.scaled_dot_product_attention(qc, mk, mv)
+            x = x + layer.multihead_attn.out_proj(
+                c.transpose(1, 2).reshape(B, 1, D)
+            )
+
+            # -- feed forward --
+            h = layer.norm3(x)
+            x = x + layer.linear2(layer.activation(layer.linear1(h)))
+
+        if self.decoder.norm is not None:
+            x = self.decoder.norm(x)
+        return x
+
+    @torch.inference_mode()
     def decode(
         self,
         embeddings: torch.Tensor,
@@ -141,10 +235,17 @@ class BLTDecoder(nn.Module):
     ) -> List[str]:
         """Greedy autoregressive decoding from embeddings to text.
 
+        Decoding is incremental: each step attends to a cached prefix and runs
+        the stack over a single position. The previous implementation re-ran
+        every layer over the whole prefix at each step, so emitting L bytes
+        cost O(L^2) work -- ~33,000 token-forwards at the default 256-byte
+        limit instead of 256 -- and it read the sampled token back to the host
+        once per sequence per step, which is B device syncs per step.
+
         Args:
             embeddings: [B, embed_dim] sentence embeddings.
             max_len: maximum number of byte tokens to generate.
-            temperature: softmax temperature (1.0 = greedy argmax).
+            temperature: softmax temperature (<= 1.0 selects greedy argmax).
 
         Returns:
             list of decoded strings.
@@ -154,45 +255,111 @@ class BLTDecoder(nn.Module):
         max_len = min(max_len, self.max_decode_len)
         B = embeddings.shape[0]
         device = embeddings.device
+        if B == 0:
+            return []
 
         memory = self.embedding_proj(embeddings).unsqueeze(1)
+        if not self._supports_incremental():
+            return self._decode_reference(memory, B, device, max_len, temperature)
 
+        mem_kv = self._project_memory(memory)
+        # The cache spans BOS plus every token that may be generated.
+        cache_len = max_len + 1
+        self_kv = []
+        for layer in self.decoder.layers:
+            attn = layer.self_attn
+            heads = attn.num_heads
+            hd = attn.embed_dim // heads
+            shape = (B, heads, cache_len, hd)
+            self_kv.append(
+                (
+                    torch.zeros(shape, device=device, dtype=memory.dtype),
+                    torch.zeros(shape, device=device, dtype=memory.dtype),
+                )
+            )
+
+        cur = torch.full((B, 1), BOS, dtype=torch.long, device=device)
+        finished = torch.zeros(B, dtype=torch.bool, device=device)
+        emitted = torch.full((B, max_len), PAD, dtype=torch.long, device=device)
+
+        for step in range(max_len):
+            pos = torch.full((1, 1), step, dtype=torch.long, device=device)
+            x = self.tok_emb(cur) + self.pos_emb(pos)
+            out = self._decode_step(x, step, self_kv, mem_kv)
+            logits = self.output_head(self.output_norm(out[:, -1, :]))
+
+            if temperature <= 0 or temperature == 1.0:
+                nxt = logits.argmax(dim=-1)
+            else:
+                nxt = torch.multinomial(
+                    F.softmax(logits / temperature, dim=-1), 1
+                ).squeeze(-1)
+
+            # Sequences that already hit EOT emit padding from here on. All of
+            # this stays on the device; nothing is read back inside the loop.
+            emitted[:, step] = torch.where(
+                finished, torch.full_like(nxt, PAD), nxt
+            )
+            finished = finished | (nxt == EOT)
+            cur = nxt.unsqueeze(1)
+
+            # Checking the stop condition costs one sync, so it is amortised
+            # over a few steps rather than paid every step.
+            if step % 8 == 7 and bool(finished.all()):
+                break
+
+        return self._rows_to_text(emitted)
+
+    @staticmethod
+    def _rows_to_text(emitted: torch.Tensor) -> List[str]:
+        """Trim each row at its first EOT/PAD and decode it, in one transfer."""
+        rows = emitted.cpu().tolist()
+        out = []
+        for row in rows:
+            seq = []
+            for tok in row:
+                if tok == EOT or tok == PAD:
+                    break
+                seq.append(tok)
+            out.append(byte_tokens_to_text(seq))
+        return out
+
+    @torch.inference_mode()
+    def _decode_reference(self, memory, B, device, max_len, temperature):
+        """Full-prefix decoding: correct for any layer configuration, but O(L^2).
+
+        Kept as the fallback for decoders whose layers do not match what the
+        incremental path reaches into (see :meth:`_supports_incremental`).
+        """
         cur_tokens = torch.full((B, 1), BOS, dtype=torch.long, device=device)
         finished = torch.zeros(B, dtype=torch.bool, device=device)
-        outputs: list[list[int]] = [[] for _ in range(B)]
+        emitted = torch.full((B, max_len), PAD, dtype=torch.long, device=device)
 
         for step in range(max_len):
             T = cur_tokens.shape[1]
             positions = torch.arange(T, device=device).unsqueeze(0)
             tgt = self.tok_emb(cur_tokens) + self.pos_emb(positions)
-
             tgt_mask = torch.triu(
                 torch.ones(T, T, dtype=torch.bool, device=device), diagonal=1
             )
-
             out = self.decoder(tgt, memory, tgt_mask=tgt_mask)
-            last_logits = self.output_head(self.output_norm(out[:, -1, :]))
+            logits = self.output_head(self.output_norm(out[:, -1, :]))
 
             if temperature <= 0 or temperature == 1.0:
-                next_tok = last_logits.argmax(dim=-1)
+                nxt = logits.argmax(dim=-1)
             else:
-                probs = F.softmax(last_logits / temperature, dim=-1)
-                next_tok = torch.multinomial(probs, 1).squeeze(-1)
+                nxt = torch.multinomial(
+                    F.softmax(logits / temperature, dim=-1), 1
+                ).squeeze(-1)
 
-            cur_tokens = torch.cat([cur_tokens, next_tok.unsqueeze(1)], dim=1)
+            emitted[:, step] = torch.where(finished, torch.full_like(nxt, PAD), nxt)
+            finished = finished | (nxt == EOT)
+            cur_tokens = torch.cat([cur_tokens, nxt.unsqueeze(1)], dim=1)
 
-            for i in range(B):
-                tok = int(next_tok[i].item())
-                if not finished[i]:
-                    if tok == EOT:
-                        finished[i] = True
-                    else:
-                        outputs[i].append(tok)
-
-            if finished.all():
+            if step % 8 == 7 and bool(finished.all()):
                 break
 
-        return [byte_tokens_to_text(seq) for seq in outputs]
+        return self._rows_to_text(emitted)
 
 
 def prepare_decoder_data(sentences: list[str], max_byte_len: int = 512):

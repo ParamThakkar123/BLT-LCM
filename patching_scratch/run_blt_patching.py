@@ -27,6 +27,7 @@ if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -259,6 +260,199 @@ def compute_entropy(logits):
     log_probs = F.log_softmax(logits, dim=-1)
     probs = torch.exp(log_probs)
     return -(probs * log_probs).sum(dim=-1)
+
+
+# Padded bytes (rows x padded length) per entropy forward. Batching by padded
+# byte count rather than sentence count keeps each forward the same size
+# regardless of how the corpus's length distribution falls.
+DEFAULT_ENTROPY_TOKEN_BUDGET = 131_072
+# Ceiling on rows per forward, so a chunk of very short sentences does not turn
+# into tens of thousands of rows of per-sentence overhead.
+DEFAULT_ENTROPY_MAX_ROWS = 1024
+
+
+def budgeted_chunks(order, lengths, token_budget, max_rows):
+    """Group length-sorted indices into chunks under a padded-token budget.
+
+    ``order`` must be sorted by ascending length, so the padded width of a chunk
+    is the length of its last member and the running cost is exact.
+    """
+    chunk: list = []
+    width = 0
+    for i in order:
+        cand_width = max(width, lengths[i])
+        if chunk and (
+            (len(chunk) + 1) * cand_width > token_budget or len(chunk) >= max_rows
+        ):
+            yield chunk
+            chunk, width = [i], lengths[i]
+        else:
+            chunk.append(i)
+            width = cand_width
+    if chunk:
+        yield chunk
+
+
+@torch.no_grad()
+def windowed_entropies_batch(
+    tokens_t, lengths, entropy_model, device, token_budget, context_overlap=None
+):
+    """Entropies for padded rows longer than the model's context, batched.
+
+    Same overlapping-window scheme as :func:`compute_entropies_for_tokens` --
+    every scored position keeps at least ``context_overlap`` bytes of real left
+    context, and each window contributes the positions no earlier window
+    covered -- but every window in the batch is cut once and pushed through the
+    model in batched forwards. The scalar version runs one batch-of-one forward
+    per window and copies each result to the host, so it pays a device sync per
+    window and leaves the GPU idle between them.
+
+    ``tokens_t``: [B, T] padded ids. ``lengths``: real byte count per row.
+    Returns [B, T] on ``device``.
+    """
+    B, T = tokens_t.shape
+    max_length = entropy_model.max_length
+    if context_overlap is None:
+        context_overlap = max_length // 2
+    context_overlap = max(0, min(context_overlap, max_length - 1))
+
+    # (row, win_start, win_end, dest_start, dest_end); destinations are trimmed
+    # to be disjoint, which reproduces the scalar version's "each window scores
+    # the positions after the previous one" ordering without duplicate writes.
+    plan: list = []
+    for b, seq_len in enumerate(lengths):
+        windows = []
+        start = 0
+        while start < seq_len:
+            win_start = max(0, start - context_overlap) if start > 0 else 0
+            win_end = min(seq_len, win_start + max_length)
+            windows.append((win_start, win_end, start))
+            if win_end >= seq_len:
+                break
+            start = win_end
+        for j, (win_start, win_end, dest_start) in enumerate(windows):
+            dest_end = (
+                win_end if j + 1 == len(windows) else min(win_end, windows[j + 1][2])
+            )
+            if dest_end > dest_start:
+                plan.append((b, win_start, win_end, dest_start, dest_end))
+
+    ent = torch.zeros(B, T, device=device)
+    if not plan:
+        return ent
+
+    n = len(plan)
+    # Only the plan itself crosses the bus -- five int64s per window. Every
+    # index derived from it is built on the device.
+    #
+    # Materialising the [n, max_length] gather map and the two flat scatter maps
+    # in numpy and copying them over instead moves tens of megabytes of int64
+    # per chunk; profiling a 1500-sentence scan put 6.6 of 7.4 seconds inside
+    # those `.to()` calls alone, which is more than the forwards they feed.
+    plan_t = torch.tensor(plan, dtype=torch.long, device=device)
+    rows, win_starts, win_ends, dest_starts, dest_ends = plan_t.unbind(dim=1)
+
+    # Cut every window out of the padded batch in one gather. The entropy model
+    # is causal, so the zero padding after a short window cannot affect the
+    # scores at its real positions.
+    ar = torch.arange(max_length, device=device)
+    within_window = ar.unsqueeze(0) < (win_ends - win_starts).unsqueeze(1)
+    gather = torch.where(within_window, win_starts.unsqueeze(1) + ar.unsqueeze(0), 0)
+    windows_t = tokens_t[rows.unsqueeze(1), gather]
+
+    sub = max(1, token_budget // max_length)
+    scores = torch.empty(n, max_length, device=device)
+    for s0 in range(0, n, sub):
+        scores[s0 : s0 + sub] = compute_entropy(entropy_model(windows_t[s0 : s0 + sub]))
+
+    # Scatter each window's kept span back into its row, in one write. The kept
+    # spans tile [0, seq_len) for every row, so the total is just the real byte
+    # count -- no device sync is needed to size the index.
+    counts = dest_ends - dest_starts
+    total_kept = int(sum(lengths))
+    offsets = torch.cumsum(counts, dim=0) - counts
+    within = torch.arange(total_kept, device=device) - torch.repeat_interleave(
+        offsets, counts
+    )
+    dest_flat = torch.repeat_interleave(rows * T + dest_starts, counts) + within
+    src_flat = (
+        torch.repeat_interleave(
+            torch.arange(n, device=device) * max_length, counts
+        )
+        + torch.repeat_interleave(dest_starts - win_starts, counts)
+        + within
+    )
+    ent.view(-1)[dest_flat] = scores.view(-1)[src_flat]
+    return ent
+
+
+@torch.no_grad()
+def compute_entropies_batched(
+    token_lists,
+    entropy_model,
+    device="cuda",
+    token_budget=DEFAULT_ENTROPY_TOKEN_BUDGET,
+    max_rows=DEFAULT_ENTROPY_MAX_ROWS,
+    context_overlap=None,
+    show_progress=False,
+):
+    """Per-byte next-byte entropies for many variable-length sequences.
+
+    Computes exactly what :func:`compute_entropies_for_tokens` computes, with
+    the same next-byte convention (``out[i][t] = H(x_{t+1} | x_{<=t})``) and the
+    same windowing guarantees -- but sequences are grouped into length-sorted
+    chunks under a padded-token budget and each chunk goes through the model in
+    a single forward. The scalar version runs one batch-of-one forward and one
+    host sync *per sentence*, which leaves the GPU idle between them and
+    dominates any corpus-scale scan.
+
+    ``token_lists``: a list of variable-length byte-token lists.
+    Returns a list of float lists aligned with the input.
+    """
+    n = len(token_lists)
+    out: list = [None] * n
+    if n == 0:
+        return out
+
+    max_length = entropy_model.max_length
+    sizes = [len(t) for t in token_lists]
+    # Length-sorted chunks keep padding waste low; results are written back by
+    # original index so the caller's order is preserved.
+    order = sorted(range(n), key=lambda i: sizes[i])
+    chunks = list(budgeted_chunks(order, sizes, token_budget, max_rows))
+    if show_progress:
+        chunks = tqdm(chunks, desc="entropy batches")
+
+    for idxs in chunks:
+        rows = [token_lists[i] for i in idxs]
+        lengths = [len(r) for r in rows]
+        T = max(lengths, default=0)
+        if T == 0:
+            for i in idxs:
+                out[i] = []
+            continue
+
+        padded = np.zeros((len(rows), T), dtype=np.int64)
+        for j, r in enumerate(rows):
+            if r:
+                padded[j, : len(r)] = r
+        tokens_t = torch.from_numpy(padded).to(device)
+
+        if T <= max_length:
+            # The entropy model is causal, so trailing padding cannot affect the
+            # scores at any real position.
+            ent = compute_entropy(entropy_model(tokens_t))
+        else:
+            ent = windowed_entropies_batch(
+                tokens_t, lengths, entropy_model, device, token_budget, context_overlap
+            )
+
+        # One host transfer for the whole chunk instead of one per sentence.
+        ent_np = ent.float().cpu().numpy()
+        for j, i in enumerate(idxs):
+            out[i] = ent_np[j, : lengths[j]].tolist()
+
+    return out
 
 
 @torch.no_grad()
@@ -610,6 +804,71 @@ def train_entropy_model(
 # ============================================================
 # Main patching pipeline
 # ============================================================
+class PatchingSummary:
+    """Running totals over a patching scan, plus the first few records.
+
+    ``run_patching`` used to return every record it wrote, which meant a scan
+    whose whole point was to stream to disk still ended by pulling the entire
+    output back into memory. Everything the caller actually does with that list
+    -- counts, two sums, and three examples to print -- is accumulated here
+    instead, in constant space.
+    """
+
+    MAX_EXAMPLES = 3
+
+    def __init__(self):
+        self.n_sentences = 0
+        self.total_patches = 0
+        self.total_bytes = 0
+        self.examples: list = []
+
+    def observe(self, record: dict, keep_example: bool = False) -> None:
+        self.n_sentences += 1
+        self.total_patches += record.get("num_patches", 0)
+        self.total_bytes += record.get("num_bytes", 0)
+        if keep_example and len(self.examples) < self.MAX_EXAMPLES:
+            self.examples.append(record)
+
+    @property
+    def avg_patches_per_sentence(self) -> float:
+        return self.total_patches / max(self.n_sentences, 1)
+
+    @property
+    def avg_bytes_per_patch(self) -> float:
+        return self.total_bytes / self.total_patches if self.total_patches else 0.0
+
+    def __len__(self) -> int:
+        return self.n_sentences
+
+
+def _batched_entropies_with_context_reset(
+    token_lists,
+    entropy_model,
+    device="cuda",
+    token_budget=DEFAULT_ENTROPY_TOKEN_BUDGET,
+):
+    """Newline-reset entropies (BLT §4.4) for many sentences at once.
+
+    Every segment of every sentence is scored in the same batched pass, then
+    regrouped, so resetting the context no longer costs one forward per line.
+    """
+    segments: list = []
+    owners: list = []
+    for i, tokens in enumerate(token_lists):
+        for segment in split_on_newlines(tokens):
+            segments.append(segment)
+            owners.append(i)
+
+    scored = compute_entropies_batched(
+        segments, entropy_model, device=device, token_budget=token_budget
+    )
+
+    out: list = [[] for _ in token_lists]
+    for owner, seg_ent in zip(owners, scored):
+        out[owner].extend(seg_ent)
+    return out
+
+
 def run_patching(
     marathi_texts,
     entropy_model,
@@ -621,6 +880,8 @@ def run_patching(
     mode="global",
     threshold_add=DEFAULT_THRESHOLD_ADD,
     reset_context_on_newline=False,
+    sentence_batch_size=2048,
+    token_budget=DEFAULT_ENTROPY_TOKEN_BUDGET,
 ):
     """
     Run BLT entropy-based patching on a list of Marathi sentences.
@@ -633,8 +894,17 @@ def run_patching(
 
     Records stream straight to ``output`` as JSONL rather than accumulating in
     memory, so an interrupted scan of a large corpus resumes at the first
-    sentence it had not yet written instead of restarting from zero. Returns the
-    full list of per-sentence results (including any replayed from a prior run).
+    sentence it had not yet written instead of restarting from zero.
+
+    Entropies are computed a chunk of sentences at a time rather than one
+    sentence per forward: at corpus scale the scalar path spent nearly all of
+    its time launching batch-of-one kernels and syncing each result back to the
+    host, with the GPU idle in between.
+
+    Returns a :class:`PatchingSummary` -- counts plus the first few records --
+    rather than every record, so summarising a multi-gigabyte scan does not
+    require holding it in memory. Use ``ResumableJsonl(output).iter_records()``
+    to stream the rows back.
     """
     entropy_model.eval()
     total_start = time.time()
@@ -648,80 +918,94 @@ def run_patching(
     if writer.done:
         print(f"  Resuming patching: {len(writer.done)} sentences already written")
 
-    for idx, text in enumerate(marathi_texts):
-        if writer.is_done(idx):
-            continue
-        tokens = text_to_byte_tokens(text)
-        if len(tokens) == 0:
-            continue
+    summary = PatchingSummary()
+    pending = [
+        (idx, text) for idx, text in enumerate(marathi_texts) if not writer.is_done(idx)
+    ]
+    # Rows already on disk still count towards the run's totals, and reading
+    # back only their two summary fields keeps that cheap.
+    if len(pending) != len(marathi_texts):
+        for row in writer.iter_records():
+            summary.observe(row, keep_example=True)
 
-        # Compute per-byte entropies (next-byte convention; see the docstring of
-        # compute_entropies_for_tokens for the alignment)
+    done_now = 0
+    for chunk_start in range(0, len(pending), sentence_batch_size):
+        chunk = pending[chunk_start : chunk_start + sentence_batch_size]
+        indices = [idx for idx, _ in chunk]
+        texts = [text for _, text in chunk]
+        token_lists = [text_to_byte_tokens(t) for t in texts]
+
+        # Per-byte entropies (next-byte convention; see the docstring of
+        # compute_entropies_for_tokens for the alignment).
         if reset_context_on_newline:
-            entropies_list = entropies_with_context_reset(
-                tokens, entropy_model, device=device
+            entropies = _batched_entropies_with_context_reset(
+                token_lists, entropy_model, device=device, token_budget=token_budget
             )
         else:
-            tokens_tensor = torch.tensor([tokens], dtype=torch.long)
-            entropies_list = compute_entropies_for_tokens(
-                tokens_tensor, entropy_model, device=device
-            )[0].tolist()
-
-        # Find patch boundaries
-        boundaries, patch_lengths = entropy_patch_sentence(
-            entropies_list, threshold, mode=mode, threshold_add=threshold_add
-        )
-
-        # Build detailed patch records
-        patches = []
-        for i, (start, length) in enumerate(zip(boundaries, patch_lengths)):
-            end = start + length
-            patch_byte_tokens = tokens[start:end]
-            patch_text = byte_tokens_to_text(patch_byte_tokens)
-            patch_entropies = entropies_list[start:end]
-
-            patches.append(
-                {
-                    "patch_index": i,
-                    "byte_start": start,
-                    "byte_end": end,
-                    "length_bytes": length,
-                    "patch_text": patch_text,
-                    "entropy_at_boundary": round(entropies_list[start], 6),
-                    "mean_entropy_in_patch": round(
-                        sum(patch_entropies) / len(patch_entropies), 6
-                    ),
-                }
+            entropies = compute_entropies_batched(
+                token_lists,
+                entropy_model,
+                device=device,
+                token_budget=token_budget,
             )
 
-        result = {
-            "sentence_index": idx,
-            "marathi_text": text,
-            "num_bytes": len(tokens),
-            "num_patches": len(patches),
-            "avg_patch_length": round(len(tokens) / max(len(patches), 1), 2),
-            "threshold_used": threshold,
-            "patching_mode": mode,
-            "threshold_add": threshold_add,
-            "entropy_per_byte": [round(e, 6) for e in entropies_list],
-            "patch_boundaries": boundaries,
-            "patch_lengths": patch_lengths,
-            "patches": patches,
-        }
-        writer.append(result)
+        for idx, text, tokens, entropies_list in zip(
+            indices, texts, token_lists, entropies
+        ):
+            if len(tokens) == 0:
+                continue
 
-        if (idx + 1) % 1000 == 0:
+            boundaries, patch_lengths = entropy_patch_sentence(
+                entropies_list, threshold, mode=mode, threshold_add=threshold_add
+            )
+
+            patches = []
+            for i, (start, length) in enumerate(zip(boundaries, patch_lengths)):
+                end = start + length
+                patch_entropies = entropies_list[start:end]
+                patches.append(
+                    {
+                        "patch_index": i,
+                        "byte_start": start,
+                        "byte_end": end,
+                        "length_bytes": length,
+                        "patch_text": byte_tokens_to_text(tokens[start:end]),
+                        "entropy_at_boundary": round(entropies_list[start], 6),
+                        "mean_entropy_in_patch": round(
+                            sum(patch_entropies) / len(patch_entropies), 6
+                        ),
+                    }
+                )
+
+            result = {
+                "sentence_index": idx,
+                "marathi_text": text,
+                "num_bytes": len(tokens),
+                "num_patches": len(patches),
+                "avg_patch_length": round(len(tokens) / max(len(patches), 1), 2),
+                "threshold_used": threshold,
+                "patching_mode": mode,
+                "threshold_add": threshold_add,
+                "entropy_per_byte": [round(e, 6) for e in entropies_list],
+                "patch_boundaries": boundaries,
+                "patch_lengths": patch_lengths,
+                "patches": patches,
+            }
+            writer.append(result)
+            summary.observe(result, keep_example=True)
+            done_now += 1
+
+        if done_now and (chunk_start // max(sentence_batch_size, 1)) % 10 == 0:
             elapsed = time.time() - total_start
             print(
-                f"  Processed {idx+1}/{len(marathi_texts)} sentences "
+                f"  Processed {done_now}/{len(pending)} pending sentences "
                 f"({elapsed:.1f}s elapsed)"
             )
 
     writer.close()
-    results = writer.all_records()
     elapsed = time.time() - total_start
-    print(f"  Patching complete: {len(results)} sentences in {elapsed:.1f}s")
-    return results
+    print(f"  Patching complete: {summary.n_sentences} sentences in {elapsed:.1f}s")
+    return summary
 
 
 # ============================================================
@@ -758,6 +1042,15 @@ def main():
         type=float,
         default=DEFAULT_THRESHOLD_ADD,
         help="theta_r for --patching_mode monotonic",
+    )
+    parser.add_argument(
+        "--sentence_batch_size",
+        type=int,
+        default=2048,
+        help="Sentences whose entropies are computed per batched pass. Larger "
+        "values amortise kernel launch and host-sync overhead further; the "
+        "actual GPU footprint is governed by the padded-token budget, not by "
+        "this number.",
     )
     parser.add_argument(
         "--reset_context_on_newline",
@@ -897,30 +1190,34 @@ def main():
         output=args.output,
         resume=args.resume,
         fingerprint=fingerprint,
+        # These three were parsed but never forwarded, so --patching_mode,
+        # --threshold_add and --reset_context_on_newline had no effect on the
+        # output at all.
+        mode=args.patching_mode,
+        threshold_add=args.threshold_add,
+        reset_context_on_newline=args.reset_context_on_newline,
+        sentence_batch_size=args.sentence_batch_size,
     )
 
-    print(f"\nSaved {len(results)} patched sentences to {args.output}")
+    print(f"\nSaved {results.n_sentences} patched sentences to {args.output}")
 
     # ---- Summary statistics ----
-    total_patches = sum(r["num_patches"] for r in results)
-    total_bytes = sum(r["num_bytes"] for r in results)
-    avg_patches_per_sent = total_patches / len(results)
-    avg_patch_len = total_bytes / total_patches if total_patches > 0 else 0
-
+    # Accumulated during the scan; the records themselves were never held in
+    # memory, so this works the same on a corpus of any size.
     print(f"\n{'='*60}")
     print(f"Summary Statistics")
     print(f"{'='*60}")
-    print(f"  Sentences processed : {len(results)}")
-    print(f"  Total bytes         : {total_bytes:,}")
-    print(f"  Total patches       : {total_patches:,}")
-    print(f"  Avg patches/sentence: {avg_patches_per_sent:.1f}")
-    print(f"  Avg bytes/patch     : {avg_patch_len:.1f}")
+    print(f"  Sentences processed : {results.n_sentences}")
+    print(f"  Total bytes         : {results.total_bytes:,}")
+    print(f"  Total patches       : {results.total_patches:,}")
+    print(f"  Avg patches/sentence: {results.avg_patches_per_sentence:.1f}")
+    print(f"  Avg bytes/patch     : {results.avg_bytes_per_patch:.1f}")
 
     # Show a few example patches
     print(f"\n{'='*60}")
     print(f"Example Patches (first 3 sentences)")
     print(f"{'='*60}")
-    for ex in results[:3]:
+    for ex in results.examples:
         print(f"\n  Sentence {ex['sentence_index']}: \"{ex['marathi_text'][:60]}...\"")
         print(f"  Bytes: {ex['num_bytes']} | Patches: {ex['num_patches']} | Avg len: {ex['avg_patch_length']}")
         for p in ex["patches"][:6]:

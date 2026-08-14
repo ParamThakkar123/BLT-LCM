@@ -29,7 +29,8 @@ import torch
 from tqdm import tqdm
 
 from base_lcm import BaseLCM
-from blt_loader import BLTLoader
+from blt_loader import BLTLoader  # also puts patching_scratch on sys.path
+from run_blt_patching import text_to_byte_tokens
 from blt_decoder import load_decoder
 from embedding_retriever import EmbeddingRetriever
 from eval_metrics import compute_all
@@ -106,6 +107,13 @@ def main():
         type=int,
         default=32,
         help="Batch size for generative decoding of predicted concepts.",
+    )
+    parser.add_argument(
+        "--predict_batch_size",
+        type=int,
+        default=32,
+        help="Documents per LCM forward. Every prefix length of a document is "
+        "predicted in one causal pass, so this batches whole documents.",
     )
     parser.add_argument(
         "--progress_jsonl",
@@ -194,11 +202,26 @@ def main():
     print("Encoding eval document embeddings...")
 
     def _encode_eval_docs():
-        out = []
-        for doc_sents in tqdm(eval_docs, desc="Encoding eval docs"):
-            embs = blt.encode_sentences_batch(doc_sents)
-            out.append(torch.stack([e.detach().cpu() for e in embs]))
-        return out
+        # The whole eval set goes in as one call. The loader length-sorts across
+        # everything it is handed and sizes each forward by padded byte count,
+        # so encoding document by document capped that sorting at 20 sentences
+        # and padded every forward out to its own document's longest sentence.
+        flat: list[str] = []
+        owners: list[int] = []
+        for i, doc_sents in enumerate(eval_docs):
+            for sent in doc_sents:
+                flat.append(sent)
+                owners.append(i)
+
+        tokenized = [text_to_byte_tokens(s) for s in flat]
+        embs = blt.encode_tokens_to_tensor(tokenized, show_progress=True).detach().cpu()
+
+        grouped: list[list] = [[] for _ in eval_docs]
+        for row, owner in enumerate(owners):
+            grouped[owner].append(embs[row])
+        return [
+            torch.stack(rows) if rows else torch.empty(0, blt.dim) for rows in grouped
+        ]
 
     eval_doc_embeddings = cached_torch(
         args.embed_cache,
@@ -214,24 +237,35 @@ def main():
     pred_embs = []  # list of [embed_dim] tensors (cpu)
     refs = []
 
-    for doc_sents, doc_embs in tqdm(
-        zip(eval_docs, eval_doc_embeddings), total=len(eval_docs), desc="Predicting"
+    # One causal pass covers every prefix length of a document at once: position
+    # t of `forward_all` predicts concept t+1, so the prediction for the prefix
+    # `doc_embs[:i]` is at position i-1. The old loop ran a separate 12-layer
+    # forward per prefix length -- up to (max_sent_per_doc - min_prefix) passes
+    # per document, each re-encoding the same prefix from scratch.
+    usable = [
+        (sents, embs)
+        for sents, embs in zip(eval_docs, eval_doc_embeddings)
+        if len(sents) >= args.min_prefix + 1 and embs.shape[0] == len(sents)
+    ]
+    for start in tqdm(
+        range(0, len(usable), args.predict_batch_size), desc="Predicting"
     ):
-        n = len(doc_sents)
-        if n < args.min_prefix + 1:
-            continue
+        group = usable[start : start + args.predict_batch_size]
+        width = max(embs.shape[0] for _, embs in group)
+        # Right-padded; the mask is causal, so a real position never attends to
+        # the padding after it and the batched result matches a per-document one.
+        padded = torch.zeros(len(group), width, embed_dim)
+        for j, (_, embs) in enumerate(group):
+            padded[j, : embs.shape[0]] = embs
 
-        for i in range(args.min_prefix, n):
-            prefix_embs = doc_embs[:i].unsqueeze(0).to(device)
+        with torch.no_grad():
+            preds = lcm.forward_all(padded.to(device))  # [G, width, embed_dim]
+        preds = preds.detach().cpu()
 
-            with torch.no_grad():
-                pred_emb = lcm(prefix_embs)
-
-            if pred_emb.dim() == 1:
-                pred_emb = pred_emb.unsqueeze(0)
-
-            pred_embs.append(pred_emb.squeeze(0).detach().cpu())
-            refs.append(doc_sents[i])
+        for j, (doc_sents, _) in enumerate(group):
+            for i in range(args.min_prefix, len(doc_sents)):
+                pred_embs.append(preds[j, i - 1])
+                refs.append(doc_sents[i])
 
     # --- Turn predicted concepts into text ---
     # Generative decoding is byte-at-a-time over thousands of predictions and
@@ -274,7 +308,9 @@ def main():
     hyps = [r["hypothesis"] for r in rows]
     refs = [r["reference"] for r in rows]
 
-    metrics = compute_all(hyps, refs, comet_model_name=args.comet_model)
+    metrics = compute_all(
+        hyps, refs, comet_model_name=args.comet_model, device=str(device)
+    )
 
     print(f"\n{'=' * 50}")
     print(f"  BLT-LCM Evaluation Results ({args.decode_method} decoding)")

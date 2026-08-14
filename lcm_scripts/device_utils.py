@@ -32,7 +32,13 @@ from __future__ import annotations
 import os
 from typing import Any, Optional
 
-__all__ = ["resolve_device", "describe_device", "report_device", "report_cpu_only"]
+__all__ = [
+    "resolve_device",
+    "describe_device",
+    "enable_tf32",
+    "report_device",
+    "report_cpu_only",
+]
 
 
 def _emitter(logger: Any = None):
@@ -93,12 +99,47 @@ def describe_device(device: Any = None) -> str:
     return " | ".join(parts)
 
 
+def enable_tf32(emit: Any = None) -> bool:
+    """Allow TF32 for matmul and cuDNN on Ampere and newer.
+
+    TF32 keeps fp32 range with 10 bits of mantissa and runs on the tensor
+    cores, which is roughly a 1.5-2x speedup on the matmul-bound parts of
+    training and evaluation. The precision loss is immaterial next to the
+    variance of these runs.
+
+    This used to be set in exactly one script (``train_lcm_blt.py``), so every
+    other trainer and every eval script silently ran fp32 matmuls on hardware
+    that could do better. Reporting the device is the one thing all of them do
+    first, which makes it the right place to set it once.
+
+    Returns True when TF32 was actually enabled.
+    """
+    import torch
+
+    if not torch.cuda.is_available():
+        return False
+    try:
+        major = torch.cuda.get_device_properties(torch.cuda.current_device()).major
+    except Exception:
+        return False
+    if major < 8:  # pre-Ampere has no TF32 path
+        return False
+
+    torch.set_float32_matmul_precision("high")
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    if emit is not None:
+        emit("[device] TF32 enabled for matmul and cuDNN (Ampere+)")
+    return True
+
+
 def report_device(
     device: Any = None,
     *,
     label: Optional[str] = None,
     logger: Any = None,
     warn_cpu: bool = True,
+    tf32: bool = True,
 ):
     """Print which device this run uses and return it as a ``torch.device``.
 
@@ -111,6 +152,8 @@ def report_device(
             or that no GPU was found and this will be slow. Pass ``False`` where
             CPU is a deliberate choice (a pinned smoke test) or where the
             calling script has already reported the same device once.
+        tf32: allow TF32 matmuls when the device supports them. Pass ``False``
+            for a run that needs bit-comparable fp32 arithmetic.
 
     Returns:
         The resolved device, so call sites can write
@@ -123,6 +166,9 @@ def report_device(
 
     prefix = f"[device] {label}: " if label else "[device] "
     emit(prefix + describe_device(dev))
+
+    if tf32 and dev.type == "cuda":
+        enable_tf32(emit)
 
     visible = os.environ.get("CUDA_VISIBLE_DEVICES")
     if visible is not None:

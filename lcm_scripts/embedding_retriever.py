@@ -41,13 +41,17 @@ class EmbeddingRetriever:
         batch_size: int = 64,
         device: str = "cpu",
     ) -> "EmbeddingRetriever":
-        """Build an index by encoding sentences with BLTLoader."""
-        all_embs = []
-        for i in range(0, len(sentences), batch_size):
-            batch = sentences[i : i + batch_size]
-            emb_batch = blt_loader.encode_sentences_batch(batch)
-            all_embs.extend([e.detach().cpu() for e in emb_batch])
-        embeddings = torch.stack(all_embs)
+        """Build an index by encoding sentences with BLTLoader.
+
+        ``batch_size`` is accepted for call compatibility but no longer slices
+        the corpus: the loader length-sorts across everything it is given and
+        sizes each forward by padded byte count, so pre-slicing into fixed
+        batches could only sort within a slice and still paid for that slice's
+        longest sentence.
+        """
+        if not sentences:
+            return cls(sentences, torch.empty(0, blt_loader.dim, device=device))
+        embeddings = blt_loader.encode_sentences(sentences).detach().to(device)
         return cls(sentences, embeddings)
 
     @classmethod
@@ -76,6 +80,18 @@ class EmbeddingRetriever:
             )
         return cls(sentences[:n], embeddings[:n])
 
+    def _similarities(self, query_embeddings: torch.Tensor) -> torch.Tensor:
+        """Cosine similarity of every query against the index, as one matmul.
+
+        The queries are moved to wherever the index lives rather than the index
+        being dragged to the CPU: the index is the large operand (N x dim), and
+        pulling it back for every batch turned a GPU matmul into a CPU one.
+        """
+        query = F.normalize(
+            query_embeddings.detach().to(self.embeddings.device).float(), dim=1
+        )
+        return query @ self.embeddings.T  # [B, N]
+
     def retrieve(
         self,
         query_embeddings: torch.Tensor,
@@ -85,14 +101,14 @@ class EmbeddingRetriever:
 
         Args:
             query_embeddings: [B, embed_dim] predicted embeddings.
-            top_k: return the top-k nearest sentence (uses top-1 for text output).
+            top_k: accepted for call compatibility; the text output is top-1.
 
         Returns:
             list of B sentences (top-1 matches).
         """
-        query = F.normalize(query_embeddings.float().detach().cpu(), dim=1)
-        sims = query @ self.embeddings.T  # [B, N]
-        indices = sims.argmax(dim=1).tolist()
+        if query_embeddings.numel() == 0:
+            return []
+        indices = self._similarities(query_embeddings).argmax(dim=1).cpu().tolist()
         return [self.sentences[i] for i in indices]
 
     def retrieve_with_scores(
@@ -101,15 +117,14 @@ class EmbeddingRetriever:
         top_k: int = 5,
     ) -> List[List[tuple]]:
         """Return top-k (sentence, score) pairs per query."""
-        query = F.normalize(query_embeddings.float().detach().cpu(), dim=1)
-        sims = query @ self.embeddings.T
-        topk = sims.topk(top_k, dim=1)
-        results = []
-        for i in range(query.shape[0]):
-            pairs = []
-            for j in range(top_k):
-                idx = int(topk.indices[i, j].item())
-                score = float(topk.values[i, j].item())
-                pairs.append((self.sentences[idx], score))
-            results.append(pairs)
-        return results
+        if query_embeddings.numel() == 0:
+            return []
+        top_k = min(top_k, len(self.sentences))
+        topk = self._similarities(query_embeddings).topk(top_k, dim=1)
+        # One transfer for the whole batch instead of two scalar syncs per pair.
+        idx_rows = topk.indices.cpu().tolist()
+        score_rows = topk.values.cpu().tolist()
+        return [
+            [(self.sentences[i], float(s)) for i, s in zip(idxs, scores)]
+            for idxs, scores in zip(idx_rows, score_rows)
+        ]

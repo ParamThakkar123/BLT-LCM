@@ -37,7 +37,7 @@ from checkpoint_utils import ResumableJsonl, config_fingerprint, load_model_stat
 from run_blt_patching import (
     text_to_byte_tokens,
     ByteEntropyModel,
-    compute_entropies_for_tokens,
+    compute_entropies_batched,
     entropy_patch_sentence,
     DEFAULT_THRESHOLD,
 )
@@ -142,20 +142,35 @@ def compute_tokenizer_fertility(tokenizer, text):
     return n_tokens / n_words, n_tokens, n_words
 
 
-def compute_blt_fertility(text, entropy_model, device, threshold=DEFAULT_THRESHOLD):
-    words = split_marathi_words(text)
-    if not words:
-        return float("inf"), 0, 0
-    byte_tokens = text_to_byte_tokens(text)
-    if len(byte_tokens) == 0:
-        return float("inf"), 0, 0
-    tokens_tensor = torch.tensor([byte_tokens], dtype=torch.long).to(device)
-    entropies = compute_entropies_for_tokens(tokens_tensor, entropy_model, device=device)
-    entropies_list = entropies[0].tolist()
-    boundaries, patch_lengths = entropy_patch_sentence(entropies_list, threshold)
-    n_patches = len(boundaries)
-    n_words = len(words)
-    return n_patches / n_words, n_patches, n_words
+def compute_blt_fertility_batch(
+    texts, entropy_model, device, threshold=DEFAULT_THRESHOLD
+):
+    """BLT patch fertility for many sentences, one batched entropy pass.
+
+    Returns a list of ``(fertility, n_patches, n_words)`` aligned with
+    ``texts``. Scoring one sentence at a time meant a batch-of-one forward and
+    a host sync per sentence, with the GPU idle in between.
+    """
+    words_per_text = [split_marathi_words(t) for t in texts]
+    token_lists = [text_to_byte_tokens(t) for t in texts]
+
+    # Only sentences with both words and bytes are worth scoring.
+    scorable = [
+        i
+        for i, (w, tk) in enumerate(zip(words_per_text, token_lists))
+        if w and tk
+    ]
+    entropies = compute_entropies_batched(
+        [token_lists[i] for i in scorable], entropy_model, device=device
+    )
+
+    out = [(float("inf"), 0, 0)] * len(texts)
+    for i, entropies_list in zip(scorable, entropies):
+        boundaries, _ = entropy_patch_sentence(entropies_list, threshold)
+        n_patches = len(boundaries)
+        n_words = len(words_per_text[i])
+        out[i] = (n_patches / n_words, n_patches, n_words)
+    return out
 
 
 # ── main ─────────────────────────────────────────────────────
@@ -237,39 +252,44 @@ def main():
     if writer.done:
         print(f"  Resuming: {len(writer.done)}/{len(sentences)} already scored")
 
-    for idx, text in enumerate(tqdm(sentences, desc="Computing fertility")):
-        if writer.is_done(idx):
-            continue
-        text = text.strip()
-        if not text:
-            continue
-
-        # Phase 1: best of augmented & retrained
-        fert_aug, _, _ = compute_tokenizer_fertility(tok_aug, text)
-        fert_ret, _, _ = compute_tokenizer_fertility(tok_ret, text)
-        phase1_best = min(fert_aug, fert_ret)
-        phase1_source = "augmented" if fert_aug <= fert_ret else "retrained"
-
-        # Phase 2: BLT patch fertility
-        fert_blt, n_patches, n_words = compute_blt_fertility(
-            text, entropy_model, device
+    # Everything still to do, so the BLT pass can be batched rather than run
+    # one batch-of-one forward (and one host sync) per sentence.
+    pending = [
+        (idx, stripped)
+        for idx, text in enumerate(sentences)
+        if not writer.is_done(idx) and (stripped := text.strip())
+    ]
+    BLT_BATCH = 512
+    for start in tqdm(
+        range(0, len(pending), BLT_BATCH), desc="Computing fertility"
+    ):
+        chunk = pending[start : start + BLT_BATCH]
+        blt_scores = compute_blt_fertility_batch(
+            [text for _, text in chunk], entropy_model, device
         )
 
-        # Regression = BLT fertility is higher (worse) than Phase 1 best
-        delta = fert_blt - phase1_best
+        for (idx, text), (fert_blt, n_patches, n_words) in zip(chunk, blt_scores):
+            # Phase 1: best of augmented & retrained
+            fert_aug, _, _ = compute_tokenizer_fertility(tok_aug, text)
+            fert_ret, _, _ = compute_tokenizer_fertility(tok_ret, text)
+            phase1_best = min(fert_aug, fert_ret)
+            phase1_source = "augmented" if fert_aug <= fert_ret else "retrained"
 
-        writer.append({
-            "idx": idx,
-            "text": text,
-            "n_words": n_words,
-            "fert_aug": round(fert_aug, 4),
-            "fert_ret": round(fert_ret, 4),
-            "phase1_best": round(phase1_best, 4),
-            "phase1_source": phase1_source,
-            "fert_blt": round(fert_blt, 4),
-            "n_patches": n_patches,
-            "delta": round(delta, 4),
-        })
+            # Regression = BLT fertility is higher (worse) than Phase 1 best
+            delta = fert_blt - phase1_best
+
+            writer.append({
+                "idx": idx,
+                "text": text,
+                "n_words": n_words,
+                "fert_aug": round(fert_aug, 4),
+                "fert_ret": round(fert_ret, 4),
+                "phase1_best": round(phase1_best, 4),
+                "phase1_source": phase1_source,
+                "fert_blt": round(fert_blt, 4),
+                "n_patches": n_patches,
+                "delta": round(delta, 4),
+            })
     writer.close()
     results = writer.all_records()
 

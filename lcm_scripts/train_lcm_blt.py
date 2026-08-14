@@ -15,7 +15,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import argparse
-import re
 import multiprocessing
 import time
 
@@ -23,6 +22,7 @@ import torch
 from tqdm import tqdm
 from datasets import load_dataset
 from run_blt_patching import text_to_byte_tokens
+from bhashasetu_utils import split_sentences
 from blt_loader import BLTLoader
 from base_lcm import BaseLCM
 from diffusion_lcm import OneTowerDiffusionLCM, TwoTowerDiffusionLCM
@@ -50,11 +50,13 @@ def prepare_data(num_docs=500, max_sent_per_doc=20, fraction=1.0):
     for row in tqdm(ds, desc="Loading docs"):
         text = row.get("marathi", "")
         if text and len(text.strip()) > 0:
-            sents = [
-                s.strip()
-                for s in re.split(r"[.αÑñ]", text.replace("\n", " "))
-                if s.strip()
-            ]
+            # Shared with every other loader in the repo. The separator class
+            # used to be a mangled literal ("[.αÑñ]") that had lost the
+            # Devanagari danda in an encoding round-trip, so Marathi text was
+            # only ever split on the ASCII full stop -- which most sentences do
+            # not contain. Documents came out as paragraph-sized "sentences",
+            # which is both wrong and far more expensive to encode.
+            sents = split_sentences(text)
             buf.extend(sents)
             while len(buf) >= max_sent_per_doc:
                 docs.append(buf[:max_sent_per_doc])
@@ -199,10 +201,37 @@ def main():
         default=200_000,
         help="Concept vectors used to fit the RVQ codebooks.",
     )
+    parser.add_argument(
+        "--amp",
+        action="store_true",
+        help="Run the forward/backward in bfloat16 autocast on CUDA. Roughly "
+        "halves step time on Ampere and newer at a small numerical cost; the "
+        "loss itself is still reduced in fp32.",
+    )
+    parser.add_argument(
+        "--scaler_fit_samples",
+        type=int,
+        default=50_000,
+        help="Concept vectors used to fit the robust scaler (LCM Eq. 4). "
+        "torch.quantile sorts its input, so this is a transient VRAM spike; "
+        "50k is statistically ample for a per-dimension median and IQR.",
+    )
+    parser.add_argument(
+        "--log_every",
+        type=int,
+        default=50,
+        help="Steps between per-step scalar logs (TensorBoard / W&B). The "
+        "gradient-norm computation walks every parameter, so logging it every "
+        "step is a real cost on a 12-layer, 2048-wide model.",
+    )
     add_resume_args(parser, default_interval_steps=1000)
     args = parser.parse_args()
 
     device = report_device(args.device)
+    amp_device = "cuda" if device.type == "cuda" else "cpu"
+    if args.amp and amp_device != "cuda":
+        print("  [amp] no CUDA device; running in fp32")
+        args.amp = False
     seed_everything(args.ckpt_seed)
     fingerprint = config_fingerprint(args)
     writer = None
@@ -229,9 +258,7 @@ def main():
 
     t1 = time.time()
     print("Encoding with BLT (this may take a while)...")
-    torch.set_float32_matmul_precision(
-        "high"
-    )  # Enable TensorFloat32 for better performance
+    # TF32 is enabled for every script by report_device() above.
     def _encode_all():
         flat_sents = []
         doc_indices = []
@@ -348,8 +375,13 @@ def main():
     scaler_sample = torch.cat(
         [s for s in embeddings_seqs if s.shape[0] > 0], dim=0
     )
-    if scaler_sample.shape[0] > 200_000:
-        idx = torch.randperm(scaler_sample.shape[0])[:200_000]
+    # torch.quantile sorts its input, so fitting on the full 200k x 1024 sample
+    # committed ~800 MiB plus a sort buffer on the GPU right before the model
+    # was allocated. The median and IQR of 50k samples are indistinguishable
+    # from those of 200k at this dimensionality, so the extra spike bought
+    # nothing. Subsample on the CPU and move only what is kept.
+    if scaler_sample.shape[0] > args.scaler_fit_samples:
+        idx = torch.randperm(scaler_sample.shape[0])[: args.scaler_fit_samples]
         scaler_sample = scaler_sample[idx]
     scaler_sample = scaler_sample.to(device)
     model.fit_normalizer(scaler_sample)
@@ -402,17 +434,33 @@ def main():
             initial=skip,
             total=len(dataloader),
         ):
-            src = src.to(device)
-            tgt = tgt.to(device)
+            src = src.to(device, non_blocking=True)
+            tgt = tgt.to(device, non_blocking=True)
             seq_len = tgt.shape[1]
             if seq_len == 0:
                 continue
             optim.zero_grad()
+            # bf16 has fp32's exponent range, so no GradScaler is needed. The
+            # MSE reduction stays in fp32 below: unlike cross_entropy it is not
+            # on autocast's promotion list, and summing many squared residuals
+            # in bf16 loses accuracy for no speed gain.
+            with torch.autocast(
+                device_type=amp_device, dtype=torch.bfloat16, enabled=args.amp
+            ):
+                if args.lcm_variant == "base":
+                    # One causal pass covers every position: output at t
+                    # predicts the concept at t+1. The old loop re-ran the model
+                    # once per position, which was O(L^2) forwards per gradient.
+                    preds = model.forward_all(src)
+                else:
+                    # Diffusion and quantized variants own their objective; they
+                    # take the full document (context + target) rather than a
+                    # pre-shifted (src, tgt) pair.
+                    doc = torch.cat([src, tgt[:, -1:]], dim=1)
+                    loss = model.loss(doc)
+
             if args.lcm_variant == "base":
-                # One causal pass covers every position: output at t predicts
-                # the concept at t+1. The old loop re-ran the model once per
-                # position, which was O(L^2) forward passes for one gradient.
-                preds = model.forward_all(src)
+                preds = preds.float()
                 # Mask padded positions so they don't pull predictions to zero.
                 valid = (tgt.abs().sum(dim=-1, keepdim=True) > 0).float()
                 loss = (
@@ -420,15 +468,12 @@ def main():
                     / valid.sum().clamp(min=1)
                     / tgt.shape[-1]
                 )
-            else:
-                # Diffusion and quantized variants own their objective; they
-                # take the full document (context + target) rather than a
-                # pre-shifted (src, tgt) pair.
-                doc = torch.cat([src, tgt[:, -1:]], dim=1)
-                loss = model.loss(doc)
             loss.backward()
             optim.step()
-            total += loss.item()
+            # Accumulated on the device and read back once per epoch. Calling
+            # .item() here forced a host sync on every single step purely to
+            # maintain a running average that is only printed at epoch end.
+            total = total + loss.detach()
             n += 1
             global_step += 1
 
@@ -440,46 +485,49 @@ def main():
                 global_step=global_step,
                 best_score=best_score,
             )
-            if writer is not None:
-                writer.add_scalar("train/step_loss", loss.item(), global_step)
-                try:
-                    lr = optim.param_groups[0]["lr"]
-                    writer.add_scalar("train/lr", lr, global_step)
-                except Exception:
-                    pass
-                try:
-                    total_norm = 0.0
-                    for p in model.parameters():
-                        if p.grad is not None:
-                            param_norm = p.grad.data.norm(2).item()
-                            total_norm += param_norm * param_norm
-                    total_norm = total_norm**0.5
-                    writer.add_scalar("train/grad_norm", total_norm, global_step)
-                except Exception:
-                    pass
+            # Step logging. The gradient norm walks every parameter and used to
+            # be computed TWICE per step when both loggers were on -- once for
+            # TensorBoard and again for W&B -- and on every step regardless. It
+            # is now computed once, only on the steps that actually log.
+            log_now = (writer is not None or wandb_module is not None) and (
+                global_step % max(args.log_every, 1) == 0
+            )
+            if log_now:
+                step_loss = loss.item()
+                lr = optim.param_groups[0]["lr"]
+                # One fused norm over all gradients instead of a per-parameter
+                # .item() sync each.
+                grads = [
+                    p.grad.detach() for p in model.parameters() if p.grad is not None
+                ]
+                total_norm = (
+                    float(torch.linalg.vector_norm(torch.stack(
+                        [torch.linalg.vector_norm(g) for g in grads]
+                    )))
+                    if grads
+                    else 0.0
+                )
 
-            if wandb_module is not None:
-                try:
-                    lr = optim.param_groups[0]["lr"]
-                    total_norm = 0.0
-                    for p in model.parameters():
-                        if p.grad is not None:
-                            param_norm = p.grad.data.norm(2).item()
-                            total_norm += param_norm * param_norm
-                    total_norm = total_norm**0.5
-                    wandb_module.log(
-                        {
-                            "train/step_loss": loss.item(),
-                            "train/lr": lr,
-                            "train/grad_norm": total_norm,
-                        },
-                        step=global_step,
-                    )
-                except Exception:
-                    pass
+                if writer is not None:
+                    writer.add_scalar("train/step_loss", step_loss, global_step)
+                    writer.add_scalar("train/lr", lr, global_step)
+                    writer.add_scalar("train/grad_norm", total_norm, global_step)
+                if wandb_module is not None:
+                    try:
+                        wandb_module.log(
+                            {
+                                "train/step_loss": step_loss,
+                                "train/lr": lr,
+                                "train/grad_norm": total_norm,
+                            },
+                            step=global_step,
+                        )
+                    except Exception:
+                        pass
 
         elapsed = time.time() - start
-        avg_loss = total / n if n > 0 else float("nan")
+        # The single host sync for the whole epoch's running loss.
+        avg_loss = float(total) / n if n > 0 else float("nan")
         print(f"Epoch {epoch + 1} avg loss: {avg_loss:.4f} time: {elapsed:.1f}s")
         if device.type == "cuda":
             peak_vram = torch.cuda.max_memory_allocated(device) / 1024**3
@@ -501,12 +549,12 @@ def main():
 
         # per-epoch logging
         if writer is not None:
-            writer.add_scalar("train/loss", total / n if n > 0 else 0.0, epoch + 1)
+            writer.add_scalar("train/loss", avg_loss if n > 0 else 0.0, epoch + 1)
         if wandb_module is not None:
             try:
                 # use monotonic global_step for wandb logging
                 wandb_module.log(
-                    {"train/loss": total / n if n > 0 else 0.0}, step=global_step
+                    {"train/loss": avg_loss if n > 0 else 0.0}, step=global_step
                 )
             except Exception:
                 pass
@@ -517,7 +565,9 @@ def main():
                 hyps = [l.strip() for l in f if l.strip()]
             with open(args.eval_ref, encoding="utf-8") as f:
                 refs = [l.strip() for l in f if l.strip()]
-            metrics = compute_all(hyps, refs, comet_model_name=args.comet_model)
+            metrics = compute_all(
+                hyps, refs, comet_model_name=args.comet_model, device=str(device)
+            )
             for k, v in metrics.items():
                 writer.add_scalar(f"eval/{k}", v, epoch + 1)
 
@@ -538,7 +588,7 @@ def main():
                 except Exception:
                     pass
         else:
-            monitor_score = -(total / n if n > 0 else float("inf"))
+            monitor_score = -(avg_loss if n > 0 else float("inf"))
 
         # `best_score` rides along in the checkpoint, so a resumed run keeps
         # comparing against the best epoch of the *whole* run rather than

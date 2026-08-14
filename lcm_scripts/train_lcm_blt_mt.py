@@ -129,10 +129,21 @@ def main():
         help="Optional path for the cached frozen train-concept encodings. Set "
         "this so a resumed run reuses them instead of re-encoding the corpus.",
     )
+    parser.add_argument(
+        "--amp",
+        action="store_true",
+        help="Run the forward/backward in bfloat16 autocast on CUDA. Roughly "
+        "halves step time on Ampere and newer at a small numerical cost; the "
+        "loss itself is still reduced in fp32.",
+    )
     add_resume_args(parser, default_interval_steps=200)
     args = parser.parse_args()
 
     device = report_device(args.device)
+    amp_device = "cuda" if device.type == "cuda" else "cpu"
+    if args.amp and amp_device != "cuda":
+        print("  [amp] no CUDA device; running in fp32")
+        args.amp = False
     fingerprint = config_fingerprint(args)
     if not args.comet_model:
         print(
@@ -246,11 +257,17 @@ def main():
             initial=skip,
             total=len(loader),
         ):
-            src = src.to(device).unsqueeze(1)  # [B, 1, dim] source concept (memory)
-            tgt = tgt.to(device).unsqueeze(1)  # [B, 1, dim] target concept
+            # [B, 1, dim] source concept (memory) and target concept
+            src = src.to(device, non_blocking=True).unsqueeze(1)
+            tgt = tgt.to(device, non_blocking=True).unsqueeze(1)
             optim.zero_grad()
-            pred = lcm(src, tgt)               # [B, dim]
-            loss = mse(pred, tgt.squeeze(1))
+            # bf16 needs no GradScaler; the MSE is reduced in fp32 because it is
+            # not on autocast's promotion list.
+            with torch.autocast(
+                device_type=amp_device, dtype=torch.bfloat16, enabled=args.amp
+            ):
+                pred = lcm(src, tgt)               # [B, dim]
+            loss = mse(pred.float(), tgt.squeeze(1))
             loss.backward()
             optim.step()
             total += loss.item()
@@ -323,7 +340,13 @@ def main():
         # output convey the source meaning", and the true meaning is the
         # uncorrupted sentence. Feeding it the noised source would move the
         # target the model is being judged against.
-        return compute_all(hyps, refs, srcs=clean_srcs, comet_model_name=args.comet_model)
+        return compute_all(
+            hyps,
+            refs,
+            srcs=clean_srcs,
+            comet_model_name=args.comet_model,
+            device=str(device),
+        )
 
     rows = []
     for noise in args.noise_levels:

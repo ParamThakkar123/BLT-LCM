@@ -6,6 +6,7 @@ Computes the average MSE loss on next sentence prediction and evaluates generate
 
 import argparse
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from datasets import load_dataset
 import re
@@ -127,6 +128,10 @@ def main():
         resume=args.resume != "never",
         label="retrieval-corpus embeddings",
     ).to(device)
+    # Normalized once, up front: cosine similarity against a fixed index is a
+    # matmul between unit vectors, and renormalizing the index per query (as
+    # cosine_similarity did) re-read the whole thing every time.
+    train_embs_normed = F.normalize(train_embs.float(), dim=1)
 
     # Prepare test data
     print("Preparing test data...")
@@ -184,7 +189,6 @@ def main():
     model.to(device)
     model.eval()
 
-    mse = torch.nn.MSELoss()
     writer = ResumableJsonl(
         args.progress_jsonl,
         fingerprint=fingerprint,
@@ -205,23 +209,27 @@ def main():
             seq_len = tgt.shape[1]
             if seq_len == 0:
                 continue
-            batch_hyps = []
-            batch_loss = 0.0
-            batch_n = 0
             # One causal pass yields every next-concept prediction at once.
             preds = model.forward_all(src)  # [B, L, E]
-            for i in range(seq_len):
-                pred = preds[:, i]  # [B, E]
-                batch_loss += mse(pred, tgt[:, i]).item()
-                batch_n += 1
 
-                # Find closest training sentence for each in batch
-                for b in range(pred.shape[0]):
-                    similarities = torch.cosine_similarity(
-                        pred[b].unsqueeze(0), train_embs, dim=1
-                    )
-                    best_idx = torch.argmax(similarities).item()
-                    batch_hyps.append(train_sentences[best_idx])
+            # Per-position MSE, computed in one reduction. The old loop called
+            # mse() and .item() once per position, so every position cost a
+            # device sync.
+            per_pos = (preds - tgt).pow(2).mean(dim=(0, 2))  # [L]
+            batch_loss = float(per_pos.sum())
+            batch_n = seq_len
+
+            # Nearest training sentence for every (position, batch) prediction,
+            # as a single matmul. This used to be B x L separate
+            # cosine_similarity calls against the whole index, each followed by
+            # an argmax and an .item() sync -- 160 of them per batch at B=8,
+            # L=20, and each one re-read the entire [N, E] index.
+            #
+            # Iteration order is position-major to match the previous loop, so
+            # the hypothesis order in the output is unchanged.
+            flat = F.normalize(preds.transpose(0, 1).reshape(-1, preds.shape[-1]), dim=1)
+            best = (flat @ train_embs_normed.T).argmax(dim=1).cpu().tolist()
+            batch_hyps = [train_sentences[i] for i in best]
 
             writer.append(
                 {

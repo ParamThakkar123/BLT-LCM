@@ -26,7 +26,7 @@ from device_utils import report_device  # noqa: E402
 from run_blt_patching import (  # noqa: E402
     DEFAULT_THRESHOLD,
     ByteEntropyModel,
-    compute_entropies_for_tokens,
+    compute_entropies_batched,
     entropy_patch_sentence,
     text_to_byte_tokens,
 )
@@ -121,11 +121,16 @@ def main() -> None:
         raise TypeError(f"Expected ByteEntropyModel or state-dict checkpoint, got {type(checkpoint)!r}")
     model.to(device).eval()
 
+    sentences = list(build_hindi_sentences(args.num_sentences))
+    token_lists = [text_to_byte_tokens(s) for s in sentences]
+    # One batched pass over the corpus rather than a batch-of-one forward and a
+    # host sync per sentence.
+    all_entropies = compute_entropies_batched(token_lists, model, device=str(device))
+
     rows = []
-    for idx, sentence in enumerate(build_hindi_sentences(args.num_sentences)):
-        tokens = text_to_byte_tokens(sentence)
-        token_tensor = torch.tensor([tokens], dtype=torch.long, device=device)
-        entropies = compute_entropies_for_tokens(token_tensor, model, device=str(device))[0].tolist()
+    for idx, (sentence, tokens, entropies) in enumerate(
+        zip(sentences, token_lists, all_entropies)
+    ):
         patch_starts, patch_lengths = entropy_patch_sentence(entropies, args.threshold)
         gold = proxy_boundaries(sentence)
         precision, recall, f1 = boundary_f1(set(patch_starts), gold)

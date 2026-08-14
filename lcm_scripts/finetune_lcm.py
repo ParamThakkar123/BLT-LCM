@@ -171,10 +171,21 @@ def main():
         help="Optional path for the cached BLT encodings, so a resumed run "
         "skips re-encoding the corpus.",
     )
+    parser.add_argument(
+        "--amp",
+        action="store_true",
+        help="Run the forward/backward in bfloat16 autocast on CUDA. Roughly "
+        "halves step time on Ampere and newer at a small numerical cost; the "
+        "loss itself is still reduced in fp32.",
+    )
     add_resume_args(parser, default_interval_steps=200)
     args = parser.parse_args()
 
     device = report_device(args.device)
+    amp_device = "cuda" if device.type == "cuda" else "cpu"
+    if args.amp and amp_device != "cuda":
+        print("  [amp] no CUDA device; running in fp32")
+        args.amp = False
     seed_everything(args.ckpt_seed)
     fingerprint = config_fingerprint(args)
     writer = None
@@ -201,11 +212,25 @@ def main():
     print("Encoding with BLT for fine-tuning...")
 
     def _encode_all():
-        seqs = []
-        for sents in tqdm(docs):
-            emb = blt.encode_sentences(sents)
-            seqs.append(emb.cpu())
-        return seqs
+        # The whole corpus goes in as one call so the loader can length-sort
+        # across all of it and size each forward by padded byte count. Encoding
+        # document by document capped that sorting at one document and padded
+        # every forward out to that document's longest sentence.
+        flat: list[str] = []
+        owners: list[int] = []
+        for i, sents in enumerate(docs):
+            for sent in sents:
+                flat.append(sent)
+                owners.append(i)
+
+        embeds = blt.encode_sentences(flat).detach().cpu()
+
+        grouped: list[list] = [[] for _ in docs]
+        for row, owner in enumerate(owners):
+            grouped[owner].append(embeds[row])
+        return [
+            torch.stack(rows) if rows else torch.empty(0, blt.dim) for rows in grouped
+        ]
 
     embeddings_seqs = cached_torch(
         args.embed_cache,
@@ -325,13 +350,18 @@ def main():
         for batch_idx, (src, tgt) in tqdm(
             dataloader.epoch(epoch, skip=skip), initial=skip, total=len(dataloader)
         ):
-            src = src.to(device)
-            tgt = tgt.to(device)
+            src = src.to(device, non_blocking=True)
+            tgt = tgt.to(device, non_blocking=True)
             optim.zero_grad()
             # Single causal pass; see train_lcm_blt.py for the rationale.
             # PEFT wrappers forward unknown attributes to the wrapped module, so
             # this reaches BaseLCM.forward_all through the LoRA-injected layers.
-            preds = model.forward_all(src)
+            # bf16 needs no GradScaler; the MSE is reduced in fp32 below.
+            with torch.autocast(
+                device_type=amp_device, dtype=torch.bfloat16, enabled=args.amp
+            ):
+                preds = model.forward_all(src)
+            preds = preds.float()
             valid = (tgt.abs().sum(dim=-1, keepdim=True) > 0).float()
             loss = (
                 ((preds - tgt).pow(2) * valid).sum()
@@ -391,7 +421,9 @@ def main():
                 hyps = [l.strip() for l in f if l.strip()]
             with open(args.eval_ref, encoding="utf-8") as f:
                 refs = [l.strip() for l in f if l.strip()]
-            metrics = compute_all(hyps, refs, comet_model_name=args.comet_model)
+            metrics = compute_all(
+                hyps, refs, comet_model_name=args.comet_model, device=str(device)
+            )
             for k, v in metrics.items():
                 writer.add_scalar(f"eval/{k}", v, epoch + 1)
             # checkpoint best by preferred metric
