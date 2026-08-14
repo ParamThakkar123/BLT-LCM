@@ -485,14 +485,20 @@ def train_decoder(
             f"  Epoch {epoch + 1}/{epochs} DONE | "
             f"Avg Loss: {avg_loss:.4f} | Time: {elapsed:.1f}s"
         )
-        ckpt.save_epoch(
+        # End-of-epoch snapshot goes into the rolling `_last` checkpoint only.
+        # No per-epoch `_epoch{N}` files: the run keeps exactly two checkpoints,
+        # `_last` (the resume target) and `_best`.
+        ckpt.save(
             trainable,
             optimizer,
             scheduler,
             epoch=epoch,
+            batch_in_epoch=0,
+            epoch_completed=True,
             global_step=global_step,
             best_score=best_loss,
         )
+        print(f"  [checkpoint] epoch {epoch + 1} -> {ckpt.last_path}", flush=True)
 
         if avg_loss < best_loss:
             best_loss = avg_loss

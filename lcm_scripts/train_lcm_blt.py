@@ -485,13 +485,19 @@ def main():
             peak_vram = torch.cuda.max_memory_allocated(device) / 1024**3
             print(f"Peak VRAM epoch {epoch + 1}: {peak_vram:.2f} GB")
             torch.cuda.reset_peak_memory_stats(device)
-        ckpt.save_epoch(
+        # End-of-epoch snapshot goes into the rolling `_last` checkpoint only.
+        # No per-epoch `_epoch{N}` files: the run keeps exactly two checkpoints,
+        # `_last` (the resume target) and `_best`.
+        ckpt.save(
             model,
             optim,
             epoch=epoch,
+            batch_in_epoch=0,
+            epoch_completed=True,
             global_step=global_step,
             best_score=best_score,
         )
+        print(f"[checkpoint] epoch {epoch + 1} -> {ckpt.last_path}", flush=True)
 
         # per-epoch logging
         if writer is not None:
