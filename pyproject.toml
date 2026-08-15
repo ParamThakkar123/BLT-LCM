@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
     version = "0.1.0"
     description = "BLT-LCM for Marathi Machine Translation Concept Extraction"
     authors = [{name = "Your Name"}]
-    requires-python = ">=3.10,<3.12"
+    requires-python = ">=3.13"
     dependencies = [
     # CUDA build, pulled from the pytorch-cu121 index below. The PyPI Windows
     # torch wheels are CPU-only, and `uv run` re-syncs the venv on every
@@ -64,8 +64,7 @@ test = [
 [tool.uv]
 index-strategy = "unsafe-best-match"
 environments = [
-    "sys_platform == 'linux'",
-    "sys_platform == 'win32'",
+    "sys_platform == 'linux'"
 ]
 
 # `explicit = true` keeps this index from shadowing PyPI for everything else;
