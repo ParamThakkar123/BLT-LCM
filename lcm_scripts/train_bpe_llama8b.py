@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 import os
 import sys
 
@@ -32,6 +33,16 @@ from bhashasetu_utils import (
 )
 from eval_metrics import compute_bleu, compute_chrf, compute_ter
 from device_utils import report_device
+from plot_utils import (
+    TrainingHistory,
+    add_plot_args,
+    plot_formats,
+    plot_noise_curves,
+    plot_table,
+    resolve_plot_dir,
+)
+from results_sync import ResultsRecorder, add_results_args
+from train_control import EpochBudget, add_epoch_control_args
 from checkpoint_utils import (
     StageTracker,
     add_resume_args,
@@ -134,6 +145,9 @@ def main():
     p.add_argument("--wandb_name", type=str, default=None)
     p.add_argument("--wandb_entity", type=str, default=os.environ.get("WANDB_ENTITY"))
     add_resume_args(p, default_interval_steps=200)
+    add_plot_args(p)
+    add_epoch_control_args(p)
+    add_results_args(p)
     args = p.parse_args()
 
     # The Trainer picks the training device itself, so report once up front
@@ -227,9 +241,13 @@ def main():
             pass
 
     train_ds = LlamaTranslationDataset(train_pairs, tokenizer, args.max_len)
+    # HF Trainer owns the loop here, so --train_until_plateau is enforced by a
+    # callback that watches the logged training loss and asks the Trainer to
+    # stop, rather than by an epoch generator we control.
+    budget = EpochBudget.from_args(args, label="cross-entropy")
     train_args = TrainingArguments(
         output_dir=args.out_dir,
-        num_train_epochs=args.epochs,
+        num_train_epochs=budget.cap if args.train_until_plateau else args.epochs,
         per_device_train_batch_size=args.batch_size,
         gradient_accumulation_steps=args.grad_accum,
         learning_rate=args.lr,
@@ -245,6 +263,34 @@ def main():
     )
     trainer = Trainer(model=model, args=train_args, train_dataset=train_ds)
 
+    if args.train_until_plateau:
+        from transformers import TrainerCallback
+
+        class PlateauStopper(TrainerCallback):
+            """Stop once the logged training loss stops improving.
+
+            The Trainer has no eval loop configured here, so the signal is the
+            same running training loss it prints; `budget` applies the same
+            --patience / --min_delta rule the other scripts use.
+            """
+
+            def on_log(self, args, state, control, logs=None, **kwargs):  # noqa: A002
+                if not logs or "loss" not in logs:
+                    return control
+                budget.observe(int(state.epoch or 0), float(logs["loss"]))
+                if budget.since_improvement >= budget.patience and (
+                    (state.epoch or 0) >= budget.min_epochs
+                ):
+                    budget.stop_reason = (
+                        f"plateau: no improvement > {budget.min_delta:g} in "
+                        f"{budget.since_improvement} logged steps"
+                    )
+                    print(f"[epochs] {budget.stop_reason}; stopping", flush=True)
+                    control.should_training_stop = True
+                return control
+
+        trainer.add_callback(PlateauStopper())
+
     # HF Trainer does its own checkpointing; hand it the resume decision.
     # `True` makes it pick the newest checkpoint-* under out_dir, restoring
     # optimizer, scheduler, RNG and the dataloader position.
@@ -259,6 +305,41 @@ def main():
     if resume_from:
         print(f"[resume] continuing Trainer run from {args.out_dir}")
     trainer.train(resume_from_checkpoint=resume_from)
+
+    # HF Trainer keeps its own scalar log, so the curve is transcribed from
+    # `state.log_history` rather than recorded in a loop we own. A resumed
+    # Trainer run restores that history too, so the curve spans the whole run.
+    plot_dir = resolve_plot_dir(args, args.out_dir)
+    history = TrainingHistory(
+        plot_dir,
+        run_name=f"bpe_llama8b_fraction{args.fraction}",
+        title=f"BPE + Llama-8B LoRA (fraction {args.fraction})",
+        fingerprint=fingerprint,
+        # The Trainer log is authoritative and already complete; merging it with
+        # an earlier sidecar could double-count steps.
+        resume=False,
+        formats=plot_formats(args),
+        loss_label="Cross-entropy",
+    )
+    epoch_losses: dict[int, list[float]] = {}
+    for entry in getattr(trainer.state, "log_history", []) or []:
+        if "loss" not in entry:
+            continue
+        step = int(entry.get("step", 0))
+        history.log_step(
+            step, float(entry["loss"]), lr=entry.get("learning_rate"),
+            grad_norm=entry.get("grad_norm"),
+        )
+        # `epoch` is fractional while an epoch is in flight; bucket by the
+        # epoch each log line falls inside so the epoch panel is meaningful
+        # even for a fractional --epochs run.
+        bucket = int(math.ceil(float(entry.get("epoch", 0)) or 1e-9))
+        epoch_losses.setdefault(max(bucket, 1), []).append(float(entry["loss"]))
+    for epoch, losses in sorted(epoch_losses.items()):
+        history.log_epoch(epoch, sum(losses) / len(losses))
+    figures = history.plot()
+    if args.train_until_plateau:
+        print(budget.summary())
 
     if wandb_module is not None:
         try:
@@ -326,6 +407,52 @@ def main():
         writer.writeheader()
         writer.writerows(rows)
     print(f"Wrote {out_csv}")
+
+    if plot_dir and rows:
+        formats = plot_formats(args)
+        prefix = os.path.join(plot_dir, f"bpe_llama8b_fraction{args.fraction}")
+        figures += plot_noise_curves(
+            rows,
+            f"{prefix}_noise_robustness",
+            title=(
+                f"BPE + Llama-8B robustness to source noise "
+                f"(fraction {args.fraction})"
+            ),
+            formats=formats,
+        )
+        figures += plot_table(
+            [
+                [f"{r['noise']:.0%}", f"{r['BLEU']:.2f}", f"{r['chrF++']:.2f}", f"{r['TER']:.2f}"]
+                for r in rows
+            ],
+            ["Source noise", "BLEU ↑", "chrF++ ↑", "TER ↓"],
+            f"{prefix}_metrics_table",
+            title=f"BPE + Llama-8B metrics (fraction {args.fraction})",
+            formats=formats,
+        )
+
+    recorder = ResultsRecorder(
+        args,
+        run_name=f"bpe_llama8b_fraction{args.fraction}",
+        script="train_bpe_llama8b.py",
+        fingerprint=fingerprint,
+    )
+    recorder.add_source(*figures, history.json_path, out_csv)
+    clean = next((r for r in rows if r["noise"] == 0.0), rows[0] if rows else {})
+    recorder.add_metrics(
+        final_train_loss=budget.best,
+        **{f"clean_{k}": v for k, v in clean.items() if isinstance(v, float)},
+    )
+    recorder.add_info(
+        base_model=args.model_name,
+        qlora=bool(args.qlora),
+        lora_rank=args.lora_rank,
+        train_pairs=len(train_pairs),
+        eval_pairs=len(eval_pairs),
+        noise_levels=args.noise_levels,
+        **budget.as_dict(),
+    )
+    recorder.publish()
 
     if wandb_module is not None:
         try:

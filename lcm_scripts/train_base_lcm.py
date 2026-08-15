@@ -3,6 +3,7 @@ Training script for Base-LCM
 """
 
 import os
+import time
 
 import torch
 import torch.nn as nn
@@ -13,6 +14,14 @@ from base_lcm import BaseLCM
 from data_loader import LCMDataset, collate_fn
 from blt_loader import BLTLoader
 from device_utils import report_device
+from plot_utils import (
+    TrainingHistory,
+    add_plot_args,
+    plot_formats,
+    resolve_plot_dir,
+)
+from results_sync import ResultsRecorder, add_results_args
+from train_control import EpochBudget, add_epoch_control_args
 from checkpoint_utils import (
     ResumableLoader,
     TrainingCheckpointer,
@@ -114,6 +123,32 @@ def train_base_lcm(args):
         shuffle=True,
         collate_fn=collate_fn,
     )
+    # The 80/20 split above already encodes a held-out set; scoring it once per
+    # epoch is what makes the training curve show generalization rather than
+    # just the fit, and costs one forward pass over a fifth of a small corpus.
+    val_dataset = RealDataset(val_sentences_list, val_embs)
+    val_loader = torch.utils.data.DataLoader(
+        val_dataset, batch_size=4, shuffle=False, collate_fn=collate_fn
+    )
+
+    def validation_loss() -> float:
+        if len(val_dataset) == 0:
+            return float("nan")
+        model.eval()
+        total, batches = 0.0, 0
+        with torch.no_grad():
+            for src, tgt in val_loader:
+                src, tgt = src.to(device), tgt.to(device)
+                preds = model.forward_all(src)
+                valid = (tgt.abs().sum(dim=-1, keepdim=True) > 0).float()
+                total += float(
+                    ((preds - tgt).pow(2) * valid).sum()
+                    / valid.sum().clamp(min=1)
+                    / tgt.shape[-1]
+                )
+                batches += 1
+        model.train()
+        return total / batches if batches else float("nan")
 
     os.makedirs(args.model_dir, exist_ok=True)
     ckpt = TrainingCheckpointer(
@@ -134,10 +169,25 @@ def train_base_lcm(args):
             f"batch {resume.start_batch}"
         )
 
+    history = TrainingHistory(
+        resolve_plot_dir(args, args.model_dir),
+        run_name="base_lcm",
+        title="Base-LCM (BLT concepts)",
+        fingerprint=fingerprint,
+        resume=args.resume != "never",
+        formats=plot_formats(args),
+        loss_label="MSE loss",
+    )
+
+    # The validation split drives the stopping rule when --train_until_plateau
+    # is on: a held-out loss is the honest signal for "still improving".
+    budget = EpochBudget.from_args(args, history=history, label="validation MSE")
+
     model.train()
-    for epoch in range(resume.start_epoch, args.epochs):
+    for epoch in budget.epochs_from(resume.start_epoch):
         total_loss = 0
         n_batches = 0
+        epoch_start = time.time()
         skip = resume.batches_to_skip(epoch)
         for batch_idx, (src, tgt) in tqdm(
             dataloader.epoch(epoch, skip=skip), initial=skip, total=len(dataloader)
@@ -155,9 +205,14 @@ def train_base_lcm(args):
             )
             loss.backward()
             optimizer.step()
-            total_loss += loss.item()
+            step_loss = loss.item()
+            total_loss += step_loss
             n_batches += 1
             global_step += 1
+            if global_step % 20 == 0:
+                history.log_step(
+                    global_step, step_loss, lr=optimizer.param_groups[0]["lr"]
+                )
             ckpt.maybe_save(
                 model,
                 optimizer,
@@ -167,9 +222,39 @@ def train_base_lcm(args):
             )
 
         avg = total_loss / n_batches if n_batches else float("nan")
-        print(f"Epoch {epoch + 1}, Loss: {avg:.4f}")
+        val = validation_loss()
+        print(f"Epoch {budget.describe(epoch)}, Loss: {avg:.4f}, Val Loss: {val:.4f}")
+        history.log_epoch(
+            epoch + 1,
+            avg,
+            val_loss=val if val == val else None,
+            seconds=time.time() - epoch_start,
+            lr=optimizer.param_groups[0]["lr"],
+        )
+        # Prefer the held-out loss; fall back to train loss if there is no
+        # validation split (a corpus too small to segment into two).
+        budget.observe(epoch, val if val == val else avg)
 
         ckpt.save_epoch(model, optimizer, epoch=epoch, global_step=global_step)
+
+    print(budget.summary())
+    figures = history.plot()
+
+    recorder = ResultsRecorder(
+        args, run_name="base_lcm", script="train_base_lcm.py", fingerprint=fingerprint
+    )
+    recorder.add_source(*figures, history.json_path)
+    recorder.add_metrics(
+        best_validation_mse=budget.best,
+        best_epoch=budget.best_epoch,
+        epochs_run=budget.observed,
+    )
+    recorder.add_info(
+        train_sequences=len(dataset),
+        val_sequences=len(val_dataset),
+        **budget.as_dict(),
+    )
+    recorder.publish()
 
 
 if __name__ == "__main__":
@@ -184,5 +269,8 @@ if __name__ == "__main__":
         "skips re-encoding the corpus.",
     )
     add_resume_args(parser, default_interval_steps=100)
+    add_plot_args(parser)
+    add_epoch_control_args(parser)
+    add_results_args(parser)
     args = parser.parse_args()
     train_base_lcm(args)

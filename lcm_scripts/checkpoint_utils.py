@@ -80,6 +80,33 @@ DEFAULT_FINGERPRINT_IGNORE = frozenset(
         "save_path",
         "pooler_save_path",
         "dry_run",
+        # Figure output switches (plot_utils.add_plot_args). Purely destinations
+        # and toggles, so turning plotting on mid-run must not invalidate the
+        # checkpoints or caches an earlier attempt wrote.
+        "plot_dir",
+        "plot_format",
+        "no_plots",
+        # Results-publishing switches (results_sync.add_results_args). Where the
+        # outputs are copied and whether they are pushed says nothing about what
+        # the run computes.
+        "results_dir",
+        "push_results",
+        "no_results",
+        "results_remote",
+        "results_branch",
+        "results_max_mb",
+        "results_commit_mode",
+        "results_retries",
+        "results_timeout",
+        # Stopping rule (train_control.add_epoch_control_args). These govern how
+        # LONG a run goes, not what any step computes -- so switching a
+        # fixed-epoch run to --train_until_plateau CONTINUES that run from its
+        # checkpoint instead of discarding the epochs already paid for.
+        "train_until_plateau",
+        "patience",
+        "min_delta",
+        "min_epochs",
+        "max_epochs",
     }
 )
 

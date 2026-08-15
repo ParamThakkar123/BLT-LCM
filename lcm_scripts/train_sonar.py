@@ -21,6 +21,14 @@ from datasets import load_dataset
 from sonar_module import SonarLite, text_to_byte_tokens
 from experiment_config import setup_logging
 from device_utils import report_device
+from plot_utils import (
+    TrainingHistory,
+    add_plot_args,
+    plot_formats,
+    resolve_plot_dir,
+)
+from results_sync import ResultsRecorder, add_results_args
+from train_control import EpochBudget, add_epoch_control_args
 from checkpoint_utils import (
     ResumableLoader,
     TrainingCheckpointer,
@@ -189,7 +197,19 @@ def train(args):
         noisy[corrupt] = 3
         return noisy, mask
 
-    for epoch in range(resume.start_epoch, args.epochs):
+    history = TrainingHistory(
+        resolve_plot_dir(args, args.model_dir),
+        run_name="sonar_lite",
+        title="SonarLite auto-encoder",
+        fingerprint=fingerprint,
+        resume=args.resume != "never",
+        formats=plot_formats(args),
+        loss_label="Reconstruction + λ·MSE",
+    )
+
+    budget = EpochBudget.from_args(args, history=history, label="AE loss")
+
+    for epoch in budget.epochs_from(resume.start_epoch):
         model.train()
         total_loss = 0.0
         steps = 0
@@ -314,9 +334,14 @@ def train(args):
             loss.backward()
             opt.step()
 
-            total_loss += loss.item()
+            step_loss = loss.item()
+            total_loss += step_loss
             steps += 1
             global_step += 1
+            if global_step % 50 == 0:
+                history.log_step(
+                    global_step, step_loss, lr=opt.param_groups[0]["lr"]
+                )
             ckpt.maybe_save(
                 model,
                 opt,
@@ -327,7 +352,14 @@ def train(args):
 
         elapsed = time.time() - start
         avg_loss = total_loss / steps if steps > 0 else 0.0
-        print(f"Epoch {epoch + 1} avg loss: {avg_loss:.4f} time: {elapsed:.1f}s")
+        print(
+            f"Epoch {budget.describe(epoch)} avg loss: {avg_loss:.4f} "
+            f"time: {elapsed:.1f}s"
+        )
+        history.log_epoch(
+            epoch + 1, avg_loss, seconds=elapsed, lr=opt.param_groups[0]["lr"]
+        )
+        budget.observe(epoch, avg_loss)
         path = ckpt.save_epoch(model, opt, epoch=epoch, global_step=global_step)
         if writer is not None:
             writer.add_scalar("train/loss", avg_loss, epoch + 1)
@@ -347,6 +379,27 @@ def train(args):
                     pass
             except Exception:
                 pass
+
+    print(budget.summary())
+    figures = history.plot()
+
+    recorder = ResultsRecorder(
+        args, run_name="sonar_lite", script="train_sonar.py", fingerprint=fingerprint
+    )
+    recorder.add_source(*figures, history.json_path)
+    recorder.add_metrics(
+        final_loss=budget.best,
+        best_epoch=budget.best_epoch,
+        epochs_run=budget.observed,
+    )
+    recorder.add_info(
+        objective="translation" if args.parallel_dataset else "denoising auto-encoder",
+        num_samples=args.num_samples,
+        noise_prob=args.noise_prob,
+        lambda_mse=args.lambda_mse,
+        **budget.as_dict(),
+    )
+    recorder.publish()
 
     if writer is not None:
         try:
@@ -415,5 +468,8 @@ if __name__ == "__main__":
     )
     parser.add_argument("--model_dir", type=str, default="lcm_models")
     add_resume_args(parser, default_interval_steps=200)
+    add_plot_args(parser)
+    add_epoch_control_args(parser)
+    add_results_args(parser)
     args = parser.parse_args()
     train(args)

@@ -129,6 +129,15 @@ if [[ -f "$REPO_DIR/.env" ]]; then
     info "loaded .env"
 fi
 
+# Results publishing: report where every step's results will go, and verify the
+# push credentials NOW. This driver runs for many hours; discovering a bad token
+# at the end of it -- once per step -- is the expensive way to find out.
+# Sourced (not executed) so its exports reach the python steps below.
+if [[ -f "$REPO_DIR/scripts/results_env.sh" ]]; then
+    # shellcheck disable=SC1091
+    . "$REPO_DIR/scripts/results_env.sh"
+fi
+
 export INDIC_RESOURCES_PATH="${INDIC_RESOURCES_PATH:-$REPO_DIR/indic_nlp_resources}"
 # Fragmentation is the usual cause of a late-epoch OOM at a batch size that ran
 # fine for an hour. Expandable segments cost nothing and remove that failure.

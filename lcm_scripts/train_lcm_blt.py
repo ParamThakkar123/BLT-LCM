@@ -30,6 +30,14 @@ from quant_lcm import QuantLCM
 from eval_metrics import compute_all
 from experiment_config import setup_logging
 from device_utils import report_device
+from plot_utils import (
+    TrainingHistory,
+    add_plot_args,
+    plot_formats,
+    resolve_plot_dir,
+)
+from results_sync import ResultsRecorder, add_results_args
+from train_control import EpochBudget, add_epoch_control_args
 from checkpoint_utils import (
     ResumableLoader,
     TrainingCheckpointer,
@@ -225,6 +233,9 @@ def main():
         "step is a real cost on a 12-layer, 2048-wide model.",
     )
     add_resume_args(parser, default_interval_steps=1000)
+    add_plot_args(parser)
+    add_epoch_control_args(parser)
+    add_results_args(parser)
     args = parser.parse_args()
 
     device = report_device(args.device)
@@ -248,6 +259,18 @@ def main():
             entity=args.wandb_entity,
             config={},
         )
+    # Training-curve record. It lives next to the checkpoints and carries the
+    # run fingerprint, so a resumed run continues the same curve instead of
+    # drawing one that starts at the restart.
+    history = TrainingHistory(
+        resolve_plot_dir(args, args.model_dir),
+        run_name=f"lcm_blt_{args.lcm_variant}",
+        title=f"BLT-LCM ({args.lcm_variant})",
+        fingerprint=fingerprint,
+        resume=args.resume != "never",
+        formats=plot_formats(args),
+        loss_label="MSE loss" if args.lcm_variant == "base" else "Loss",
+    )
     t0 = time.time()
     print("Preparing data list...")
     docs = prepare_data(args.num_docs, fraction=args.fraction)
@@ -422,7 +445,12 @@ def main():
             f"batch {resume.start_batch}, global step {global_step}"
         )
 
-    for epoch in range(resume.start_epoch, args.epochs):
+    # Epoch budget: a fixed --epochs, or --train_until_plateau to keep going
+    # while the loss improves. Seeded from the history so a resumed run keeps
+    # the patience counter the original process had reached.
+    budget = EpochBudget.from_args(args, history=history, label="MSE loss")
+
+    for epoch in budget.epochs_from(resume.start_epoch):
         model.train()
         total = 0.0
         n = 0
@@ -489,9 +517,9 @@ def main():
             # be computed TWICE per step when both loggers were on -- once for
             # TensorBoard and again for W&B -- and on every step regardless. It
             # is now computed once, only on the steps that actually log.
-            log_now = (writer is not None or wandb_module is not None) and (
-                global_step % max(args.log_every, 1) == 0
-            )
+            log_now = (
+                writer is not None or wandb_module is not None or history.enabled
+            ) and (global_step % max(args.log_every, 1) == 0)
             if log_now:
                 step_loss = loss.item()
                 lr = optim.param_groups[0]["lr"]
@@ -508,6 +536,9 @@ def main():
                     else 0.0
                 )
 
+                history.log_step(
+                    global_step, step_loss, lr=lr, grad_norm=total_norm
+                )
                 if writer is not None:
                     writer.add_scalar("train/step_loss", step_loss, global_step)
                     writer.add_scalar("train/lr", lr, global_step)
@@ -528,11 +559,24 @@ def main():
         elapsed = time.time() - start
         # The single host sync for the whole epoch's running loss.
         avg_loss = float(total) / n if n > 0 else float("nan")
-        print(f"Epoch {epoch + 1} avg loss: {avg_loss:.4f} time: {elapsed:.1f}s")
+        print(
+            f"Epoch {budget.describe(epoch)} avg loss: {avg_loss:.4f} "
+            f"time: {elapsed:.1f}s"
+        )
+        peak_vram = None
         if device.type == "cuda":
             peak_vram = torch.cuda.max_memory_allocated(device) / 1024**3
             print(f"Peak VRAM epoch {epoch + 1}: {peak_vram:.2f} GB")
             torch.cuda.reset_peak_memory_stats(device)
+        history.log_epoch(
+            epoch + 1,
+            avg_loss,
+            seconds=elapsed,
+            lr=optim.param_groups[0]["lr"],
+            peak_vram_gb=peak_vram,
+        )
+        # Drives --train_until_plateau: the loop ends when this stops improving.
+        budget.observe(epoch, avg_loss)
         # End-of-epoch snapshot goes into the rolling `_last` checkpoint only.
         # No per-epoch `_epoch{N}` files: the run keeps exactly two checkpoints,
         # `_last` (the resume target) and `_best`.
@@ -559,8 +603,10 @@ def main():
             except Exception:
                 pass
 
-        # optional evaluation and best-checkpointing
-        if args.eval_hyp and args.eval_ref and writer is not None:
+        # optional evaluation and best-checkpointing. The eval files are an
+        # explicit request, so it runs whenever either sink -- TensorBoard or
+        # the plotted history -- is there to receive the numbers.
+        if args.eval_hyp and args.eval_ref and (writer is not None or history.enabled):
             with open(args.eval_hyp, encoding="utf-8") as f:
                 hyps = [l.strip() for l in f if l.strip()]
             with open(args.eval_ref, encoding="utf-8") as f:
@@ -568,8 +614,10 @@ def main():
             metrics = compute_all(
                 hyps, refs, comet_model_name=args.comet_model, device=str(device)
             )
-            for k, v in metrics.items():
-                writer.add_scalar(f"eval/{k}", v, epoch + 1)
+            history.log_eval(epoch + 1, metrics)
+            if writer is not None:
+                for k, v in metrics.items():
+                    writer.add_scalar(f"eval/{k}", v, epoch + 1)
 
             # checkpoint best by preferred metric
             monitor_score = None
@@ -606,6 +654,37 @@ def main():
                 global_step=global_step,
                 best_score=best_score,
             )
+
+    print(budget.summary())
+
+    # Training curve + diagnostics dashboard for the whole run.
+    figures = history.plot()
+
+    # Collect figures, loss history and the full hyperparameter set into the
+    # repository and (with --push_results) push them.
+    recorder = ResultsRecorder(
+        args,
+        run_name=f"lcm_blt_{args.lcm_variant}",
+        script="train_lcm_blt.py",
+        fingerprint=fingerprint,
+    )
+    recorder.add_source(*figures, history.json_path)
+    recorder.add_metrics(
+        final_train_loss=budget.best,
+        best_epoch=budget.best_epoch,
+        epochs_run=budget.observed,
+        best_score=best_score,
+    )
+    recorder.add_info(
+        lcm_variant=args.lcm_variant,
+        documents=len(docs),
+        concepts=int(sum(int(s.shape[0]) for s in embeddings_seqs)),
+        embed_dim=embed_dim,
+        checkpoint=ckpt.best_path,
+        **budget.as_dict(),
+    )
+    recorder.publish()
+
     # close writers
     if writer is not None:
         try:

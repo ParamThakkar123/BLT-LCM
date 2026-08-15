@@ -13,11 +13,19 @@ import argparse
 import csv
 import random
 import os
-from typing import List, Optional
+from typing import Any, List, Optional, Sequence
 
 from bhashasetu_utils import add_character_noise
 from eval_metrics import compute_all
 from device_utils import report_device
+from plot_utils import (
+    add_plot_args,
+    plot_formats,
+    plot_noise_curves,
+    plot_table,
+    resolve_plot_dir,
+)
+from results_sync import ResultsRecorder, add_results_args
 from checkpoint_utils import StageTracker, add_resume_args, config_fingerprint
 
 
@@ -31,6 +39,9 @@ def run_eval(
     comet_model_name: Optional[str] = None,
     resume: str = "auto",
     fingerprint: Optional[str] = None,
+    plot_dir: Optional[str] = None,
+    formats: Sequence[str] = ("png",),
+    recorder: Any = None,
 ):
     # One (seed, noise) cell is a full metric pass — with COMET that is a neural
     # forward over every sentence — so finished cells are memoized and an
@@ -85,6 +96,69 @@ def run_eval(
             writer.writerow(r)
     print(f"Wrote results to {out_csv}")
 
+    figures: List[str] = []
+    if plot_dir and rows:
+        prefix = os.path.join(
+            plot_dir, os.path.splitext(os.path.basename(out_csv))[0]
+        )
+        side = "inputs (references)" if corrupt_input else "outputs (hypotheses)"
+        # One line per seed: the spread between the lines IS the run-to-run
+        # error bar, which a single averaged curve would hide.
+        figures += plot_noise_curves(
+            rows,
+            f"{prefix}_noise_degradation",
+            title=f"Metric degradation as {side} are corrupted",
+            x_key="noise_prob",
+            x_label="Character-noise probability",
+            metrics=("BLEU", "chrF++", "TER", "METEOR", "COMET"),
+            series_key="seed",
+            formats=formats,
+        )
+        # Seed-averaged summary, since that is what gets quoted in a table.
+        by_noise: dict[float, list[dict]] = {}
+        for r in rows:
+            by_noise.setdefault(float(r["noise_prob"]), []).append(r)
+        metric_names = ["BLEU", "chrF++", "TER", "METEOR", "COMET"]
+
+        def _mean(cells, key):
+            vals = [
+                float(c[key])
+                for c in cells
+                if isinstance(c.get(key), (int, float)) and c[key] == c[key]
+            ]
+            return f"{sum(vals) / len(vals):.2f}" if vals else "—"
+
+        figures += plot_table(
+            [
+                [f"{noise:.0%}", str(len(cells))]
+                + [_mean(cells, m) for m in metric_names]
+                for noise, cells in sorted(by_noise.items())
+            ],
+            ["Noise", "Seeds"] + metric_names,
+            f"{prefix}_summary_table",
+            title=f"Seed-averaged metrics ({side} corrupted)",
+            formats=formats,
+        )
+
+    if recorder is not None:
+        recorder.add_source(*figures, out_csv)
+        clean = [r for r in rows if float(r["noise_prob"]) == 0.0]
+        for metric in ("BLEU", "chrF++", "TER", "METEOR", "COMET"):
+            vals = [
+                float(r[metric])
+                for r in clean
+                if isinstance(r.get(metric), (int, float)) and r[metric] == r[metric]
+            ]
+            if vals:
+                recorder.add_metrics(**{f"clean_{metric}": sum(vals) / len(vals)})
+        recorder.add_info(
+            seeds=seeds,
+            noise_levels=noisy_probs,
+            corrupt_input=corrupt_input,
+            sentences=len(hyps),
+        )
+        recorder.publish()
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -107,6 +181,8 @@ if __name__ == "__main__":
         help="Optional COMET model name or checkpoint path",
     )
     add_resume_args(parser, training=False)
+    add_plot_args(parser)
+    add_results_args(parser)
     args = parser.parse_args()
     # BLEU/chrF++/TER are CPU string metrics; COMET runs a model on this device.
     report_device(label="metrics", warn_cpu=False)
@@ -126,4 +202,12 @@ if __name__ == "__main__":
         comet_model_name=args.comet_model,
         resume=args.resume,
         fingerprint=config_fingerprint(args, extra={"stage": "eval_runner"}),
+        plot_dir=resolve_plot_dir(args, os.path.dirname(args.out_csv) or "results"),
+        formats=plot_formats(args),
+        recorder=ResultsRecorder(
+            args,
+            run_name=os.path.splitext(os.path.basename(args.out_csv))[0],
+            script="eval_runner.py",
+            fingerprint=config_fingerprint(args, extra={"stage": "eval_runner"}),
+        ),
     )

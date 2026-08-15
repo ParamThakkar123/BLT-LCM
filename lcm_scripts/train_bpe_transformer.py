@@ -13,6 +13,7 @@ import csv
 import math
 import os
 import sys
+import time
 from typing import Sequence
 
 sys.path.append(os.path.dirname(__file__))
@@ -35,6 +36,16 @@ from bhashasetu_utils import (
 )
 from eval_metrics import compute_bleu, compute_chrf, compute_ter
 from device_utils import report_device
+from plot_utils import (
+    TrainingHistory,
+    add_plot_args,
+    plot_formats,
+    plot_noise_curves,
+    plot_table,
+    resolve_plot_dir,
+)
+from results_sync import ResultsRecorder, add_results_args
+from train_control import EpochBudget, add_epoch_control_args
 from checkpoint_utils import (
     ResumableLoader,
     StageTracker,
@@ -269,6 +280,9 @@ def main():
     p.add_argument("--wandb_name", type=str, default=None)
     p.add_argument("--wandb_entity", type=str, default=os.environ.get("WANDB_ENTITY"))
     add_resume_args(p, default_interval_steps=200)
+    add_plot_args(p)
+    add_epoch_control_args(p)
+    add_results_args(p)
     args = p.parse_args()
 
     seed_everything(args.ckpt_seed)
@@ -351,13 +365,27 @@ def main():
             f"batch {resume.start_batch}"
         )
 
-    for epoch in range(resume.start_epoch, args.epochs):
+    plot_dir = resolve_plot_dir(args, args.out_dir)
+    history = TrainingHistory(
+        plot_dir,
+        run_name=f"bpe_transformer_fraction{args.fraction}",
+        title=f"BPE Transformer (fraction {args.fraction})",
+        fingerprint=fingerprint,
+        resume=args.resume != "never",
+        formats=plot_formats(args),
+        loss_label="Cross-entropy",
+    )
+
+    budget = EpochBudget.from_args(args, history=history, label="cross-entropy")
+
+    for epoch in budget.epochs_from(resume.start_epoch):
         model.train()
         total, steps = 0.0, 0
+        epoch_start = time.time()
         skip = resume.batches_to_skip(epoch)
         for batch_idx, (src, tgt) in tqdm(
             loader.epoch(epoch, skip=skip),
-            desc=f"epoch {epoch + 1}",
+            desc=f"epoch {budget.describe(epoch)}",
             initial=skip,
             total=len(loader),
         ):
@@ -369,9 +397,16 @@ def main():
             )
             loss.backward()
             opt.step()
-            total += float(loss.item())
+            step_loss = float(loss.item())
+            total += step_loss
             steps += 1
             global_step += 1
+            # Sampled every 50 steps so the step-loss panel stays dense without
+            # a JSON record per optimizer step.
+            if global_step % 50 == 0:
+                history.log_step(
+                    global_step, step_loss, lr=opt.param_groups[0]["lr"]
+                )
             ckpt.maybe_save(
                 model,
                 opt,
@@ -380,13 +415,24 @@ def main():
                 global_step=global_step,
             )
         avg_loss = total / max(1, steps)
-        print(f"epoch={epoch + 1} train_loss={avg_loss:.4f}")
+        print(f"epoch={budget.describe(epoch)} train_loss={avg_loss:.4f}")
+        budget.observe(epoch, avg_loss)
+        history.log_epoch(
+            epoch + 1,
+            avg_loss,
+            seconds=time.time() - epoch_start,
+            lr=opt.param_groups[0]["lr"],
+            perplexity=math.exp(min(avg_loss, 20.0)),
+        )
         if wandb_module is not None:
             try:
                 wandb_module.log({"train/loss": avg_loss}, step=epoch + 1)
             except Exception:
                 pass
         ckpt.save_epoch(model, opt, epoch=epoch, global_step=global_step)
+
+    print(budget.summary())
+    figures = history.plot()
 
     # Greedy decoding the eval set is the slowest part of this script and runs
     # once per noise level, so completed levels are memoized.
@@ -429,6 +475,53 @@ def main():
         writer.writeheader()
         writer.writerows(rows)
     print(f"Wrote {out_csv}")
+
+    if plot_dir and rows:
+        formats = plot_formats(args)
+        prefix = os.path.join(plot_dir, f"bpe_transformer_fraction{args.fraction}")
+        figures += plot_noise_curves(
+            rows,
+            f"{prefix}_noise_robustness",
+            title=(
+                f"BPE Transformer robustness to source noise "
+                f"(fraction {args.fraction})"
+            ),
+            formats=formats,
+        )
+        figures += plot_table(
+            [
+                [f"{r['noise']:.0%}", f"{r['BLEU']:.2f}", f"{r['chrF++']:.2f}", f"{r['TER']:.2f}"]
+                for r in rows
+            ],
+            ["Source noise", "BLEU ↑", "chrF++ ↑", "TER ↓"],
+            f"{prefix}_metrics_table",
+            title=f"BPE Transformer metrics (fraction {args.fraction})",
+            formats=formats,
+        )
+
+    recorder = ResultsRecorder(
+        args,
+        run_name=f"bpe_transformer_fraction{args.fraction}",
+        script="train_bpe_transformer.py",
+        fingerprint=fingerprint,
+    )
+    recorder.add_source(*figures, history.json_path, out_csv)
+    clean = next((r for r in rows if r["noise"] == 0.0), rows[0] if rows else {})
+    recorder.add_metrics(
+        final_train_loss=budget.best,
+        best_epoch=budget.best_epoch,
+        epochs_run=budget.observed,
+        **{f"clean_{k}": v for k, v in clean.items() if isinstance(v, float)},
+    )
+    recorder.add_info(
+        fraction=args.fraction,
+        vocab_size=sp.get_piece_size(),
+        train_pairs=len(train_pairs),
+        eval_pairs=len(eval_pairs),
+        noise_levels=args.noise_levels,
+        **budget.as_dict(),
+    )
+    recorder.publish()
 
     if wandb_module is not None:
         try:

@@ -24,6 +24,14 @@ from base_lcm import BaseLCM
 from eval_metrics import compute_all
 from experiment_config import setup_logging
 from device_utils import report_device
+from plot_utils import (
+    TrainingHistory,
+    add_plot_args,
+    plot_formats,
+    resolve_plot_dir,
+)
+from results_sync import ResultsRecorder, add_results_args
+from train_control import EpochBudget, add_epoch_control_args
 from checkpoint_utils import (
     ResumableLoader,
     TrainingCheckpointer,
@@ -179,6 +187,9 @@ def main():
         "loss itself is still reduced in fp32.",
     )
     add_resume_args(parser, default_interval_steps=200)
+    add_plot_args(parser)
+    add_epoch_control_args(parser)
+    add_results_args(parser)
     args = parser.parse_args()
 
     device = report_device(args.device)
@@ -341,7 +352,19 @@ def main():
             f"batch {resume.start_batch}, global step {global_step}"
         )
 
-    for epoch in range(resume.start_epoch, args.epochs):
+    history = TrainingHistory(
+        resolve_plot_dir(args, args.model_dir),
+        run_name="lcm_finetuned",
+        title="BLT-LCM fine-tuning" + (" (LoRA)" if args.lora else ""),
+        fingerprint=fingerprint,
+        resume=args.resume != "never",
+        formats=plot_formats(args),
+        loss_label="MSE loss",
+    )
+
+    budget = EpochBudget.from_args(args, history=history, label="MSE loss")
+
+    for epoch in budget.epochs_from(resume.start_epoch):
         model.train()
         total = 0.0
         n = 0
@@ -381,27 +404,56 @@ def main():
                 global_step=global_step,
                 best_score=best_score,
             )
-            if writer is not None:
-                writer.add_scalar("finetune/step_loss", loss.item(), global_step)
+            # The history is sampled; TensorBoard keeps its per-step cadence.
+            sample_history = history.enabled and global_step % 50 == 0
+            if writer is not None or sample_history:
+                step_loss = loss.item()
+                lr = optim.param_groups[0]["lr"]
                 try:
-                    lr = optim.param_groups[0]["lr"]
-                    writer.add_scalar("finetune/lr", lr, global_step)
-                except Exception as e:
-                    logging.warning(f"LR logging failed: {e}")
-                try:
-                    total_norm = 0.0
-                    for p in model.parameters():
-                        if p.grad is not None:
-                            param_norm = p.grad.data.norm(2).item()
-                            total_norm += param_norm * param_norm
-                    total_norm = total_norm**0.5
-                    writer.add_scalar("finetune/grad_norm", total_norm, global_step)
+                    # One fused norm over all gradients, as in train_lcm_blt.py.
+                    # The per-parameter .norm().item() loop this replaces forced
+                    # a device sync for every single parameter tensor.
+                    grads = [
+                        p.grad.detach()
+                        for p in model.parameters()
+                        if p.grad is not None
+                    ]
+                    total_norm = (
+                        float(
+                            torch.linalg.vector_norm(
+                                torch.stack(
+                                    [torch.linalg.vector_norm(g) for g in grads]
+                                )
+                            )
+                        )
+                        if grads
+                        else 0.0
+                    )
                 except Exception as e:
                     logging.warning(f"Grad norm logging failed: {e}")
+                    total_norm = None
+                if sample_history:
+                    history.log_step(
+                        global_step, step_loss, lr=lr, grad_norm=total_norm
+                    )
+                if writer is not None:
+                    writer.add_scalar("finetune/step_loss", step_loss, global_step)
+                    writer.add_scalar("finetune/lr", lr, global_step)
+                    if total_norm is not None:
+                        writer.add_scalar(
+                            "finetune/grad_norm", total_norm, global_step
+                        )
 
         elapsed = time.time() - start
         avg_loss = total / n if n > 0 else float("nan")
-        print(f"Fine-tune Epoch {epoch + 1} avg loss: {avg_loss:.4f} time: {elapsed:.1f}s")
+        print(
+            f"Fine-tune Epoch {budget.describe(epoch)} avg loss: {avg_loss:.4f} "
+            f"time: {elapsed:.1f}s"
+        )
+        history.log_epoch(
+            epoch + 1, avg_loss, seconds=elapsed, lr=optim.param_groups[0]["lr"]
+        )
+        budget.observe(epoch, avg_loss)
         ckpt.save_epoch(
             model, optim, epoch=epoch, global_step=global_step, best_score=best_score
         )
@@ -416,7 +468,9 @@ def main():
             except Exception as e:
                 logging.warning(f"wandb epoch log failed: {e}")
 
-        if args.eval_hyp and args.eval_ref and writer is not None:
+        # The eval files are an explicit request, so the pass runs whenever
+        # either sink -- TensorBoard or the plotted history -- can receive it.
+        if args.eval_hyp and args.eval_ref and (writer is not None or history.enabled):
             with open(args.eval_hyp, encoding="utf-8") as f:
                 hyps = [l.strip() for l in f if l.strip()]
             with open(args.eval_ref, encoding="utf-8") as f:
@@ -424,8 +478,10 @@ def main():
             metrics = compute_all(
                 hyps, refs, comet_model_name=args.comet_model, device=str(device)
             )
-            for k, v in metrics.items():
-                writer.add_scalar(f"eval/{k}", v, epoch + 1)
+            history.log_eval(epoch + 1, metrics)
+            if writer is not None:
+                for k, v in metrics.items():
+                    writer.add_scalar(f"eval/{k}", v, epoch + 1)
             # checkpoint best by preferred metric
             monitor_score = None
             for cand in ["chrF++", "BLEU", "METEOR"]:
@@ -454,6 +510,31 @@ def main():
                 global_step=global_step,
                 best_score=best_score,
             )
+
+    print(budget.summary())
+    figures = history.plot()
+
+    recorder = ResultsRecorder(
+        args,
+        run_name="lcm_finetuned",
+        script="finetune_lcm.py",
+        fingerprint=fingerprint,
+    )
+    recorder.add_source(*figures, history.json_path)
+    recorder.add_metrics(
+        final_train_loss=budget.best,
+        best_epoch=budget.best_epoch,
+        epochs_run=budget.observed,
+        best_score=best_score,
+    )
+    recorder.add_info(
+        base_checkpoint=args.checkpoint,
+        lora=bool(args.lora),
+        documents=len(docs),
+        checkpoint=ckpt.best_path,
+        **budget.as_dict(),
+    )
+    recorder.publish()
 
     # close writers
     if writer is not None:

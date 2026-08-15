@@ -60,6 +60,16 @@ from base_lcm import BaseLCM
 from eval_metrics import compute_all
 from bhashasetu_utils import load_bhashasetu_pairs, add_character_noise
 from device_utils import report_device
+from plot_utils import (
+    TrainingHistory,
+    add_plot_args,
+    plot_formats,
+    plot_noise_curves,
+    plot_table,
+    resolve_plot_dir,
+)
+from results_sync import ResultsRecorder, add_results_args
+from train_control import EpochBudget, add_epoch_control_args
 from checkpoint_utils import (
     ResumableLoader,
     StageTracker,
@@ -137,6 +147,9 @@ def main():
         "loss itself is still reduced in fp32.",
     )
     add_resume_args(parser, default_interval_steps=200)
+    add_plot_args(parser)
+    add_epoch_control_args(parser)
+    add_results_args(parser)
     args = parser.parse_args()
 
     device = report_device(args.device)
@@ -246,14 +259,29 @@ def main():
             f"batch {resume.start_batch}"
         )
 
-    for epoch in range(resume.start_epoch, args.epochs):
+    # Curve for this seed's run. The seed is in the name so a multi-seed sweep
+    # produces one figure per seed rather than overwriting a shared one.
+    plot_dir = resolve_plot_dir(args, args.model_dir)
+    history = TrainingHistory(
+        plot_dir,
+        run_name=f"lcm_blt_mt_s{args.seed}",
+        title=f"BLT-LCM En→Mr (fraction {args.fraction}, seed {args.seed})",
+        fingerprint=fingerprint,
+        resume=args.resume != "never",
+        formats=plot_formats(args),
+        loss_label="Concept MSE",
+    )
+
+    budget = EpochBudget.from_args(args, history=history, label="concept MSE")
+
+    for epoch in budget.epochs_from(resume.start_epoch):
         lcm.train()
         total, n = 0.0, 0
         start = time.time()
         skip = resume.batches_to_skip(epoch)
         for batch_idx, (src, tgt) in tqdm(
             loader.epoch(epoch, skip=skip),
-            desc=f"epoch {epoch + 1}/{args.epochs}",
+            desc=f"epoch {budget.describe(epoch)}",
             initial=skip,
             total=len(loader),
         ):
@@ -270,9 +298,16 @@ def main():
             loss = mse(pred.float(), tgt.squeeze(1))
             loss.backward()
             optim.step()
-            total += loss.item()
+            step_loss = loss.item()
+            total += step_loss
             n += 1
             global_step += 1
+            # Sampled, not per-step: the sidecar stays small and the step-loss
+            # panel is still dense enough to read.
+            if global_step % 50 == 0:
+                history.log_step(
+                    global_step, step_loss, lr=optim.param_groups[0]["lr"]
+                )
             ckpt.maybe_save(
                 lcm,
                 optim,
@@ -280,11 +315,20 @@ def main():
                 batch_in_epoch=batch_idx,
                 global_step=global_step,
             )
+        elapsed = time.time() - start
+        avg_loss = total / max(n, 1)
         print(
-            f"Epoch {epoch + 1}/{args.epochs} | MSE {total / max(n, 1):.5f} "
-            f"| {time.time() - start:.1f}s"
+            f"Epoch {budget.describe(epoch)} | MSE {avg_loss:.5f} "
+            f"| {elapsed:.1f}s"
         )
+        history.log_epoch(
+            epoch + 1, avg_loss, seconds=elapsed, lr=optim.param_groups[0]["lr"]
+        )
+        budget.observe(epoch, avg_loss)
         ckpt.save_epoch(lcm, optim, epoch=epoch, global_step=global_step)
+
+    print(budget.summary())
+    figures = history.plot()
 
     best_ckpt = ckpt.best_path
     ckpt.save_best(
@@ -365,6 +409,37 @@ def main():
             }
         )
 
+    # Robustness figures: every metric against the source-noise level, plus the
+    # same numbers as a drop-in table image.
+    if plot_dir and rows:
+        formats = plot_formats(args)
+        prefix = os.path.join(plot_dir, f"lcm_blt_mt_s{args.seed}")
+        figures += plot_noise_curves(
+            rows,
+            f"{prefix}_noise_robustness",
+            title=(
+                f"BLT-LCM En→Mr robustness to source noise "
+                f"(fraction {args.fraction}, seed {args.seed})"
+            ),
+            metrics=("BLEU", "chrF++", "TER", "METEOR", "COMET"),
+            formats=formats,
+        )
+        metric_names = ["BLEU", "chrF++", "TER", "METEOR", "COMET"]
+        figures += plot_table(
+            [
+                [f"{r['noise']:.0%}"]
+                + [
+                    f"{r[m]:.2f}" if isinstance(r.get(m), float) and r[m] == r[m] else "—"
+                    for m in metric_names
+                ]
+                for r in rows
+            ],
+            ["Source noise"] + metric_names,
+            f"{prefix}_metrics_table",
+            title=f"BLT-LCM En→Mr metrics (fraction {args.fraction}, seed {args.seed})",
+            formats=formats,
+        )
+
     if args.out_csv:
         os.makedirs(os.path.dirname(args.out_csv) or ".", exist_ok=True)
         fieldnames = [
@@ -377,6 +452,31 @@ def main():
             for r in rows:
                 w.writerow(r)
         print(f"Saved metrics to {args.out_csv}")
+
+    # Publish figures, history, metrics CSV and the full hyperparameter set.
+    recorder = ResultsRecorder(
+        args,
+        run_name=f"lcm_blt_mt_s{args.seed}",
+        script="train_lcm_blt_mt.py",
+        fingerprint=fingerprint,
+    )
+    recorder.add_source(*figures, history.json_path, args.out_csv or "")
+    clean = next((r for r in rows if r["noise"] == 0.0), rows[0] if rows else {})
+    recorder.add_metrics(
+        final_train_loss=budget.best,
+        best_epoch=budget.best_epoch,
+        epochs_run=budget.observed,
+        **{f"clean_{k}": v for k, v in clean.items() if isinstance(v, float)},
+    )
+    recorder.add_info(
+        seed=args.seed,
+        data_seed=args.data_seed,
+        train_pairs=len(train_pairs),
+        eval_pairs=len(eval_pairs),
+        noise_levels=args.noise_levels,
+        **budget.as_dict(),
+    )
+    recorder.publish()
 
 
 if __name__ == "__main__":
