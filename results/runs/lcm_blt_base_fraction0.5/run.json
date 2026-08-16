@@ -2,9 +2,9 @@
   "run_name": "lcm_blt_base_fraction0.5",
   "script": "train_lcm_blt.py",
   "fingerprint": "7ccb427b76c2d837",
-  "started_utc": "2026-08-16T09:12:52Z",
-  "finished_utc": "2026-08-16T09:12:52Z",
-  "wall_clock_seconds": 0.0,
+  "started_utc": "2026-08-16T10:18:14Z",
+  "finished_utc": "2026-08-16T10:18:14Z",
+  "wall_clock_seconds": 0.1,
   "hyperparameters": {
     "amp": false,
     "batch_size": 48,
@@ -103,7 +103,7 @@
       "auto"
     ],
     "cwd": "/marimo/BLT-LCM",
-    "git_commit": "ddb8f65",
+    "git_commit": "d724db6",
     "git_branch": "main",
     "git_dirty": true,
     "torch": "2.13.0+cu130",
