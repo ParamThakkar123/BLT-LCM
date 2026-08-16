@@ -9,6 +9,7 @@ restart) silently changes the experiment, which is worse than crashing.
 import json
 import os
 import sys
+from unittest import mock
 
 import pytest
 import torch
@@ -21,6 +22,7 @@ from checkpoint_utils import (  # noqa: E402
     ResumableLoader,
     StageTracker,
     TrainingCheckpointer,
+    atomic_torch_save,
     cached_torch,
     capture_rng_state,
     config_fingerprint,
@@ -121,6 +123,32 @@ def test_epoch_checkpoints_are_pruned_numerically(tmp_path):
         ck.save_epoch(model, epoch=epoch)
     kept = sorted(p for p in os.listdir(out) if p.startswith("toy_epoch"))
     assert kept == ["toy_epoch10.pth", "toy_epoch11.pth"]
+
+
+def test_interleaved_writers_do_not_steal_each_others_staging_file(tmp_path):
+    """A second writer must not make the first one die renaming its tmp file.
+
+    Two jobs pointed at one `lcm_models/` (or an OOM retry overlapping the run
+    it replaced) used to share a single `<path>.tmp`: whoever renamed first took
+    the file away, and the other blew up with FileNotFoundError deep into
+    training. Simulated here by starting a save inside a save.
+    """
+    path = str(tmp_path / "ckpt.pth")
+    real_save = torch.save
+    inner_done = []
+
+    def racing_save(obj, dest, *a, **kw):
+        real_save(obj, dest, *a, **kw)
+        if not inner_done:  # the "other job" completes its whole save mid-write
+            inner_done.append(True)
+            atomic_torch_save({"who": "second"}, path)
+
+    with mock.patch.object(torch, "save", racing_save):
+        atomic_torch_save({"who": "first"}, path)
+
+    assert inner_done, "the nested writer never ran"
+    assert torch.load(path, weights_only=False) == {"who": "first"}
+    assert [p for p in os.listdir(tmp_path) if p.endswith(".tmp")] == []
 
 
 def test_config_fingerprint_ignores_io_and_logging_flags():
