@@ -34,6 +34,9 @@ echo "Job started:  $(date)"
 START=$(date +%s)
 
 source "$REPO_DIR/scripts/report_gpu.sh"
+# Loads .env and verifies the push credentials before the job spends any
+# GPU time, so a bad token is a message here rather than a lost result.
+source "$REPO_DIR/scripts/results_env.sh"
 
 uv run --frozen lcm_scripts/eval_lcm_blt.py \
     --lcm_checkpoint "lcm_models/${RUN_NAME}/lcm_blt_best.pth" \

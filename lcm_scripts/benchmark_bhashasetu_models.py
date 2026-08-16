@@ -18,6 +18,15 @@ sys.path.append(os.path.dirname(__file__))
 
 from device_utils import report_device
 from bhashasetu_utils import DEFAULT_FRACTIONS, DEFAULT_NOISE_LEVELS
+from plot_utils import (
+    add_plot_args,
+    plot_formats,
+    plot_grouped_bars,
+    plot_lines,
+    plot_table,
+    resolve_plot_dir,
+)
+from results_sync import ResultsRecorder, add_results_args
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -69,6 +78,8 @@ def main():
     p.add_argument("--wandb_project", type=str, default=None)
     p.add_argument("--wandb_name", type=str, default=None)
     p.add_argument("--wandb_entity", type=str, default=os.environ.get("WANDB_ENTITY"))
+    add_plot_args(p)
+    add_results_args(p)
     args = p.parse_args()
     # Each sub-job reports its own device; this is the orchestrator's view.
     report_device(args.device, label="orchestrator")
@@ -86,6 +97,13 @@ def main():
             wandb_args += ["--wandb_name", args.wandb_name]
         if args.wandb_entity:
             wandb_args += ["--wandb_entity", args.wandb_entity]
+
+    # Forwarded so each sub-job writes its own training curve in the requested
+    # format. --plot_dir is deliberately NOT forwarded: each run keeps its
+    # figures beside its own outputs, and the orchestrator plots the summary.
+    plot_pass_through = ["--plot_format", args.plot_format]
+    if args.no_plots:
+        plot_pass_through.append("--no_plots")
 
     all_rows: list[dict[str, str]] = []
     for frac in args.fractions:
@@ -118,6 +136,7 @@ def main():
                 *data_cols,
                 *device_cols,
                 *wandb_args,
+                *plot_pass_through,
             ]
             run(cmd, args.dry_run)
             all_rows.extend(read_metrics(run_dir / f"metrics_fraction{frac}.csv"))
@@ -139,6 +158,7 @@ def main():
                 *common_noise,
                 *device_cols,
                 *wandb_args,
+                *plot_pass_through,
             ]
             run(cmd, args.dry_run)
             all_rows.extend(read_metrics(run_dir / f"metrics_fraction{frac}.csv"))
@@ -162,6 +182,7 @@ def main():
                 *common_noise,
                 *data_cols,
                 *wandb_args,
+                *plot_pass_through,
             ]
             if args.llama_qlora:
                 cmd.append("--qlora")
@@ -185,6 +206,7 @@ def main():
                 *common_noise,
                 *device_cols,
                 *wandb_args,
+                *plot_pass_through,
             ]
             run(cmd, args.dry_run)
             all_rows.extend(read_metrics(run_dir / f"metrics_fraction{frac}.csv"))
@@ -197,6 +219,103 @@ def main():
             writer.writeheader()
             writer.writerows(all_rows)
         print(f"Wrote summary to {summary}")
+
+        plot_dir = resolve_plot_dir(args, str(out_dir))
+        figures: list[str] = []
+        if plot_dir:
+            formats = plot_formats(args)
+            prefix = os.path.join(plot_dir, "summary")
+
+            def _num(row, key):
+                try:
+                    return float(row[key])
+                except (TypeError, ValueError, KeyError):
+                    return float("nan")
+
+            models = sorted({r.get("model", "") for r in all_rows if r.get("model")})
+            noises = sorted({_num(r, "noise") for r in all_rows})
+            fractions = sorted({_num(r, "fraction") for r in all_rows})
+
+            def _cell(model, fraction, noise, metric):
+                for r in all_rows:
+                    if (
+                        r.get("model") == model
+                        and _num(r, "fraction") == fraction
+                        and _num(r, "noise") == noise
+                    ):
+                        return _num(r, metric)
+                return float("nan")
+
+            for metric in ("BLEU", "chrF++", "TER"):
+                safe = metric.replace("+", "p")
+                # Robustness: one line per model, at each data fraction.
+                for fraction in fractions:
+                    figures += plot_lines(
+                        [f"{n:.0%}" for n in noises],
+                        {
+                            m: [_cell(m, fraction, n, metric) for n in noises]
+                            for m in models
+                        },
+                        f"{prefix}_{safe}_noise_fraction{fraction:g}",
+                        title=(
+                            f"{metric} vs input noise at {fraction:.0%} of BhashaSetu"
+                        ),
+                        x_label="Input noise",
+                        y_label=metric,
+                        formats=formats,
+                    )
+                # Data efficiency: clean-input score against corpus fraction.
+                clean = min(noises) if noises else 0.0
+                figures += plot_grouped_bars(
+                    [f"{f:.0%}" for f in fractions],
+                    {
+                        m: [_cell(m, f, clean, metric) for f in fractions]
+                        for m in models
+                    },
+                    f"{prefix}_{safe}_by_fraction",
+                    title=f"{metric} by training-data fraction (noise {clean:.0%})",
+                    x_label="Fraction of BhashaSetu",
+                    y_label=metric,
+                    formats=formats,
+                )
+
+            figures += plot_table(
+                [
+                    [
+                        r.get("model", ""),
+                        f"{_num(r, 'fraction'):.0%}",
+                        f"{_num(r, 'noise'):.0%}",
+                        f"{_num(r, 'BLEU'):.2f}",
+                        f"{_num(r, 'chrF++'):.2f}",
+                        f"{_num(r, 'TER'):.2f}",
+                    ]
+                    for r in all_rows
+                ],
+                ["Model", "Fraction", "Noise", "BLEU ↑", "chrF++ ↑", "TER ↓"],
+                f"{prefix}_table",
+                title="BhashaSetu benchmark summary",
+                formats=formats,
+            )
+
+        # One record for the whole sweep. Each sub-job already published its
+        # own; this is the cross-model comparison on top.
+        recorder = ResultsRecorder(
+            args, run_name="bhashasetu_benchmark", script="benchmark_bhashasetu_models.py"
+        )
+        recorder.add_source(*figures, str(summary))
+        for row in all_rows:
+            if _num(row, "noise") == 0.0:
+                tag = f"{row.get('model','?')}_f{_num(row, 'fraction'):g}"
+                for metric in ("BLEU", "chrF++", "TER"):
+                    recorder.add_metrics(**{f"{tag}_{metric}": _num(row, metric)})
+        recorder.add_info(
+            models=args.models,
+            fractions=args.fractions,
+            noise_levels=args.noise_levels,
+            epochs=args.epochs,
+            rows=len(all_rows),
+        )
+        recorder.publish()
     elif args.dry_run:
         print("Dry run complete; no metrics were collected.")
     else:

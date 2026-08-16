@@ -17,6 +17,14 @@ from run_blt_patching import text_to_byte_tokens
 from tqdm import tqdm
 
 from device_utils import report_device
+from plot_utils import (
+    add_plot_args,
+    plot_curve,
+    plot_formats,
+    plot_histogram,
+    resolve_plot_dir,
+)
+from results_sync import ResultsRecorder, add_results_args
 from checkpoint_utils import (
     ResumableJsonl,
     add_resume_args,
@@ -97,6 +105,8 @@ def main():
         "rerun replays this file and only evaluates the missing batches.",
     )
     add_resume_args(parser, training=False)
+    add_plot_args(parser)
+    add_results_args(parser)
     args = parser.parse_args()
 
     device = report_device()
@@ -218,6 +228,9 @@ def main():
             per_pos = (preds - tgt).pow(2).mean(dim=(0, 2))  # [L]
             batch_loss = float(per_pos.sum())
             batch_n = seq_len
+            # Kept per batch so the position curve survives a resume: the
+            # aggregate below is rebuilt from the JSONL, not from live state.
+            per_pos_list = [float(v) for v in per_pos.cpu().tolist()]
 
             # Nearest training sentence for every (position, batch) prediction,
             # as a single matmul. This used to be B x L separate
@@ -237,6 +250,7 @@ def main():
                     "loss_sum": batch_loss,
                     "n": batch_n,
                     "hyps": batch_hyps,
+                    "per_position": per_pos_list,
                 }
             )
     writer.close()
@@ -257,6 +271,42 @@ def main():
     avg_loss = total_loss / n if n > 0 else float("inf")
     print(f"Test MSE Loss: {avg_loss:.4f}")
 
+    # --- Figures ---
+    plot_dir = resolve_plot_dir(args, "results")
+    figures: list[str] = []
+    if plot_dir and rows:
+        formats = plot_formats(args)
+        prefix = os.path.join(plot_dir, "evaluate_blt_lcm")
+        # Per-document-position error: a flat curve means the model holds
+        # context across a document, a rising one means it degrades with depth.
+        position_sums: dict[int, float] = {}
+        position_counts: dict[int, int] = {}
+        for r in rows:
+            for pos, value in enumerate(r.get("per_position", [])):
+                position_sums[pos] = position_sums.get(pos, 0.0) + float(value)
+                position_counts[pos] = position_counts.get(pos, 0) + 1
+        if position_sums:
+            positions = sorted(position_sums)
+            figures += plot_curve(
+                [p + 1 for p in positions],
+                [position_sums[p] / position_counts[p] for p in positions],
+                f"{prefix}_mse_by_position",
+                title="Next-concept MSE by position within the document",
+                x_label="Sentence position in document",
+                y_label="Mean squared error",
+                label="Test split",
+                formats=formats,
+            )
+        # Spread across batches, so an average that is dragged by a few
+        # pathological documents is visible as such.
+        figures += plot_histogram(
+            [r["loss_sum"] / max(r["n"], 1) for r in rows],
+            f"{prefix}_batch_mse_distribution",
+            title="Per-batch mean MSE on the test split",
+            x_label="Mean squared error",
+            formats=formats,
+        )
+
     # Save hyp and ref
     os.makedirs("outputs", exist_ok=True)
     with open("outputs/hyp.txt", "w", encoding="utf-8") as f:
@@ -276,6 +326,23 @@ def main():
     with open("evaluation_results.txt", "w") as f:
         f.write(f"Test MSE Loss: {avg_loss:.4f}\n")
         f.write(f"Number of predictions: {n}\n")
+
+    recorder = ResultsRecorder(
+        args,
+        run_name="evaluate_blt_lcm",
+        script="evaluate_blt_lcm.py",
+        fingerprint=fingerprint,
+    )
+    recorder.add_source(
+        *figures, "results/mt_eval_results.csv", "evaluation_results.txt"
+    )
+    recorder.add_metrics(test_mse=avg_loss, predictions=n, hypotheses=len(hyps))
+    recorder.add_info(
+        checkpoint=args.checkpoint,
+        test_documents=len(test_docs),
+        retrieval_corpus=len(train_sentences),
+    )
+    recorder.publish()
 
 
 if __name__ == "__main__":

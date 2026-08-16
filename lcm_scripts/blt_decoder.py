@@ -9,9 +9,10 @@ to the projected embedding, autoregressively generating byte tokens.
 Training uses teacher-forced cross-entropy against the original byte sequence.
 """
 
+import math
 import os
 import sys
-from typing import List, Optional
+from typing import Any, List, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -22,6 +23,8 @@ sys.path.append(os.path.join(os.path.dirname(__file__), "..", "patching_scratch"
 
 from device_utils import report_device
 from checkpoint_utils import ResumableLoader, TrainingCheckpointer
+from plot_utils import TrainingHistory
+from train_control import EpochBudget
 
 from run_blt_patching import (
     VOCAB_SIZE,
@@ -494,6 +497,10 @@ def train_decoder(
     max_checkpoints: int = 5,
     seed: int = 42,
     amp: bool = False,
+    plot_dir: Optional[str] = None,
+    plot_formats: Sequence[str] = ("png",),
+    budget: Optional[EpochBudget] = None,
+    recorder: Any = None,
 ):
     """Jointly train the cross-attention pooler and the byte decoder.
 
@@ -574,6 +581,17 @@ def train_decoder(
     rp = ckpt.restore(
         ckpt.load(resume, map_location=device), trainable, optimizer, scheduler
     )
+    history = TrainingHistory(
+        plot_dir,
+        run_name=os.path.splitext(os.path.basename(save_path))[0] or "blt_decoder",
+        title="BLT byte decoder"
+        + (" + pooler" if train_pooler else " (pooler frozen)"),
+        fingerprint=fingerprint,
+        resume=resume != "never",
+        formats=plot_formats,
+        loss_label="Byte cross-entropy",
+    )
+
     best_loss = rp.best_score if rp.best_score is not None else float("inf")
     global_step = rp.global_step
     if rp.resumed:
@@ -582,7 +600,13 @@ def train_decoder(
             f"batch {rp.start_batch} (best loss so far {best_loss:.4f})"
         )
 
-    for epoch in range(rp.start_epoch, epochs):
+    if budget is None:
+        budget = EpochBudget(epochs, label="byte cross-entropy")
+    # Seeded here rather than at construction: the history only exists inside
+    # this function, and a resumed run must not restart its patience window.
+    budget.seed_from_history(history)
+
+    for epoch in budget.epochs_from(rp.start_epoch):
         decoder.train()
         if train_pooler:
             blt_loader.pooler.train()
@@ -625,9 +649,17 @@ def train_decoder(
             optimizer.step()
             scheduler.step()
 
-            total_loss += loss.item()
+            step_loss = loss.item()
+            total_loss += step_loss
             n_batches += 1
             global_step += 1
+
+            # Sampled on the same cadence as the console log, so the step-loss
+            # and LR-schedule panels line up with what the run printed.
+            if global_step % max(log_every, 1) == 0:
+                history.log_step(
+                    global_step, step_loss, lr=scheduler.get_last_lr()[0]
+                )
 
             ckpt.maybe_save(
                 trainable,
@@ -649,8 +681,19 @@ def train_decoder(
         elapsed = time.time() - start
         avg_loss = total_loss / max(n_batches, 1)
         print(
-            f"  Epoch {epoch + 1}/{epochs} DONE | "
+            f"  Epoch {budget.describe(epoch)} DONE | "
             f"Avg Loss: {avg_loss:.4f} | Time: {elapsed:.1f}s"
+        )
+        budget.observe(epoch, avg_loss)
+        # Teacher-forced cross-entropy over bytes, so exp(loss) is the
+        # per-byte perplexity -- the quantity the reconstruction quality
+        # actually tracks.
+        history.log_epoch(
+            epoch + 1,
+            avg_loss,
+            seconds=elapsed,
+            lr=scheduler.get_last_lr()[0],
+            byte_perplexity=math.exp(min(avg_loss, 20.0)),
         )
         # End-of-epoch snapshot goes into the rolling `_last` checkpoint only.
         # No per-epoch `_epoch{N}` files: the run keeps exactly two checkpoints,
@@ -695,6 +738,27 @@ def train_decoder(
             if train_pooler and pooler_save_path:
                 blt_loader.save_pooler(pooler_save_path)
                 print(f"  Saved learned pooler to {pooler_save_path}")
+
+    print(budget.summary())
+    figures = history.plot()
+    if recorder is not None:
+        recorder.add_source(*figures, history.json_path)
+        recorder.add_metrics(
+            best_byte_cross_entropy=budget.best,
+            best_epoch=budget.best_epoch,
+            epochs_run=budget.observed,
+            byte_perplexity=(
+                math.exp(min(budget.best, 20.0)) if budget.best is not None else None
+            ),
+        )
+        recorder.add_info(
+            sentences=len(dataset),
+            train_pooler=train_pooler,
+            threshold=threshold,
+            decoder_parameters=sum(p.numel() for p in decoder.parameters()),
+            **budget.as_dict(),
+        )
+        recorder.publish()
 
     blt_loader.pooler.eval()
     return decoder
@@ -806,8 +870,14 @@ if __name__ == "__main__":
         "pooler learns to project pooled byte features to this dimension.",
     )
     from checkpoint_utils import add_resume_args, config_fingerprint, seed_everything
+    from plot_utils import add_plot_args, plot_formats, resolve_plot_dir
+    from results_sync import ResultsRecorder, add_results_args
+    from train_control import add_epoch_control_args
 
     add_resume_args(parser, default_interval_steps=200)
+    add_plot_args(parser)
+    add_epoch_control_args(parser)
+    add_results_args(parser)
     args = parser.parse_args()
 
     report_device(args.device)
@@ -880,6 +950,18 @@ if __name__ == "__main__":
         max_checkpoints=args.max_checkpoints,
         seed=args.ckpt_seed,
         amp=args.amp,
+        plot_dir=resolve_plot_dir(
+            args, os.path.dirname(args.save_path) or "lcm_models"
+        ),
+        plot_formats=plot_formats(args),
+        budget=EpochBudget.from_args(args, label="byte cross-entropy"),
+        recorder=ResultsRecorder(
+            args,
+            run_name=os.path.splitext(os.path.basename(args.save_path))[0]
+            or "blt_decoder",
+            script="blt_decoder.py",
+            fingerprint=fingerprint,
+        ),
     )
 
     print("\nTesting reconstruction on sample sentences...")

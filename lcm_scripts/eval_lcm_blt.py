@@ -35,6 +35,15 @@ from blt_decoder import load_decoder
 from embedding_retriever import EmbeddingRetriever
 from eval_metrics import compute_all
 from device_utils import report_device
+from plot_utils import (
+    add_plot_args,
+    plot_formats,
+    plot_histogram,
+    plot_metric_bars,
+    plot_table,
+    resolve_plot_dir,
+)
+from results_sync import ResultsRecorder, add_results_args
 from checkpoint_utils import (
     ResumableJsonl,
     add_resume_args,
@@ -124,6 +133,8 @@ def main():
         "A rerun replays this file and only decodes what is missing.",
     )
     add_resume_args(parser, training=False)
+    add_plot_args(parser)
+    add_results_args(parser)
     args = parser.parse_args()
 
     device = report_device(args.device)
@@ -321,6 +332,46 @@ def main():
             print(f"  {k:12s}: {v:.2f}")
     print(f"{'=' * 50}")
 
+    # --- Figures ---
+    # `or "."` matters: --out_csv with a bare filename has an empty dirname,
+    # and an empty plot_dir would silently switch the figures off.
+    plot_dir = resolve_plot_dir(
+        args,
+        (os.path.dirname(args.out_csv) or ".") if args.out_csv else "results",
+    )
+    figures: list[str] = []
+    if plot_dir and hyps:
+        formats = plot_formats(args)
+        prefix = os.path.join(plot_dir, f"eval_lcm_blt_{args.decode_method}")
+        figures += plot_metric_bars(
+            metrics,
+            f"{prefix}_metrics",
+            title=f"BLT-LCM evaluation ({args.decode_method} decoding)",
+            subtitle=f"{len(hyps):,} next-sentence predictions",
+            formats=formats,
+        )
+        figures += plot_table(
+            [
+                [k, f"{v:.4f}"]
+                for k, v in metrics.items()
+                if isinstance(v, float) and v == v
+            ]
+            + [["Samples", f"{len(hyps):,}"]],
+            ["Metric", "Value"],
+            f"{prefix}_metrics_table",
+            title=f"BLT-LCM evaluation ({args.decode_method} decoding)",
+            formats=formats,
+        )
+        # Length agreement is the fastest read on whether the decoder is
+        # truncating or rambling: a corpus-level BLEU hides it entirely.
+        figures += plot_histogram(
+            [len(h) - len(r) for h, r in zip(hyps, refs)],
+            f"{prefix}_length_delta",
+            title="Hypothesis minus reference length",
+            x_label="Character-length difference (hypothesis − reference)",
+            formats=formats,
+        )
+
     # --- Optionally save per-sample CSV ---
     if args.out_csv:
         import csv
@@ -332,6 +383,27 @@ def main():
             for h, r in zip(hyps, refs):
                 writer.writerow([h, r])
         print(f"Saved per-sample results to {args.out_csv}")
+
+    recorder = ResultsRecorder(
+        args,
+        run_name=f"eval_lcm_blt_{args.decode_method}",
+        script="eval_lcm_blt.py",
+        fingerprint=fingerprint,
+    )
+    recorder.add_source(*figures)
+    recorder.add_metrics(
+        samples=len(hyps),
+        **{k: v for k, v in metrics.items() if isinstance(v, float) and v == v},
+    )
+    recorder.add_info(
+        lcm_checkpoint=args.lcm_checkpoint,
+        decode_method=args.decode_method,
+        fraction=args.fraction,
+        min_prefix=args.min_prefix,
+        eval_docs=len(eval_docs),
+        retrieval_corpus=len(train_sents),
+    )
+    recorder.publish()
 
     return metrics
 

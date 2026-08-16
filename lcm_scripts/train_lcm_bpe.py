@@ -13,6 +13,7 @@ import argparse
 import csv
 import os
 import sys
+import time
 from pathlib import Path
 
 sys.path.append(os.path.dirname(__file__))
@@ -28,6 +29,16 @@ from tqdm import tqdm
 
 from base_lcm import BaseLCM
 from device_utils import report_device
+from plot_utils import (
+    TrainingHistory,
+    add_plot_args,
+    plot_formats,
+    plot_noise_curves,
+    plot_table,
+    resolve_plot_dir,
+)
+from results_sync import ResultsRecorder, add_results_args
+from train_control import EpochBudget, add_epoch_control_args
 from checkpoint_utils import (
     ResumableLoader,
     ResumePoint,
@@ -190,6 +201,7 @@ def train_epoch(
     resume: ResumePoint,
     trainable,
     global_step: int,
+    history: TrainingHistory | None = None,
 ) -> tuple[float, int]:
     """Run one epoch, checkpointing as it goes. Returns (avg_loss, global_step)."""
     model.train()
@@ -211,9 +223,13 @@ def train_epoch(
         loss = ((pred - tgt).pow(2) * sent_mask).sum() / sent_mask.sum().clamp(min=1)
         loss.backward()
         optim.step()
-        total += float(loss.item())
+        step_loss = float(loss.item())
+        total += step_loss
         steps += 1
         global_step += 1
+        # Sampled every 50 steps; see train_lcm_sonar.py for the rationale.
+        if history is not None and global_step % 50 == 0:
+            history.log_step(global_step, step_loss, lr=optim.param_groups[0]["lr"])
         ckpt.maybe_save(
             trainable,
             optim,
@@ -314,6 +330,9 @@ def main():
     )
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     add_resume_args(p, default_interval_steps=200)
+    add_plot_args(p)
+    add_epoch_control_args(p)
+    add_results_args(p)
     args = p.parse_args()
 
     if args.model_dim <= args.embed_dim:
@@ -385,7 +404,21 @@ def main():
             f"batch {resume.start_batch}"
         )
 
-    for epoch in range(resume.start_epoch, args.epochs):
+    plot_dir = resolve_plot_dir(args, args.out_dir)
+    history = TrainingHistory(
+        plot_dir,
+        run_name=f"lcm_bpe_fraction{args.fraction}",
+        title=f"BPE-LCM (fraction {args.fraction})",
+        fingerprint=fingerprint,
+        resume=args.resume != "never",
+        formats=plot_formats(args),
+        loss_label="Masked MSE",
+    )
+
+    budget = EpochBudget.from_args(args, history=history, label="masked MSE")
+
+    for epoch in budget.epochs_from(resume.start_epoch):
+        epoch_start = time.time()
         loss, global_step = train_epoch(
             model,
             encoder,
@@ -397,8 +430,16 @@ def main():
             resume,
             trainable,
             global_step,
+            history,
         )
-        print(f"epoch={epoch + 1} train_loss={loss:.4f}")
+        print(f"epoch={budget.describe(epoch)} train_loss={loss:.4f}")
+        history.log_epoch(
+            epoch + 1,
+            loss,
+            seconds=time.time() - epoch_start,
+            lr=optim.param_groups[0]["lr"],
+        )
+        budget.observe(epoch, loss)
         if run:
             run.log({"train/loss": loss, "epoch": epoch + 1})
         ckpt.save_epoch(
@@ -408,6 +449,9 @@ def main():
             global_step=global_step,
             extra={"args": vars(args)},
         )
+
+    print(budget.summary())
+    figures = history.plot()
 
     retriever = build_retriever(train_docs, sp, encoder, args, device)
     # One retrieval decode per noise level over the whole eval set is minutes of
@@ -454,6 +498,57 @@ def main():
         writer.writeheader()
         writer.writerows(rows)
     print(f"Wrote {out_csv}")
+
+    if plot_dir and rows:
+        formats = plot_formats(args)
+        prefix = os.path.join(plot_dir, f"lcm_bpe_fraction{args.fraction}")
+        figures += plot_noise_curves(
+            rows,
+            f"{prefix}_noise_robustness",
+            title=f"BPE-LCM robustness to input noise (fraction {args.fraction})",
+            formats=formats,
+        )
+        figures += plot_table(
+            [
+                [
+                    f"{r['noise']:.0%}",
+                    f"{r['num_predictions']:,}",
+                    f"{r['BLEU']:.2f}",
+                    f"{r['chrF++']:.2f}",
+                    f"{r['TER']:.2f}",
+                ]
+                for r in rows
+            ],
+            ["Input noise", "Predictions", "BLEU ↑", "chrF++ ↑", "TER ↓"],
+            f"{prefix}_metrics_table",
+            title=f"BPE-LCM metrics (fraction {args.fraction})",
+            formats=formats,
+        )
+
+    recorder = ResultsRecorder(
+        args,
+        run_name=f"lcm_bpe_fraction{args.fraction}",
+        script="train_lcm_bpe.py",
+        fingerprint=fingerprint,
+    )
+    recorder.add_source(*figures, history.json_path, out_csv)
+    clean = next((r for r in rows if r["noise"] == 0.0), rows[0] if rows else {})
+    recorder.add_metrics(
+        final_train_loss=budget.best,
+        best_epoch=budget.best_epoch,
+        epochs_run=budget.observed,
+        **{f"clean_{k}": v for k, v in clean.items() if isinstance(v, float)},
+    )
+    recorder.add_info(
+        fraction=args.fraction,
+        vocab_size=sp.get_piece_size(),
+        train_docs=len(train_docs),
+        eval_docs=len(eval_docs),
+        noise_levels=args.noise_levels,
+        **budget.as_dict(),
+    )
+    recorder.publish()
+
     if run:
         run.finish()
 

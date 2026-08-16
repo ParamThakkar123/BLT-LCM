@@ -16,6 +16,7 @@ Usage:
 """
 
 import argparse
+import math
 import os
 import sys
 import time
@@ -36,6 +37,15 @@ from torch.utils.data import Dataset
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lcm_scripts"))
 
 from device_utils import report_device
+from plot_utils import (  # noqa: E402
+    TrainingHistory,
+    add_plot_args,
+    plot_formats,
+    plot_histogram,
+    resolve_plot_dir,
+)
+from results_sync import ResultsRecorder, add_results_args  # noqa: E402
+from train_control import EpochBudget, add_epoch_control_args  # noqa: E402
 from checkpoint_utils import (  # noqa: E402
     ResumableJsonl,
     ResumableLoader,
@@ -687,6 +697,10 @@ def train_entropy_model(
     save_interval_seconds=0.0,
     max_checkpoints=5,
     seed=42,
+    plot_dir=None,
+    plot_formats=("png",),
+    budget=None,
+    recorder=None,
 ):
     print(f"\n{'='*60}")
     print(f"Training Byte-Level Entropy Model")
@@ -747,8 +761,23 @@ def train_entropy_model(
             f"batch {rp.start_batch}"
         )
 
+    history = TrainingHistory(
+        plot_dir,
+        run_name="entropy_model_marathi",
+        title="Byte-level entropy model (Marathi)",
+        fingerprint=fingerprint,
+        resume=resume != "never",
+        formats=plot_formats,
+        loss_label="Byte cross-entropy",
+    )
+
+    if budget is None:
+        budget = EpochBudget(epochs, label="byte cross-entropy")
+    # Seeded from the history so a resumed run keeps its patience window.
+    budget.seed_from_history(history)
+
     model.train()
-    for epoch in range(rp.start_epoch, epochs):
+    for epoch in budget.epochs_from(rp.start_epoch):
         total_loss = 0.0
         n_batches = 0
         start = time.time()
@@ -767,9 +796,17 @@ def train_entropy_model(
             optimizer.step()
             scheduler.step()
 
-            total_loss += loss.item()
+            step_loss = loss.item()
+            total_loss += step_loss
             n_batches += 1
             global_step += 1
+
+            # Sampled on the console-log cadence, so the step-loss and
+            # cosine-LR panels line up with what the run printed.
+            if global_step % 100 == 0:
+                history.log_step(
+                    global_step, step_loss, lr=scheduler.get_last_lr()[0]
+                )
 
             ckpt.maybe_save(
                 model,
@@ -790,11 +827,43 @@ def train_entropy_model(
         elapsed = time.time() - start
         avg_loss = total_loss / max(n_batches, 1)
         print(
-            f"  Epoch {epoch+1}/{epochs} DONE | "
+            f"  Epoch {budget.describe(epoch)} DONE | "
             f"Avg Loss: {avg_loss:.4f} | Time: {elapsed:.1f}s"
+        )
+        budget.observe(epoch, avg_loss)
+        # The loss IS the entropy this model exists to produce (nats/byte under
+        # cross-entropy), so the curve doubles as the patching-quality signal:
+        # the entropy threshold is only meaningful once it has converged.
+        history.log_epoch(
+            epoch + 1,
+            avg_loss,
+            seconds=elapsed,
+            lr=scheduler.get_last_lr()[0],
+            bits_per_byte=avg_loss / math.log(2),
         )
         ckpt.save_epoch(
             model, optimizer, scheduler, epoch=epoch, global_step=global_step
+        )
+
+    print(budget.summary())
+    figures = history.plot()
+    # The recorder is filled in here but published by the caller, which still
+    # has the patching-distribution figures to add after this returns.
+    if recorder is not None:
+        recorder.add_source(*figures, history.json_path)
+        recorder.add_metrics(
+            best_byte_cross_entropy=budget.best,
+            best_epoch=budget.best_epoch,
+            epochs_run=budget.observed,
+            bits_per_byte=(
+                budget.best / math.log(2) if budget.best is not None else None
+            ),
+        )
+        recorder.add_info(
+            entropy_model_parameters=total_params,
+            training_sentences=len(marathi_texts),
+            training_chunks=len(dataset),
+            **budget.as_dict(),
         )
 
     model.eval()
@@ -821,13 +890,42 @@ class PatchingSummary:
         self.total_patches = 0
         self.total_bytes = 0
         self.examples: list = []
+        # Distributions, kept as count-keyed tallies rather than per-sentence
+        # lists so plotting them costs the same on a 10k-sentence scan and on a
+        # multi-gigabyte one.
+        self.patches_per_sentence: dict[int, int] = {}
+        self.patch_lengths: dict[int, int] = {}
 
     def observe(self, record: dict, keep_example: bool = False) -> None:
         self.n_sentences += 1
-        self.total_patches += record.get("num_patches", 0)
+        n_patches = record.get("num_patches", 0)
+        self.total_patches += n_patches
         self.total_bytes += record.get("num_bytes", 0)
+        self.patches_per_sentence[n_patches] = (
+            self.patches_per_sentence.get(n_patches, 0) + 1
+        )
+        for length in record.get("patch_lengths", ()):
+            self.patch_lengths[length] = self.patch_lengths.get(length, 0) + 1
         if keep_example and len(self.examples) < self.MAX_EXAMPLES:
             self.examples.append(record)
+
+    @staticmethod
+    def _expand(tally: dict[int, int], cap: int = 200_000) -> list[float]:
+        """Tally -> sample list for the histogram plotter, capped in size."""
+        total = sum(tally.values()) or 1
+        out: list[float] = []
+        for value, count in sorted(tally.items()):
+            # Proportional down-sampling keeps the shape while bounding the
+            # list handed to matplotlib.
+            keep = max(1, round(count * min(1.0, cap / total)))
+            out.extend([float(value)] * keep)
+        return out
+
+    def patches_per_sentence_samples(self) -> list[float]:
+        return self._expand(self.patches_per_sentence)
+
+    def patch_length_samples(self) -> list[float]:
+        return self._expand(self.patch_lengths)
 
     @property
     def avg_patches_per_sentence(self) -> float:
@@ -1097,11 +1195,24 @@ def main():
         default="cuda" if torch.cuda.is_available() else "cpu",
     )
     add_resume_args(parser, default_interval_steps=200)
+    add_plot_args(parser)
+    add_epoch_control_args(parser)
+    add_results_args(parser)
 
     args = parser.parse_args()
     report_device(args.device)
     seed_everything(args.ckpt_seed)
     fingerprint = config_fingerprint(args)
+    plot_dir = resolve_plot_dir(
+        args, os.path.dirname(os.path.abspath(args.save_model)) or "."
+    )
+    formats = plot_formats(args)
+    recorder = ResultsRecorder(
+        args,
+        run_name="entropy_model_marathi",
+        script="run_blt_patching.py",
+        fingerprint=fingerprint,
+    )
 
     # ---- Load dataset (streaming to avoid downloading entire 7.8GB) ----
     print("Loading BhashaSetu dataset from HuggingFace (streaming)...")
@@ -1156,6 +1267,13 @@ def main():
             save_interval_seconds=args.save_interval_seconds,
             max_checkpoints=args.max_checkpoints,
             seed=args.ckpt_seed,
+            plot_dir=plot_dir,
+            plot_formats=formats,
+            # This script's fixed-count flag is --train_epochs, not --epochs.
+            budget=EpochBudget.from_args(
+                args, label="byte cross-entropy", epochs=args.train_epochs
+            ),
+            recorder=recorder,
         )
         # Save model with config for easy reloading
         if args.save_model:
@@ -1212,6 +1330,51 @@ def main():
     print(f"  Total patches       : {results.total_patches:,}")
     print(f"  Avg patches/sentence: {results.avg_patches_per_sentence:.1f}")
     print(f"  Avg bytes/patch     : {results.avg_bytes_per_patch:.1f}")
+
+    # Patching distributions. These are what the entropy threshold actually
+    # controls, so they are the diagnostic to look at when tuning --threshold.
+    patch_figures = []
+    if plot_dir and results.n_sentences:
+        tag = f"tau{args.threshold:g}".replace(".", "p")
+        patch_figures += plot_histogram(
+            results.patches_per_sentence_samples(),
+            os.path.join(plot_dir, f"patching_{tag}_patches_per_sentence"),
+            title=(
+                f"Patches per sentence (τ={args.threshold:g}, "
+                f"mode={args.patching_mode})"
+            ),
+            x_label="Patches per sentence",
+            formats=formats,
+        )
+        patch_figures += plot_histogram(
+            results.patch_length_samples(),
+            os.path.join(plot_dir, f"patching_{tag}_patch_length"),
+            title=f"Patch length in bytes (τ={args.threshold:g})",
+            x_label="Patch length (bytes)",
+            formats=formats,
+        )
+
+    # Publish: the entropy-model training curve (added inside
+    # train_entropy_model) plus the patching distributions from this scan.
+    recorder.add_source(*patch_figures)
+    recorder.add_metrics(
+        sentences=results.n_sentences,
+        total_patches=results.total_patches,
+        total_bytes=results.total_bytes,
+        avg_patches_per_sentence=round(results.avg_patches_per_sentence, 4),
+        avg_bytes_per_patch=round(results.avg_bytes_per_patch, 4),
+        compression_ratio=round(
+            results.total_bytes / max(results.total_patches, 1), 4
+        ),
+    )
+    recorder.add_info(
+        threshold=args.threshold,
+        patching_mode=args.patching_mode,
+        threshold_add=args.threshold_add,
+        reset_context_on_newline=args.reset_context_on_newline,
+        mode=args.mode,
+    )
+    recorder.publish()
 
     # Show a few example patches
     print(f"\n{'='*60}")

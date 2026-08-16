@@ -184,6 +184,378 @@ not use the GPU it was given".
 
 ---
 
+## 0.57 Figures: training curves and evaluation plots
+
+**Every training script draws its own training curve, and every evaluation
+script draws its own results figures**, at 300 DPI, next to the run's other
+outputs. Nothing extra needs to be run and no flags are required.
+
+```
+--plot_dir DIR        where figures go (default: the run's own output dir --
+                      --model_dir or --out_dir, whichever the script uses)
+--plot_format FMT     png (default) | jpg | both
+--no_plots            skip figure generation entirely
+```
+
+These three flags are excluded from the run fingerprint, so switching plotting
+on or changing the format mid-run does **not** invalidate an in-progress run's
+checkpoints or embedding caches.
+
+### What a training run writes
+
+```
+<plot_dir>/<run>_training_curve.png      # loss vs epoch (+ validation, best-epoch callout)
+<plot_dir>/<run>_training_dashboard.png  # step loss, epoch loss, LR schedule,
+                                         #   gradient norm, epoch wall-clock, eval metrics
+<plot_dir>/<run>_history.json            # the raw scalars behind both figures
+```
+
+The dashboard only draws panels it has data for, so a run without a learning-rate
+schedule or without per-epoch evaluation simply gets a smaller sheet.
+
+`<run>_history.json` carries the run fingerprint and is **resume-aware**: a job
+that is preempted after epoch 2 and restarted finishes with a curve covering
+epochs 1–4, not one that begins at the restart. A history written under a
+different configuration is not spliced in — it is discarded, the same way a
+mismatched checkpoint is refused (§0.5).
+
+Per-step scalars are *sampled* (every 50 steps, or `--log_every` where the
+script has one) rather than recorded per optimizer step. The gradient-norm
+reduction walks every parameter, so it stays off the hot path, and the sidecar
+stays small on a multi-epoch run.
+
+| Script | Run name | Loss plotted |
+| --- | --- | --- |
+| `train_lcm_blt.py` | `lcm_blt_<variant>` | MSE / diffusion / RVQ loss per variant |
+| `train_lcm_blt_mt.py` | `lcm_blt_mt_s<seed>` | concept MSE (one curve per seed) |
+| `train_lcm_sonar.py` | `lcm_sonar_fraction<F>` | masked MSE |
+| `train_lcm_bpe.py` | `lcm_bpe_fraction<F>` | masked MSE |
+| `train_bpe_transformer.py` | `bpe_transformer_fraction<F>` | cross-entropy (+ perplexity) |
+| `train_bpe_llama8b.py` | `bpe_llama8b_fraction<F>` | cross-entropy, transcribed from the HF Trainer log |
+| `train_base_lcm.py` | `base_lcm` | MSE, **with a held-out validation curve** |
+| `train_sonar.py` | `sonar_lite` | reconstruction + λ·MSE |
+| `finetune_lcm.py` | `lcm_finetuned` | MSE |
+| `blt_decoder.py` | `blt_decoder` | byte cross-entropy (+ byte perplexity) |
+| `run_blt_patching.py` | `entropy_model_marathi` | byte cross-entropy (+ bits/byte) |
+
+### What an evaluation run writes
+
+| Script | Figures |
+| --- | --- |
+| `eval_lcm_blt.py` | metric bars, metric table, hypothesis-vs-reference length delta |
+| `eval_lcm_sonar.py` | metric vs noise level, metric table |
+| `evaluate_blt_lcm.py` | MSE by sentence position in the document, per-batch MSE distribution |
+| `eval_runner.py` | metric degradation vs noise, **one line per seed**, plus a seed-averaged table |
+| `run_metric_suite.py` | metrics across checkpoints (i.e. across training), COMET on its own axis, best-checkpoint bars, summary table |
+| `train_lcm_blt_mt.py`, `train_lcm_*`, `train_bpe_*` | noise-robustness curves and a metric table after their eval stage |
+| `compare_bhashasetu_metrics.py` | grouped bars and degradation lines, per metric, across BLT / BPE / SONAR |
+| `benchmark_bhashasetu_models.py` | cross-model robustness per data fraction, score-by-fraction bars, full summary table |
+| `run_blt_patching.py` | patches-per-sentence and patch-length distributions at the chosen τ |
+
+`benchmark_bhashasetu_models.py` forwards `--plot_format` / `--no_plots` to every
+sub-job, so a whole benchmark sweep is drawn in one format; `--plot_dir` is not
+forwarded, so each run keeps its own figures beside its own outputs.
+
+Figure generation is best-effort by design: a headless node without a writable
+font cache, a missing backend, or a corrupt sidecar prints a warning and the run
+continues. A finished training run is never lost to a plotting failure.
+
+The paper figures proper are still built separately by `generate_paper_figures.py`
+and the per-analysis plotters under `error_analysis/`, `fertility_audit/`,
+`morpheme_alignment/`, `fixed_chunk_ablation/` and `tokenization_statistics/`.
+`tests/test_plot_utils.py` covers the shared helpers in `lcm_scripts/plot_utils.py`.
+
+---
+
+## 0.58 Variable epochs: train while the loss is still improving
+
+A fixed `--epochs` is a guess. Every training script also accepts a stopping
+rule that keeps going while the monitored loss improves:
+
+```
+--train_until_plateau   run until the loss stops improving, instead of a fixed --epochs
+--patience N            consecutive non-improving epochs tolerated (default 3)
+--min_delta X           improvement smaller than X counts as no improvement (default 0)
+--min_epochs N          never stop on plateau before N epochs (default 1)
+--max_epochs N          hard cap, so an oscillating loss still terminates (default 200)
+```
+
+```bash
+# Stop once three epochs in a row fail to improve the loss by more than 1e-4,
+# but never before 5 epochs and never past 60.
+uv run lcm_scripts/train_lcm_blt.py --entropy_model ... \
+  --train_until_plateau --patience 3 --min_delta 1e-4 --min_epochs 5 --max_epochs 60
+```
+
+Without the flag, nothing changes: `--epochs N` runs exactly N epochs, as every
+existing command line and Slurm script expects. With it, `--epochs` becomes a
+**floor** (at least that many) and `--max_epochs` becomes the ceiling.
+
+What is monitored:
+
+| Script | Monitored quantity |
+| --- | --- |
+| `train_base_lcm.py` | **held-out validation MSE** (it has a real 80/20 split) |
+| every other script | that script's training loss |
+| `train_bpe_llama8b.py` | the HF Trainer's logged training loss, via a `TrainerCallback` that sets `should_training_stop` |
+
+Each epoch prints its position (`Epoch 7/<=60 (until plateau)`), non-improving
+epochs print the patience countdown, and the run ends with a line saying why:
+
+```
+  [plateau] epoch 9: MSE loss 0.3616 did not beat 0.3554 by > 0.0001 (2/3 before stopping)
+[epochs] ran 11 epoch(s); best MSE loss 0.355 at epoch 8; stopped because plateau: ...
+```
+
+**Resume-safe.** The patience counter is rebuilt from the run's
+`*_history.json`, so a job preempted on its second-to-last tolerated epoch comes
+back with the same "epochs since improvement" the original process had — not a
+fresh window that would buy several more pointless epochs.
+
+The stopping-rule flags are excluded from the run fingerprint on purpose: they
+govern how *long* a run goes, not what any step computes, so adding
+`--train_until_plateau` to an existing command **continues** that run from its
+checkpoint instead of discarding the epochs already paid for.
+
+---
+
+## 0.59 Publishing results to git (and GitHub)
+
+Every training and evaluation script ends by collecting what it produced into
+`results/runs/<run_name>/` and committing it:
+
+```
+results/runs/<run_name>/
+  README.md                 # metrics table, run info, embedded figures
+  run.json                  # ALL hyperparameters, metrics, stop reason, environment
+  <run>_history.json        # every recorded loss, LR and gradient norm
+  *.png / *.jpg             # the run's figures
+  metrics_*.csv             # the run's metric CSV, where it has one
+```
+
+```
+--push_results        also push the commit to the remote (or BLT_LCM_PUSH_RESULTS=1)
+--results_dir DIR     where collected results go (default results/runs)
+--results_remote R    remote to push to (default origin)
+--results_branch B    branch to push to (default: the current branch)
+--results_max_mb N    skip any single file larger than this (default 25)
+--no_results          do not collect or commit anything
+```
+
+`run.json` is the reproducibility record: the complete argparse namespace, the
+final and best losses, the stop reason, the git commit the code was at (flagged
+if the working tree was dirty), torch/CUDA versions, GPU name, and the Slurm job
+id when there is one.
+
+Deliberate limits, because this runs unattended at the end of every job:
+
+* **Only an explicit file list is staged** — `git add <paths>`, never `-A`. A run
+  cannot commit your working-tree edits, and cannot commit a checkpoint, dataset
+  shard or embedding cache. Only `.png/.jpg/.pdf/.svg/.csv/.json/.md/.txt` are
+  eligible; `.pth`/`.pt`/`.jsonl` are excluded by design.
+* **Size-capped** — anything over `--results_max_mb` is skipped with a warning
+  rather than written into git history, where it is permanent.
+* **Never fatal** — no remote, no upstream, a rejected push, a detached HEAD:
+  all print a warning and return. A finished training run is never lost to a
+  failed push.
+* **Never interactive** — every git call runs with `GIT_TERMINAL_PROMPT=0` and a
+  timeout (`--results_timeout`, default 120 s). A missing credential fails in
+  seconds instead of hanging a GPU job until its Slurm wall-clock limit, which
+  is the single most expensive way for unattended publishing to break.
+* **Push is opt-in** — committing locally is cheap and reversible; pushing is
+  neither. Set `BLT_LCM_PUSH_RESULTS=1` in `.env` to make it automatic for every
+  job without editing any command line.
+
+> **`.gitignore` note.** `runs/` (which matches at any depth) and `*.json` would
+> otherwise hide every published result. `.gitignore` ends with
+> `!results/runs/` + `!results/runs/**` to re-include them — the directory
+> negation has to come first, because git does not descend into an excluded
+> directory looking for negations. Removing those two lines silently disables
+> all publishing.
+
+### On a GPU cluster
+
+Slurm/PBS/LSF is auto-detected (via `SLURM_JOB_ID` and friends) and switches the
+publisher into **isolated commit** mode:
+
+```
+--results_commit_mode auto|isolated|worktree
+```
+
+Array jobs all `cd $REPO_DIR` into **one clone**. In `worktree` mode they would
+contend for `.git/index.lock`, and a job that moved `HEAD` would move it
+underneath every other job still running. In `isolated` mode the commit is built
+through a private index with plumbing (`read-tree` → `add` → `write-tree` →
+`commit-tree`) and pushed straight to the remote, so the only shared state
+touched is the remote ref:
+
+* the shared checkout's index, `HEAD` and working tree are never modified;
+* pushes that lose a race are retried (`--results_retries`, default 5) with
+  randomized backoff, so an array finishing together does not retry in lockstep;
+* a result identical to what is already on the remote is not re-pushed.
+
+Verified with 8 concurrent publishes into one checkout: all 8 landed, `HEAD`
+unchanged, no `index.lock` left behind.
+
+Because the local `HEAD` does not move, the results are **on the remote, not in
+your local checkout** — `git pull` to see them.
+
+### Credentials
+
+A compute node has no credential helper, no ssh agent and no terminal to prompt
+on. Put a token in `.env` (gitignored — line 1 of `.gitignore`), which every
+`scripts/*.sh` job script sources:
+
+```bash
+BLT_LCM_PUSH_RESULTS=1
+GITHUB_USERNAME=your-github-username
+GITHUB_TOKEN=ghp_...      # classic PAT with `repo` scope, or fine-grained
+                          # with "Contents: read and write" on this repo
+```
+
+**Never put the token in a tracked file** (`auto_setup.sh`, a submit script,
+`.env.example`). The first results push would publish it to GitHub, and GitHub
+revokes tokens it detects in pushes — breaking the jobs it was added for.
+
+`results_sync.py` reads `BLT_LCM_GIT_TOKEN`, `GIT_TOKEN`, `GITHUB_TOKEN` or
+`GH_TOKEN` (in that order) and injects it into an `https://` remote for the
+duration of the push. ssh remotes use the agent/key instead and need no token.
+The assembled URL is redacted out of any error message.
+
+`scripts/results_env.sh` is sourced by `auto_setup.sh` and every `scripts/*.sh`
+job. It loads `.env`, reports how the job will publish, and **verifies the
+credentials with `git ls-remote` before the job starts**, so a bad token is a
+message in the first second rather than a lost result eleven hours later:
+
+```
+Results publishing:
+  push: ON -> origin/main
+  auth: token from the environment (user ParamThakkar123)
+  credentials: OK (verified before the job starts)
+  mode: isolated commit (shared checkout safe; local HEAD is not moved)
+```
+
+`benchmark_bhashasetu_models.py` publishes a `bhashasetu_benchmark` record on top
+of the per-model ones, holding the cross-model comparison figures and the
+clean-input score of every (model, fraction) cell.
+
+`tests/test_results_sync.py` and `tests/test_train_control.py` cover both.
+
+---
+
+## 0.7 Publication-grade evaluation
+
+Five additions aimed squarely at what a reviewer checks first.
+
+### 0.7.1 FLORES-200 — comparable numbers
+
+```bash
+uv run lcm_scripts/eval_flores.py \
+  --lcm_checkpoint lcm_models/lcm_blt_mt_s42_best.pth \
+                   lcm_models/lcm_blt_mt_s43_best.pth \
+                   lcm_models/lcm_blt_mt_s44_best.pth \
+  --entropy_model patching_scratch/entropy_model_marathi.pt \
+  --pooler lcm_models/blt_pooler.pth --decoder lcm_models/blt_decoder.pth \
+  --flores_tgt mar_Deva --comet_model Unbabel/wmt22-comet-da \
+  --compare nllb-600m=outputs/flores_baselines/nllb-600m_eng_Latn-mar_Deva_noise0.0.hyp.txt
+```
+
+`lcm_scripts/flores_utils.py` loads FLORES-200 (`dev` = 997 sentences for
+tuning, `devtest` = 1012 for reporting), the benchmark IndicTrans2, NLLB and the
+Indic MT literature report on. Every BhashaSetu number in this repo is on an
+ad-hoc split nobody else uses, so it cannot be situated against anything;
+FLORES fixes that. Friendly aliases work everywhere (`mr`, `marathi`,
+`mar_Deva`). 24 Indic languages are available.
+
+FLORES has no train split by design — it is evaluation data only, so there is
+nothing to leak. Passing `--flores_max_examples` prints a warning, because a
+truncated devtest is **not** comparable to published numbers.
+
+### 0.7.2 Published baselines
+
+```bash
+uv run lcm_scripts/eval_public_baselines.py \
+  --systems nllb-600m indictrans2 --flores_tgt mar_Deva \
+  --noise_levels 0.0 0.1 0.2 --out_dir outputs/flores_baselines
+```
+
+Runs NLLB-200 and IndicTrans2 on exactly the segments `eval_flores.py` uses and
+writes their hypotheses, so the comparison is on identical data and can be
+paired-tested. IndicTrans2 additionally needs `pip install IndicTransToolkit`
+for its preprocessor — without it the model is fed unnormalized text and its
+scores are not the published ones, so the script refuses rather than reporting
+a misleadingly low number.
+
+### 0.7.3 Statistical significance
+
+`lcm_scripts/significance.py` handles the two independent sources of noise:
+
+* **Test-set noise** — `paired_test()` wraps sacrebleu's paired bootstrap
+  resampling (Koehn 2004, `--significance_test bs`) or approximate
+  randomization (`ar`). The same segments are resampled for both systems, so
+  segment difficulty cancels.
+* **Training noise** — `seed_summary()` aggregates the per-seed metric CSVs into
+  mean ± std with a **t-based** confidence interval. With 3 seeds, t(2)=4.303
+  rather than 1.96; a normal interval would be 2.2× too narrow.
+
+> **A trap worth knowing about.** sacrebleu returns its *floor* p-value
+> (`1/(n+1)`, e.g. 0.001 at 1000 resamples) when the observed delta is zero,
+> because no resample produces a larger delta than zero. Taken at face value
+> that reads as "p < 0.05, significant" for two **byte-identical** systems.
+> `SystemComparison.significant` checks the delta before the p-value, and
+> identical outputs are flagged in the results with a note.
+> `tests/test_significance.py` pins this, along with the property that matters:
+> a real gap comes out significant and two equally-good systems do not.
+
+### 0.7.4 Ablations
+
+```bash
+uv run lcm_scripts/run_ablations.py --ablation variant decode compute \
+  --entropy_model patching_scratch/entropy_model_marathi.pt --fraction 0.25
+```
+
+| Ablation | Answers |
+| --- | --- |
+| `variant` | all four LCM variants (base / one-tower / two-tower / quant). The LCM paper reports diffusion beating the MSE baseline, so reporting only `base` invites "did you try the variant your own citation prefers?" |
+| `decode` | generative decoding vs the nearest-neighbour retrieval baseline. Retrieval can only emit sentences already in the training corpus, so it flatters corpus metrics without generating anything; reporting both separates "good concept space" from "good decoder" |
+| `compute` | BLT-LCM vs a **parameter-matched** BPE Transformer. The match is searched over a size grid using an analytic parameter count (verified against real models in `tests/test_run_ablations.py`), and warns loudly if the closest configuration is more than 5% off rather than quietly calling it matched |
+
+At the paper's configuration (embed 1024 / model 2048 / 12 layers = 610.6M
+parameters) the matched baseline is 612.5M — 0.3% off.
+
+### 0.7.5 Cross-language transfer and the entropy-model mismatch
+
+```bash
+uv run lcm_scripts/eval_multilingual.py \
+  --entropy_model patching_scratch/entropy_model_marathi.pt
+```
+
+The entropy model was trained on Marathi, so every other language it patches —
+**including the English source side of the translation task** — is out of
+distribution. This measures the cost, on FLORES's n-way parallel data, so a
+difference between languages is a property of the model rather than of the test
+set. Measured on devtest:
+
+| Language | Script | Bits/byte | vs Marathi | Bytes/patch |
+| --- | --- | --- | --- | --- |
+| Marathi (trained on) | Deva | 0.244 | 1.00× | 23.9 |
+| Hindi | Deva | 0.208 | 0.85× | 36.6 |
+| Bengali | Beng | 0.220 | 0.90× | 68.4 |
+| Tamil | Taml | 0.241 | 0.99× | 71.8 |
+| **English** | **Latn** | **0.733** | **3.00×** | **13.0** |
+
+Two things worth stating in the paper rather than leaving for a reviewer:
+
+1. **English costs 3× the bits/byte of Marathi**, and is patched at half the
+   granularity. Every reported En→Mr number is computed through that mismatch.
+2. **Low entropy is not good patching.** The non-Devanagari Indic scripts score
+   *lower* bits/byte than Marathi yet get 3–4× larger patches — the model has
+   learned generic UTF-8 continuation structure for byte ranges it never saw in
+   training, which is predictable without being linguistically meaningful. The
+   compression ratio, not the entropy, is what exposes this.
+
+---
+
 ## 0.6 Paper-fidelity notes
 
 The implementations follow **BLT** (Pagnoni et al., 2024) and **LCM** (Barrault

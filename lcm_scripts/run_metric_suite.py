@@ -26,6 +26,15 @@ from typing import Dict, List, Optional
 
 from eval_metrics import compute_all
 from device_utils import report_device
+from plot_utils import (
+    add_plot_args,
+    plot_formats,
+    plot_lines,
+    plot_metric_bars,
+    plot_table,
+    resolve_plot_dir,
+)
+from results_sync import ResultsRecorder, add_results_args
 from checkpoint_utils import StageTracker, add_resume_args, config_fingerprint
 
 
@@ -138,6 +147,8 @@ def main():
         help="Fail if any checkpoint is missing a matching hypothesis file",
     )
     add_resume_args(parser, training=False)
+    add_plot_args(parser)
+    add_results_args(parser)
     args = parser.parse_args()
     # BLEU/chrF++/TER/METEOR are CPU string metrics; COMET runs a model here.
     report_device(label="metrics", warn_cpu=False)
@@ -222,6 +233,92 @@ def main():
             writer.writerow(row)
 
     print(f"Wrote metric suite results to: {args.out_csv}")
+
+    plot_dir = resolve_plot_dir(args, os.path.dirname(args.out_csv) or "results")
+    figures: List[str] = []
+    best = max(rows, key=lambda r: r["chrF++"] if r["chrF++"] == r["chrF++"] else -1e9)
+    if plot_dir:
+        formats = plot_formats(args)
+        prefix = os.path.splitext(args.out_csv)[0]
+        prefix = os.path.join(plot_dir, os.path.basename(prefix))
+        labels = [
+            os.path.splitext(r["checkpoint"])[0].replace("lcm_blt_", "")
+            for r in rows
+        ]
+        metric_names = ["BLEU", "chrF++", "METEOR", "TER"]
+        # Checkpoints are ordered by epoch (see epoch_key), so this reads as a
+        # metric-vs-training-progress curve rather than an arbitrary sequence.
+        figures += plot_lines(
+            labels,
+            {m: [r.get(m, float("nan")) for r in rows] for m in metric_names},
+            f"{prefix}_metrics_by_checkpoint",
+            title="MT metrics across checkpoints",
+            x_label="Checkpoint",
+            y_label="Score",
+            rotate_xticks=30 if max(len(x) for x in labels) > 6 else 0,
+            formats=formats,
+        )
+        # COMET is on a 0-1 scale, so it gets its own axis rather than being
+        # flattened against BLEU/chrF++.
+        if any(r.get("COMET") == r.get("COMET") for r in rows):
+            figures += plot_lines(
+                labels,
+                {"COMET": [r.get("COMET", float("nan")) for r in rows]},
+                f"{prefix}_comet_by_checkpoint",
+                title="COMET across checkpoints",
+                x_label="Checkpoint",
+                y_label="COMET",
+                rotate_xticks=30 if max(len(x) for x in labels) > 6 else 0,
+                formats=formats,
+            )
+        # The single best checkpoint by chrF++, as a headline bar chart.
+        figures += plot_metric_bars(
+            {m: best[m] for m in metric_names + ["COMET"]},
+            f"{prefix}_best_checkpoint_metrics",
+            title=f"Best checkpoint by chrF++: {best['checkpoint']}",
+            subtitle=f"{best['num_sentences']:,} sentences",
+            formats=formats,
+        )
+        figures += plot_table(
+            [
+                [r["checkpoint"], f"{r['num_sentences']:,}"]
+                + [
+                    f"{r[m]:.2f}" if r[m] == r[m] else "—"
+                    for m in metric_names
+                ]
+                + [f"{r['COMET']:.4f}" if r["COMET"] == r["COMET"] else "—"]
+                for r in rows
+            ],
+            ["Checkpoint", "Sentences", "BLEU ↑", "chrF++ ↑", "METEOR ↑", "TER ↓", "COMET ↑"],
+            f"{prefix}_summary_table",
+            title="Metric suite results",
+            highlight_row=rows.index(best),
+            formats=formats,
+        )
+
+    recorder = ResultsRecorder(
+        args,
+        run_name=os.path.splitext(os.path.basename(args.out_csv))[0],
+        script="run_metric_suite.py",
+        fingerprint=fingerprint,
+    )
+    recorder.add_source(*figures, args.out_csv)
+    recorder.add_metrics(
+        best_checkpoint=best["checkpoint"],
+        **{
+            f"best_{k}": best[k]
+            for k in ("BLEU", "chrF++", "METEOR", "COMET", "TER")
+            if best[k] == best[k]
+        },
+    )
+    recorder.add_info(
+        checkpoints_scored=len(rows),
+        checkpoints_skipped=len(skipped),
+        sentences=rows[0]["num_sentences"],
+        comet_model=args.comet_model,
+    )
+    recorder.publish()
+
     if skipped:
         print("Skipped checkpoints without matching hypothesis files:")
         for ckpt, hyp_path in skipped:

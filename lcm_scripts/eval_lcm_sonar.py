@@ -41,6 +41,14 @@ from eval_metrics import compute_bleu, compute_chrf, compute_ter
 from sonar_loader import SonarLoader
 from train_lcm_sonar import encode_docs
 from device_utils import report_device
+from plot_utils import (
+    add_plot_args,
+    plot_formats,
+    plot_noise_curves,
+    plot_table,
+    resolve_plot_dir,
+)
+from results_sync import ResultsRecorder, add_results_args
 from checkpoint_utils import (
     StageTracker,
     add_resume_args,
@@ -101,6 +109,8 @@ def main() -> None:
         "so a rerun skips re-encoding it.",
     )
     add_resume_args(p, training=False)
+    add_plot_args(p)
+    add_results_args(p)
     args = p.parse_args()
 
     device = report_device(args.device)
@@ -169,6 +179,56 @@ def main() -> None:
         writer.writeheader()
         writer.writerows(rows)
     print(f"Wrote {out_csv}")
+
+    plot_dir = resolve_plot_dir(args, os.path.dirname(out_csv) or ".")
+    figures: list[str] = []
+    if plot_dir and rows:
+        formats = plot_formats(args)
+        prefix = os.path.join(plot_dir, f"eval_lcm_sonar_fraction{args.fraction}")
+        figures += plot_noise_curves(
+            rows,
+            f"{prefix}_noise_robustness",
+            title=(
+                f"SONAR-LCM robustness to input noise "
+                f"({os.path.basename(args.checkpoint)}, fraction {args.fraction})"
+            ),
+            formats=formats,
+        )
+        figures += plot_table(
+            [
+                [
+                    f"{r['noise']:.0%}",
+                    f"{r['num_predictions']:,}",
+                    f"{r['BLEU']:.2f}",
+                    f"{r['chrF++']:.2f}",
+                    f"{r['TER']:.2f}",
+                ]
+                for r in rows
+            ],
+            ["Input noise", "Predictions", "BLEU ↑", "chrF++ ↑", "TER ↓"],
+            f"{prefix}_metrics_table",
+            title=f"SONAR-LCM metrics (fraction {args.fraction})",
+            formats=formats,
+        )
+
+    recorder = ResultsRecorder(
+        args,
+        run_name=f"eval_lcm_sonar_fraction{args.fraction}",
+        script="eval_lcm_sonar.py",
+        fingerprint=fingerprint,
+    )
+    recorder.add_source(*figures, out_csv)
+    clean = next((r for r in rows if r["noise"] == 0.0), rows[0] if rows else {})
+    recorder.add_metrics(
+        **{f"clean_{k}": v for k, v in clean.items() if isinstance(v, (int, float))}
+    )
+    recorder.add_info(
+        checkpoint=args.checkpoint,
+        fraction=args.fraction,
+        eval_docs=len(eval_docs),
+        noise_levels=args.noise_levels,
+    )
+    recorder.publish()
 
 
 if __name__ == "__main__":

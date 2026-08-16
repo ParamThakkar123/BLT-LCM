@@ -33,6 +33,15 @@ tokenization_statistics/patch_compression_by_morpheme_class.png
 # Apptainer container image
 *.sif
 
+# Published run results ARE meant to be committed -- that is the whole point of
+# results_sync.py. Three rules above would otherwise swallow them: `runs/`
+# (which matches at any depth, so it hides results/runs/ too), `*.json` (the
+# run record and loss history), and `results/mt_eval_results.csv`. The
+# directory has to be re-included before the files, because git does not
+# descend into an excluded directory to look for negations.
+!results/runs/
+!results/runs/**
+
 # Vendored/third-party tooling and downloaded archives (do not commit — they
 # bloat the repo). Singularity is a container runtime pulled in for HPC builds.
 singularity/
