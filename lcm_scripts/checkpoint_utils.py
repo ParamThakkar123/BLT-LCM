@@ -25,9 +25,11 @@ into a run whose flags have changed is refused rather than silently splicing two
 configurations together; pass ``--resume never`` to start fresh instead.
 
 Checkpoint writes go through ``atomic_torch_save`` / ``atomic_write_text``: the
-payload lands in a sibling ``.tmp`` file and is then ``os.replace``-d into
-place, so a process killed mid-write leaves the previous checkpoint intact
-instead of a truncated one.
+payload lands in a uniquely-named sibling ``.tmp`` file, is fsync-ed, and is
+then ``os.replace``-d into place, so a process killed mid-write leaves the
+previous checkpoint intact instead of a truncated one, and two writers aimed at
+the same path settle it by last-writer-wins rather than by one of them dying on
+a rename.
 """
 
 from __future__ import annotations
@@ -39,6 +41,7 @@ import random
 import re
 import shutil
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Iterator, Optional, Sequence
@@ -122,25 +125,70 @@ def _ensure_parent(path: str) -> None:
         os.makedirs(parent, exist_ok=True)
 
 
+def _stage_path(path: str) -> str:
+    """Create an empty, uniquely-named staging file beside ``path``.
+
+    The staging name has to be unique per writer, not a fixed ``<path>.tmp``:
+    with a shared name, two writers aimed at the same output (two jobs launched
+    against one ``lcm_models/``, an OOM retry overlapping its predecessor) both
+    write the same tmp, and whichever calls ``os.replace`` first moves the file
+    out from under the other -- which then dies with ``FileNotFoundError`` on a
+    rename, hundreds of seconds into training. Distinct staging files make that
+    a harmless last-writer-wins instead of a crash. Same directory, so the
+    rename stays on one filesystem and therefore stays atomic.
+    """
+    _ensure_parent(path)
+    parent = os.path.dirname(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(
+        prefix=f"{os.path.basename(path)}.", suffix=".tmp", dir=parent
+    )
+    os.close(fd)
+    return tmp
+
+
+def _discard(tmp: str) -> None:
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
+
+
 def atomic_torch_save(obj: Any, path: str) -> None:
     """``torch.save`` that can't leave a half-written checkpoint behind."""
     if torch is None:  # pragma: no cover
         raise RuntimeError("torch is required for atomic_torch_save")
-    _ensure_parent(path)
-    tmp = f"{path}.tmp"
-    torch.save(obj, tmp)
-    os.replace(tmp, path)
+    tmp = _stage_path(path)
+    try:
+        torch.save(obj, tmp)
+        # torch.save closes its file without fsync, so on a crash the rename can
+        # land before the bytes do; reopening to fsync keeps the promise above.
+        # Write mode: Windows' fsync is FlushFileBuffers, which a read handle is
+        # not allowed to call. Best-effort -- some network mounts refuse fsync
+        # outright, and losing durability on a power cut beats killing a run
+        # that is otherwise fine.
+        try:
+            with open(tmp, "r+b") as f:
+                os.fsync(f.fileno())
+        except OSError:
+            pass
+        os.replace(tmp, path)
+    except BaseException:
+        _discard(tmp)
+        raise
 
 
 def atomic_write_text(text: str, path: str, encoding: str = "utf-8") -> None:
     """Write text so readers never observe a partial file."""
-    _ensure_parent(path)
-    tmp = f"{path}.tmp"
-    with open(tmp, "w", encoding=encoding, newline="") as f:
-        f.write(text)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    tmp = _stage_path(path)
+    try:
+        with open(tmp, "w", encoding=encoding, newline="") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        _discard(tmp)
+        raise
 
 
 def atomic_write_json(obj: Any, path: str, indent: int = 2) -> None:
