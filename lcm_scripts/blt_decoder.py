@@ -869,7 +869,12 @@ if __name__ == "__main__":
         help="Concept dimension (default 1024, matching SONAR / the LCM). The "
         "pooler learns to project pooled byte features to this dimension.",
     )
-    from checkpoint_utils import add_resume_args, config_fingerprint, seed_everything
+    from checkpoint_utils import (
+        DEFAULT_FINGERPRINT_IGNORE,
+        add_resume_args,
+        config_fingerprint,
+        seed_everything,
+    )
     from plot_utils import add_plot_args, plot_formats, resolve_plot_dir
     from results_sync import ResultsRecorder, add_results_args
     from train_control import add_epoch_control_args
@@ -882,7 +887,13 @@ if __name__ == "__main__":
 
     report_device(args.device)
     seed_everything(args.ckpt_seed)
-    fingerprint = config_fingerprint(args)
+    # --batch_size is a VRAM knob, not part of what the run computes: the
+    # auto-setup driver halves it and retries after a CUDA OOM, and that retry
+    # has to resume the interrupted run instead of aborting on a fingerprint
+    # mismatch against the checkpoint the first attempt already wrote.
+    fingerprint = config_fingerprint(
+        args, ignore=DEFAULT_FINGERPRINT_IGNORE | {"batch_size"}
+    )
 
     from datasets import load_dataset
     from tqdm import tqdm

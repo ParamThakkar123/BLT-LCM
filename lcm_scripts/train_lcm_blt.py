@@ -39,6 +39,7 @@ from plot_utils import (
 from results_sync import ResultsRecorder, add_results_args
 from train_control import EpochBudget, add_epoch_control_args
 from checkpoint_utils import (
+    DEFAULT_FINGERPRINT_IGNORE,
     ResumableLoader,
     TrainingCheckpointer,
     add_resume_args,
@@ -244,7 +245,19 @@ def main():
         print("  [amp] no CUDA device; running in fp32")
         args.amp = False
     seed_everything(args.ckpt_seed)
-    fingerprint = config_fingerprint(args)
+    # --batch_size is a VRAM knob, not part of what the run computes: the
+    # auto-setup driver halves it and retries after a CUDA OOM, and that retry
+    # has to resume the interrupted run (and reuse the cached embeddings, which
+    # a frozen encoder produces identically at any batch size) instead of
+    # aborting on a fingerprint mismatch.
+    fingerprint = config_fingerprint(
+        args, ignore=DEFAULT_FINGERPRINT_IGNORE | {"batch_size"}
+    )
+    # Fraction in the run name: one encode pass per fraction, so the training
+    # curve and the published results directory must not be shared between them.
+    # The checkpoints are separated by --model_dir instead (the eval scripts
+    # glob for a fixed `lcm_blt_best.pth` inside a per-run directory).
+    run_name = f"lcm_blt_{args.lcm_variant}_fraction{args.fraction:g}"
     writer = None
     if args.log_dir:
         writer = setup_logging(args.log_dir)
@@ -264,8 +277,8 @@ def main():
     # drawing one that starts at the restart.
     history = TrainingHistory(
         resolve_plot_dir(args, args.model_dir),
-        run_name=f"lcm_blt_{args.lcm_variant}",
-        title=f"BLT-LCM ({args.lcm_variant})",
+        run_name=run_name,
+        title=f"BLT-LCM ({args.lcm_variant}, fraction {args.fraction:g})",
         fingerprint=fingerprint,
         resume=args.resume != "never",
         formats=plot_formats(args),
@@ -664,7 +677,7 @@ def main():
     # repository and (with --push_results) push them.
     recorder = ResultsRecorder(
         args,
-        run_name=f"lcm_blt_{args.lcm_variant}",
+        run_name=run_name,
         script="train_lcm_blt.py",
         fingerprint=fingerprint,
     )

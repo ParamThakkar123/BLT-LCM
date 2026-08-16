@@ -15,6 +15,9 @@
 # finished instead of redoing the whole pipeline. Inside a step, the python
 # scripts' own `--resume auto` checkpointing picks up mid-epoch.
 #
+# Ctrl-C stops the pipeline, not just the running step: the interrupted step is
+# left unmarked (so a re-run resumes it) and nothing further is started.
+#
 # Usage (from anywhere -- the script finds its own repo root):
 #   bash scripts/auto_setup.sh                  # everything, resuming as needed
 #   bash scripts/auto_setup.sh --list           # show the plan + chosen batch sizes
@@ -94,6 +97,33 @@ info() { echo "${C_DIM}[auto-setup]${C_OFF} $*"; }
 warn() { echo "${C_YEL}[auto-setup] WARNING:${C_OFF} $*" >&2; }
 die()  { echo "${C_RED}[auto-setup] FATAL:${C_OFF} $*" >&2; exit 1; }
 rule() { echo "${C_DIM}--------------------------------------------------------------------${C_OFF}"; }
+
+# --------------------------------------------------------------------------- #
+# interrupt handling
+# --------------------------------------------------------------------------- #
+
+# Ctrl-C has to stop the pipeline, not just the step that is running. The
+# terminal delivers SIGINT to the whole foreground process group, so this script
+# and every later step get it too: without a trap, one Ctrl-C killed the running
+# training and the driver then marched through all remaining steps, each dying
+# in under a second and each recorded as a genuine "FAILED (exit 130)".
+INTERRUPTED=0
+INTERRUPTED_STEP=""
+PIPELINE_START=$(date +%s)
+
+on_signal() {
+    # A second Ctrl-C during the (short) shutdown falls through to the default
+    # action, so the driver can always be killed outright.
+    (( INTERRUPTED )) && return 0
+    INTERRUPTED=1
+    echo
+    warn "received SIG$1 -- stopping the pipeline (re-run to resume where it stopped)"
+}
+trap 'on_signal INT' INT
+trap 'on_signal TERM' TERM
+
+# 128 + signal number: SIGINT and SIGTERM as a child's exit status.
+interrupted_rc() { (( $1 == 130 || $1 == 143 )); }
 
 # --------------------------------------------------------------------------- #
 # step 0 -- locate the repository root
@@ -366,6 +396,13 @@ run_step() {
     local marker="$MARK_DIR/$(slug "$id").done"
     local log="$LOG_DIR/$(slug "$id").log"
 
+    # A signal that arrived between steps (or while one was finishing cleanly)
+    # must not start the next one.
+    if (( INTERRUPTED )); then
+        print_summary
+        exit 130
+    fi
+
     if ! selected "$id"; then
         SKIPPED_STEPS+=("$id (filtered)")
         return 0
@@ -406,6 +443,14 @@ run_step() {
 
         if (( rc == 0 )); then break; fi
 
+        # Killed by a signal rather than failing on its own: stop here. The OOM
+        # backoff below must not "retry" an interrupted step, and the pipeline
+        # must not continue into steps the same signal would kill instantly.
+        if (( INTERRUPTED )) || interrupted_rc "$rc"; then
+            INTERRUPTED=1
+            break
+        fi
+
         # Out of memory -> halve the batch size and try again, if the step has one.
         if [[ -n "$bs" ]] && (( attempt < MAX_OOM_RETRIES )) && (( bs > 1 )) \
            && tail -400 "$log" | grep -qiE 'out of memory|CUBLAS_STATUS_ALLOC_FAILED|CUDA error: out of memory'; then
@@ -417,6 +462,18 @@ run_step() {
         fi
         break
     done
+
+    if (( INTERRUPTED )); then
+        # No completion marker and no failure entry: the step neither finished
+        # nor failed, so a re-run picks it up again from its own --resume state.
+        INTERRUPTED_STEP="$id"
+        printf '{"id":"%s","desc":"%s","status":"interrupted","exit_code":%d,"batch_size":"%s","elapsed_s":%d,"finished":"%s","log":"%s"}\n' \
+            "$(json_escape "$id")" "$(json_escape "$desc")" \
+            "$rc" "${bs:-}" "$elapsed" "$(now)" "$(json_escape "$log")" >> "$MANIFEST"
+        warn "$id INTERRUPTED after ${elapsed}s -- not marked done; re-run to resume it"
+        print_summary
+        exit 130
+    fi
 
     local arts
     arts=$(record_artifacts "$id")
@@ -447,9 +504,42 @@ run_step() {
     warn "$id FAILED (exit $rc) after ${elapsed}s -- see $log"
     FAILED_STEPS+=("$id (exit $rc)")
     if [[ "$STOP_ON_FAIL" == "1" ]]; then
+        print_summary
         die "STOP_ON_FAIL=1 and $id failed"
     fi
     return "$rc"
+}
+
+# What ran, what did not, and where to look. Called from the normal end of the
+# pipeline and from the interrupt path, so an aborted run still reports state.
+print_summary() {
+    local total=$(( $(date +%s) - PIPELINE_START ))
+    rule
+    if (( INTERRUPTED )); then
+        say "pipeline INTERRUPTED after ${total}s${INTERRUPTED_STEP:+ during $INTERRUPTED_STEP}"
+    else
+        say "pipeline finished in ${total}s"
+    fi
+    say "state:     $MARK_DIR"
+    say "logs:      $LOG_DIR"
+    say "artifacts: $ART_DIR"
+    say "manifest:  $MANIFEST"
+    echo
+    if (( ${#DONE_STEPS[@]} )); then
+        echo "${C_GRN}completed (${#DONE_STEPS[@]}):${C_OFF}"
+        printf '  %s\n' "${DONE_STEPS[@]}"
+    fi
+    if (( ${#SKIPPED_STEPS[@]} )); then
+        echo "${C_DIM}skipped (${#SKIPPED_STEPS[@]}):${C_OFF}"
+        printf '  %s\n' "${SKIPPED_STEPS[@]}"
+    fi
+    if (( ${#FAILED_STEPS[@]} )); then
+        echo "${C_RED}failed (${#FAILED_STEPS[@]}):${C_OFF}"
+        printf '  %s\n' "${FAILED_STEPS[@]}"
+    fi
+    echo
+    say "re-run this script to continue: completed steps are skipped, and an"
+    say "interrupted or failed one resumes from its own checkpoint."
 }
 
 # --------------------------------------------------------------------------- #
@@ -457,6 +547,9 @@ run_step() {
 # --------------------------------------------------------------------------- #
 
 frac_tag() { echo "${1/./}"; }   # 0.25 -> 025
+# The python side names its per-run files with "%g"-formatted fractions, so the
+# driver has to normalise the same way to predict them: 0.50 -> 0.5.
+frac_num() { printf '%g' "$1"; }
 
 build_decoder() {
     local bs="$1"
@@ -471,17 +564,25 @@ build_decoder() {
 
 ENCODE_FRACTION=""
 build_encode() {
-    local bs="$1" f="$ENCODE_FRACTION" cache
+    local bs="$1" f="$ENCODE_FRACTION" cache model_dir
     cache="embeddings/blt_embeddings_frac$(frac_tag "$f").pth"
+    # One --model_dir per fraction. train_lcm_blt.py names its checkpoints
+    # `lcm_blt_last/_best.pth` (the eval scripts glob for exactly that inside a
+    # per-run directory), so the fractions have to be separated by directory:
+    # sharing lcm_models/ put all three on the same file, and since the run
+    # fingerprint covers --fraction, the second fraction aborted on the first
+    # one's checkpoint instead of resuming its own.
+    model_dir="lcm_models/blt_lcm_$(frac_tag "$f")"
     CMD=("${UV_RUN[@]}" lcm_scripts/train_lcm_blt.py
          --entropy_model "$ENTROPY_MODEL"
          --fraction "$f" --epochs 0 --batch_size "$bs"
+         --model_dir "$model_dir"
          --embed_cache "$cache"
          --resume auto)
     # The cached embeddings feed the paper's numbers, so they stay fp32 unless
     # AMP_ENCODE=1 is set explicitly.
     [[ "${AMP_ENCODE:-0}" == "1" ]] && CMD+=(--amp)
-    STEP_ARTIFACTS=("$cache")
+    STEP_ARTIFACTS=("$cache" "$model_dir")
 }
 
 MT_FRACTION=""; MT_SEED=""
@@ -497,12 +598,21 @@ build_mt() {
          --noise_levels 0.0 0.1 0.2
          --comet_model "$COMET_MODEL"
          --out_csv "$csv"
-         --embed_cache "embeddings/blt_mt_concepts_frac$(frac_tag "$f")_s${s}.pth"
+         --embed_cache "embeddings/blt_mt_concepts_frac$(frac_tag "$f").pth"
          --resume auto)
-    # Per seed, not shared across seeds: config_fingerprint() hashes --seed, so
-    # one cache file per fraction would be invalidated and rewritten by every
-    # seed instead of being reused.
-    STEP_ARTIFACTS=("$csv" "lcm_models/lcm_blt_mt_s${s}_best.pth")
+    # One concept cache per FRACTION, shared by all three seeds. The encoder is
+    # frozen and runs under no_grad in eval mode, so the concepts of a fraction
+    # are identical for every seed; train_lcm_blt_mt.py keys this cache on the
+    # encoding inputs only, so seed 43 loads what seed 42 wrote. A per-seed
+    # cache re-encoded the same corpus nine times across the grid: 4.2 GPU-hours
+    # and 99 GiB to store three identical copies of each fraction.
+    # The checkpoint carries the fraction as well as the seed -- the whole grid
+    # writes into one --model_dir, and a seed-only name had every fraction
+    # landing on the same file (which is what made this step fail).
+    STEP_ARTIFACTS=(
+        "$csv"
+        "lcm_models/lcm_blt_mt_fraction$(frac_num "$f")_s${s}_best.pth"
+    )
 }
 
 build_baselines() {
@@ -533,7 +643,8 @@ build_analysis() {
 # the plan
 # --------------------------------------------------------------------------- #
 
-PIPELINE_START=$(date +%s)
+# PIPELINE_START is set with the signal trap, well before this point, so the
+# interrupt path can report an elapsed time no matter where it fires.
 
 if (( LIST_ONLY )); then
     say "planned steps (VRAM ${VRAM} MiB):"
@@ -552,6 +663,10 @@ if selected "setup:deps"; then
         if install_deps 2>&1 | tee "$LOG_DIR/setup_deps.log"; then
             (( DRY_RUN )) || echo "finished $(now)" > "$INSTALL_MARK"
             DONE_STEPS+=("setup:deps")
+        elif (( INTERRUPTED )); then
+            INTERRUPTED_STEP="setup:deps"
+            print_summary
+            exit 130
         else
             die "dependency install failed -- see $LOG_DIR/setup_deps.log"
         fi
@@ -638,27 +753,8 @@ if (( LIST_ONLY )); then
     exit 0
 fi
 
-TOTAL=$(( $(date +%s) - PIPELINE_START ))
-rule
-say "pipeline finished in ${TOTAL}s"
-say "state:     $MARK_DIR"
-say "logs:      $LOG_DIR"
-say "artifacts: $ART_DIR"
-say "manifest:  $MANIFEST"
-echo
-if (( ${#DONE_STEPS[@]} )); then
-    echo "${C_GRN}completed (${#DONE_STEPS[@]}):${C_OFF}"
-    printf '  %s\n' "${DONE_STEPS[@]}"
-fi
-if (( ${#SKIPPED_STEPS[@]} )); then
-    echo "${C_DIM}skipped (${#SKIPPED_STEPS[@]}):${C_OFF}"
-    printf '  %s\n' "${SKIPPED_STEPS[@]}"
-fi
+print_summary
 if (( ${#FAILED_STEPS[@]} )); then
-    echo "${C_RED}failed (${#FAILED_STEPS[@]}):${C_OFF}"
-    printf '  %s\n' "${FAILED_STEPS[@]}"
-    echo
-    say "re-run this script to retry only the failed steps (completed ones are skipped)."
     exit 1
 fi
 say "all selected steps completed."

@@ -102,10 +102,16 @@ Produces `lcm_models/blt_pooler.pth` + `lcm_models/blt_decoder.pth`.
 uv run lcm_scripts/train_lcm_blt.py \
   --entropy_model patching_scratch/entropy_model_marathi.pt \
   --fraction 0.25 --epochs 0 --batch_size 8 \
+  --model_dir lcm_models/blt_lcm_025 \
   --embed_cache embeddings/blt_embeddings_frac025.pth
 ```
 
-Repeat with `--fraction 0.50 / 0.80` and matching `--embed_cache` names.
+Repeat with `--fraction 0.50 / 0.80` and matching `--model_dir` / `--embed_cache`
+names. The per-fraction `--model_dir` is required, not cosmetic: this script's
+checkpoints are named `lcm_blt_last/_best.pth` regardless of the fraction, so a
+shared directory has each fraction land on the previous one's checkpoint — and
+because the fraction is part of the resume fingerprint, the run then aborts
+instead of resuming.
 On the cluster: `sbatch scripts/encode_blt.sh 0.25` (and 0.50, 0.80).
 
 ---
@@ -135,8 +141,9 @@ Notes on the flags:
 - `--comet_model` **must** be passed — the default is `None` and COMET is NaN without it.
 - `--seed` varies model init, batch order and the eval-noise draw → real error bars.
 - `--data_seed 42` stays fixed so all seeds share one train/eval split.
-- One CSV **per seed** — same `--out_csv` would overwrite. Checkpoints are already
-  seed-suffixed (`lcm_blt_mt_s42_best.pth`).
+- One CSV **per (fraction, seed)** — a shared `--out_csv` would overwrite. Every other
+  file the run writes is keyed the same way: checkpoints, eval state, curves and the
+  published results directory all carry both (`lcm_blt_mt_fraction0.25_s42_best.pth`).
 
 CSV columns: `model, fraction, noise, seed, BLEU, chrF++, TER, METEOR, COMET`.
 
