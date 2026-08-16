@@ -1,19 +1,19 @@
 # blt_decoder
 
 * script: `blt_decoder.py`
-* finished: 2026-08-16T03:43:00Z
-* wall clock: 928.1 s
-* code: `d9c92c6` on `main` (working tree dirty)
+* finished: 2026-08-16T09:10:44Z
+* wall clock: 1005.5 s
+* code: `4d43ead` on `main` (working tree dirty)
 * device: NVIDIA RTX PRO 6000 Blackwell Server Edition
 
 ## Results
 
 | metric | value |
 | --- | --- |
-| best_byte_cross_entropy | 0.5849998848778861 |
+| best_byte_cross_entropy | 0.5843794604345244 |
 | best_epoch | 10 |
 | epochs_run | 10 |
-| byte_perplexity | 1.7949907789967554 |
+| byte_perplexity | 1.793877468240172 |
 
 ## Run info
 
@@ -29,7 +29,7 @@
 | min_delta | 0.0 |
 | min_epochs | 1 |
 | epochs_observed | 10 |
-| best | 0.5849998848778861 |
+| best | 0.5843794604345244 |
 | best_epoch | 10 |
 | epochs_since_improvement | 0 |
 | stop_reason | reached the --epochs cap of 10 |
