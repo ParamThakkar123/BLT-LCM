@@ -16,7 +16,7 @@ What it produces:
 
 Usage:
   python lcm_scripts/eval_flores.py \
-    --lcm_checkpoint lcm_models/lcm_blt_mt_s42_best.pth \
+    --lcm_checkpoint lcm_models/lcm_blt_mt_fraction0.25_s42_best.pth \
     --entropy_model patching_scratch/entropy_model_marathi.pt \
     --pooler lcm_models/blt_pooler.pth --decoder lcm_models/blt_decoder.pth \
     --flores_tgt mar_Deva --comet_model Unbabel/wmt22-comet-da \

@@ -71,6 +71,7 @@ from plot_utils import (
 from results_sync import ResultsRecorder, add_results_args
 from train_control import EpochBudget, add_epoch_control_args
 from checkpoint_utils import (
+    DEFAULT_FINGERPRINT_IGNORE,
     ResumableLoader,
     StageTracker,
     TrainingCheckpointer,
@@ -157,7 +158,20 @@ def main():
     if args.amp and amp_device != "cuda":
         print("  [amp] no CUDA device; running in fp32")
         args.amp = False
-    fingerprint = config_fingerprint(args)
+    # --batch_size is a VRAM knob, not part of what the run computes: the
+    # auto-setup driver halves it and retries after a CUDA OOM, and that retry
+    # has to resume the interrupted run (and reuse the cached encodings) rather
+    # than abort on a fingerprint mismatch. Every other flag still invalidates.
+    fingerprint = config_fingerprint(
+        args, ignore=DEFAULT_FINGERPRINT_IGNORE | {"batch_size"}
+    )
+    # One identity for every file this run writes -- checkpoints, eval state,
+    # training curve, figures and the published results directory. It carries
+    # BOTH the fraction and the seed because the grid runs 3 fractions x 3 seeds
+    # into a single --model_dir: with the seed alone, the 0.50 run resolved to
+    # the 0.25 run's checkpoint and died on the fingerprint check, while the
+    # curves and eval state of the earlier fraction were silently overwritten.
+    run_name = f"lcm_blt_mt_fraction{args.fraction:g}_s{args.seed}"
     if not args.comet_model:
         print(
             "WARNING: --comet_model not set, so the COMET column will be NaN. "
@@ -211,6 +225,30 @@ def main():
     # --- Encode train concepts once (frozen encoder) ---
     # The encoder is frozen, so these tensors depend only on the config: cache
     # them and a resumed run skips straight back to the optimizer loop.
+    #
+    # The cache key covers exactly what the encoding consumes, NOT the whole
+    # config. In particular it excludes --seed: encoding is a no_grad forward
+    # pass through eval-mode modules, so the concepts are identical for every
+    # seed of a fraction, and the seed governs only the LCM's init, its batch
+    # order and the eval-noise draw. Keyed on the full config instead, the 3
+    # seeds x 3 fractions grid re-encoded the same corpus nine times -- 4.2
+    # GPU-hours and 99 GiB of cache to produce three identical copies per
+    # fraction. Anything that does change the tensors (the encoder, the pooler,
+    # the corpus slice, the columns) is still in the key.
+    encode_fingerprint = config_fingerprint(
+        {
+            "entropy_model": args.entropy_model,
+            "pooler": args.pooler,
+            "fraction": args.fraction,
+            "max_examples": args.max_examples,
+            "eval_examples": args.eval_examples,
+            "src_col": args.src_col,
+            "tgt_col": args.tgt_col,
+            "data_seed": args.data_seed,
+        },
+        ignore=(),
+        extra={"stage": "mt-train-concepts"},
+    )
     src_tr, tgt_tr = cached_torch(
         args.embed_cache,
         lambda: (
@@ -225,7 +263,7 @@ def main():
                 )
             ),
         ),
-        fingerprint=fingerprint,
+        fingerprint=encode_fingerprint,
         resume=args.resume != "never",
         label="train concepts",
     )
@@ -241,11 +279,12 @@ def main():
     mse = torch.nn.MSELoss()
 
     os.makedirs(args.model_dir, exist_ok=True)
-    # Seed in the prefix: multi-seed runs would otherwise clobber each other's
-    # checkpoints, and a resumed run would pick up the wrong seed's state.
+    # Fraction + seed in the prefix: runs of the grid would otherwise clobber
+    # each other's checkpoints, and a resumed run would pick up another cell's
+    # state (or, because the fingerprint covers both, refuse to start at all).
     ckpt = TrainingCheckpointer(
         args.model_dir,
-        prefix=f"lcm_blt_mt_s{args.seed}",
+        prefix=run_name,
         fingerprint=fingerprint,
         max_keep=args.max_checkpoints,
         save_interval_steps=args.save_interval_steps,
@@ -259,12 +298,12 @@ def main():
             f"batch {resume.start_batch}"
         )
 
-    # Curve for this seed's run. The seed is in the name so a multi-seed sweep
-    # produces one figure per seed rather than overwriting a shared one.
+    # Curve for this grid cell. Fraction and seed are both in the name, so a
+    # sweep produces one figure per cell rather than overwriting a shared one.
     plot_dir = resolve_plot_dir(args, args.model_dir)
     history = TrainingHistory(
         plot_dir,
-        run_name=f"lcm_blt_mt_s{args.seed}",
+        run_name=run_name,
         title=f"BLT-LCM En→Mr (fraction {args.fraction}, seed {args.seed})",
         fingerprint=fingerprint,
         resume=args.resume != "never",
@@ -348,7 +387,7 @@ def main():
     refs = [p.target for p in eval_pairs]
     clean_srcs = [p.source for p in eval_pairs]
     stages = StageTracker(
-        os.path.join(args.model_dir, f"lcm_blt_mt_s{args.seed}_eval_state.json"),
+        os.path.join(args.model_dir, f"{run_name}_eval_state.json"),
         fingerprint=fingerprint,
         resume=args.resume != "never",
     )
@@ -413,7 +452,7 @@ def main():
     # same numbers as a drop-in table image.
     if plot_dir and rows:
         formats = plot_formats(args)
-        prefix = os.path.join(plot_dir, f"lcm_blt_mt_s{args.seed}")
+        prefix = os.path.join(plot_dir, run_name)
         figures += plot_noise_curves(
             rows,
             f"{prefix}_noise_robustness",
@@ -456,7 +495,7 @@ def main():
     # Publish figures, history, metrics CSV and the full hyperparameter set.
     recorder = ResultsRecorder(
         args,
-        run_name=f"lcm_blt_mt_s{args.seed}",
+        run_name=run_name,
         script="train_lcm_blt_mt.py",
         fingerprint=fingerprint,
     )

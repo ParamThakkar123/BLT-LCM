@@ -81,7 +81,11 @@ and a resumed run reloads the encodings instead of recomputing them.
 
 Resume state is keyed to a fingerprint of the run's settings (learning rate,
 fraction, epochs, architecture, …; output paths and logging toggles are
-excluded, so redirecting `--out_dir` or turning W&B on/off is fine). Resuming
+excluded, so redirecting `--out_dir` or turning W&B on/off is fine). The three
+scripts the auto-setup driver sizes batches for — `blt_decoder.py`,
+`train_lcm_blt.py`, `train_lcm_blt_mt.py` — also exclude `--batch_size`, because
+that driver halves it and retries after a CUDA OOM and the retry has to resume
+the interrupted run rather than abort on it. Resuming
 into a run whose hyperparameters changed **errors out** rather than splicing two
 configurations into one set of results:
 
@@ -226,8 +230,8 @@ stays small on a multi-epoch run.
 
 | Script | Run name | Loss plotted |
 | --- | --- | --- |
-| `train_lcm_blt.py` | `lcm_blt_<variant>` | MSE / diffusion / RVQ loss per variant |
-| `train_lcm_blt_mt.py` | `lcm_blt_mt_s<seed>` | concept MSE (one curve per seed) |
+| `train_lcm_blt.py` | `lcm_blt_<variant>_fraction<F>` | MSE / diffusion / RVQ loss per variant |
+| `train_lcm_blt_mt.py` | `lcm_blt_mt_fraction<F>_s<seed>` | concept MSE (one curve per fraction × seed) |
 | `train_lcm_sonar.py` | `lcm_sonar_fraction<F>` | masked MSE |
 | `train_lcm_bpe.py` | `lcm_bpe_fraction<F>` | masked MSE |
 | `train_bpe_transformer.py` | `bpe_transformer_fraction<F>` | cross-entropy (+ perplexity) |
@@ -451,9 +455,9 @@ Five additions aimed squarely at what a reviewer checks first.
 
 ```bash
 uv run lcm_scripts/eval_flores.py \
-  --lcm_checkpoint lcm_models/lcm_blt_mt_s42_best.pth \
-                   lcm_models/lcm_blt_mt_s43_best.pth \
-                   lcm_models/lcm_blt_mt_s44_best.pth \
+  --lcm_checkpoint lcm_models/lcm_blt_mt_fraction0.25_s42_best.pth \
+                   lcm_models/lcm_blt_mt_fraction0.25_s43_best.pth \
+                   lcm_models/lcm_blt_mt_fraction0.25_s44_best.pth \
   --entropy_model patching_scratch/entropy_model_marathi.pt \
   --pooler lcm_models/blt_pooler.pth --decoder lcm_models/blt_decoder.pth \
   --flores_tgt mar_Deva --comet_model Unbabel/wmt22-comet-da \
