@@ -1,0 +1,9 @@
+{
+  "run_name": "lcm_blt_base",
+  "title": "BLT-LCM (base)",
+  "fingerprint": "8e39ac7d9854805a",
+  "loss_label": "MSE loss",
+  "steps": [],
+  "epochs": [],
+  "evals": []
+}
