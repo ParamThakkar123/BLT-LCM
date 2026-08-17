@@ -22,6 +22,12 @@ Deliberate limits, because this runs unattended at the end of every job:
   hanging a GPU job until its Slurm time limit.
 * **Push is opt-in.** Committing locally is cheap and reversible; pushing is
   neither, so it takes ``--push_results`` (or ``BLT_LCM_PUSH_RESULTS=1``).
+* **Everything it leaves behind is reported.** Because the selection above is
+  deliberate, the run says which of its files did *not* go into the commit and
+  why -- wrong type, over the size cap, covered by ``.gitignore``, or never
+  written at all. The list is printed at the end of the job and recorded under
+  ``withheld`` in ``run.json``, so the pushed record itself names what exists
+  only on the machine that ran the job.
 
 Cluster mode
 ------------
@@ -306,6 +312,9 @@ class ResultsRecorder:
         self.metrics: dict[str, Any] = {}
         self.extra: dict[str, Any] = {}
         self._sources: list[str] = []
+        # Files the run produced (or was expected to produce) that this commit
+        # will not carry, each with the reason. See _withhold.
+        self._withheld: list[dict] = []
 
         self.repo_root = repo_root or _repo_root(os.getcwd())
         if self.enabled and not self.repo_root:
@@ -400,6 +409,62 @@ class ResultsRecorder:
                 env[var] = os.environ[var]
         return env
 
+    # -- what is deliberately NOT published ---------------------------------- #
+
+    def _withhold(self, path: str, reason: str, size: Optional[int] = None) -> None:
+        """Note a file the run has, or should have, that the commit will not.
+
+        Publishing is selective on purpose, but silence about what it dropped is
+        how a figure that was never drawn, a CSV covered by ``.gitignore`` or a
+        table just over the size cap goes unnoticed until someone needs it and
+        the node is gone. Every exclusion lands here, gets printed at the end of
+        the job, and is written into ``run.json``.
+        """
+        entry: dict[str, Any] = {"path": path, "reason": reason}
+        if size is not None:
+            entry["megabytes"] = round(size / 1024 / 1024, 3)
+        self._withheld.append(entry)
+
+    def _report_withheld(self) -> None:
+        if not self._withheld:
+            return
+        print(f"[results] {len(self._withheld)} file(s) present but not published:")
+        for item in self._withheld:
+            size = f" [{item['megabytes']:.1f} MB]" if "megabytes" in item else ""
+            print(f"[results]   {item['path']}{size} -- {item['reason']}")
+        print('[results] the same list is under "withheld" in run.json')
+
+    def _rel(self, path: str) -> str:
+        """Repo-relative, forward-slashed -- the form every git call wants."""
+        assert self.repo_root
+        return os.path.relpath(path, self.repo_root).replace(os.sep, "/")
+
+    def _ignored(self, rel_paths: Sequence[str]) -> dict[str, str]:
+        """Which of ``rel_paths`` ``.gitignore`` excludes, and by which rule.
+
+        ``git add`` fails outright on an ignored path, and that failure used to
+        abandon the entire publish: one ignored file and the run's figures,
+        metrics and record all stayed on the node. They are filtered out and
+        reported instead. ``-f`` is deliberately not used -- the ignore rule is
+        somebody's decision, and a job is not the place to overrule it.
+
+        Already-tracked files are never reported here (that is git's own default
+        for ``check-ignore``), which is right: an ignore rule does not stop an
+        update to a file the repository already carries.
+        """
+        if not rel_paths or not self.repo_root:
+            return {}
+        r = self._git("check-ignore", "-v", "--", *rel_paths)
+        if r.returncode not in (0, 1):  # 1 == nothing matched; anything else is an error
+            return {}
+        ignored: dict[str, str] = {}
+        for line in r.stdout.splitlines():
+            # "<source>:<line>:<pattern>\t<path>"
+            rule, _, path = line.partition("\t")
+            if path:
+                ignored[path.strip().replace(os.sep, "/")] = rule.strip()
+        return ignored
+
     def _record(self) -> dict:
         hyper = {}
         for k, v in sorted(vars(self.args).items() if hasattr(self.args, "__dict__") else []):
@@ -418,6 +483,10 @@ class ResultsRecorder:
             "hyperparameters": hyper,
             "metrics": self.metrics,
             "info": self.extra,
+            # What this run produced but did not publish, and why. Recorded in
+            # the pushed file itself so the gap is visible from the repository,
+            # without access to the machine that ran the job.
+            "withheld": list(self._withheld),
             "environment": self._environment(),
         }
 
@@ -458,6 +527,24 @@ class ResultsRecorder:
                 lines.append("")
                 lines.append(f"![{os.path.basename(f)}]({rel})")
                 lines.append("")
+        # What this run produced but the repository does not carry. Kept in the
+        # README as well as run.json, because this is the section someone reads
+        # when a figure or a checkpoint they expected is not in the directory.
+        withheld = record.get("withheld") or []
+        if withheld:
+            lines += [
+                "",
+                "## Present on the run machine, not in this commit",
+                "",
+                "| file | why |",
+                "| --- | --- |",
+            ]
+            for item in withheld[:40]:
+                size = f" ({item['megabytes']:.1f} MB)" if "megabytes" in item else ""
+                name = str(item["path"]).replace(os.sep, "/")
+                lines.append(f"| `{name}`{size} | {item['reason']} |")
+            if len(withheld) > 40:
+                lines.append(f"| … | {len(withheld) - 40} more, see `run.json` |")
         lines += [
             "",
             "Full hyperparameters, metrics and environment: "
@@ -480,22 +567,41 @@ class ResultsRecorder:
                         yield from self._accept(p, seen)
             elif os.path.isfile(src):
                 yield from self._accept(src, seen)
+            else:
+                # A figure the run was meant to draw, or a CSV it was meant to
+                # write, that is not on disk. Dropping it in silence is what
+                # makes a half-finished run look like a complete one.
+                self._withhold(src, "not on disk")
 
     def _accept(self, path: str, seen: set) -> Iterable[str]:
         real = os.path.realpath(path)
         if real in seen:
             return
         name = os.path.basename(path)
-        if name in SKIP_NAMES or not name.lower().endswith(PUBLISHABLE_SUFFIXES):
+        if name in SKIP_NAMES:
+            self._withhold(path, "an input the repository does not carry")
+            return
+        if not name.lower().endswith(PUBLISHABLE_SUFFIXES):
+            # Checkpoints, caches and corpora: large, regenerable, and permanent
+            # once committed. Named anyway, so "where is the checkpoint?" has an
+            # answer that does not require guessing.
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                size = None
+            self._withhold(path, "not a publishable file type", size)
             return
         try:
             size = os.path.getsize(path)
-        except OSError:
+        except OSError as e:
+            self._withhold(path, f"unreadable ({e.strerror or e})")
             return
         if size > self.max_bytes:
-            print(
-                f"[results] skipping {name} ({size / 1024 / 1024:.1f} MB > "
-                f"--results_max_mb); git history is permanent"
+            self._withhold(
+                path,
+                f"larger than --results_max_mb "
+                f"({self.max_bytes / 1024 / 1024:g} MB); git history is permanent",
+                size,
             )
             return
         seen.add(real)
@@ -527,25 +633,43 @@ class ResultsRecorder:
             shutil.copy2(src, dst)
             copied.append(dst)
 
-        record = self._record()
         record_path = os.path.join(self.out_dir, "run.json")
+        summary_path = os.path.join(self.out_dir, "README.md")
+        collected = sorted(set(copied + [record_path, summary_path]))
+
+        # Ignore rules are resolved BEFORE the record is written, so run.json
+        # can name the files that were collected onto this disk but cannot be
+        # committed -- including itself, if the results directory is ignored.
+        ignored = self._ignored([self._rel(p) for p in collected]) if self.repo_root else {}
+        for rel, rule in sorted(ignored.items()):
+            self._withhold(rel, f"ignored by {rule}" if rule else "ignored by .gitignore")
+        committable = [p for p in collected if self._rel(p) not in ignored] if self.repo_root else collected
+
+        record = self._record()
         with open(record_path, "w", encoding="utf-8") as f:
             json.dump(record, f, indent=2, default=str)
-        summary_path = self._write_summary(record, copied)
-        return sorted(set(copied + [record_path, summary_path])), record
+        self._write_summary(record, copied)
+        return committable, record
 
     def _publish(self, message: Optional[str]) -> Optional[str]:
         if not self.out_dir:
             return None
         paths, _record = self._collect()
         print(f"[results] collected {len(paths)} file(s) into {self.out_dir}")
+        self._report_withheld()
 
         if not self.repo_root:
             return self.out_dir
 
-        rel_paths = [
-            os.path.relpath(p, self.repo_root).replace(os.sep, "/") for p in paths
-        ]
+        if not paths:
+            # Everything collected is ignored by the repository's own rules.
+            print(
+                "[results] nothing left to commit: every collected file is "
+                "covered by .gitignore (listed above); results stay on disk"
+            )
+            return self.out_dir
+
+        rel_paths = [self._rel(p) for p in paths]
         msg = message or (
             f"results: {self.run_name} ({self.script})\n\n"
             + "\n".join(f"{k}: {v}" for k, v in list(self.metrics.items())[:12])
@@ -562,8 +686,8 @@ class ResultsRecorder:
     def _publish_worktree(self, rel_paths: list[str], msg: str) -> None:
         add = self._git_id("add", "--", *rel_paths)
         if add.returncode != 0:
-            # .gitignore is the usual cause; -f would override a deliberate
-            # decision by whoever wrote that ignore rule, so it is not used.
+            # Ignored paths were filtered out before this point (see _ignored),
+            # so what is left is a real failure -- permissions, a locked index.
             print(f"[results] git add failed: {add.stderr.strip()}")
             return
 

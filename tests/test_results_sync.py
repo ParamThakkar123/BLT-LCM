@@ -127,6 +127,81 @@ def test_missing_and_empty_sources_are_tolerated(repo, tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# What is present but NOT published
+# --------------------------------------------------------------------------- #
+
+
+def test_withheld_files_are_named_with_reasons(repo, tmp_path, capsys):
+    """Selective publishing is fine; silence about what it dropped is not."""
+    src = make_run_outputs(tmp_path / "run", big_mb=2)
+    rec = ResultsRecorder(
+        make_args(tmp_path, results_max_mb=1.0), "demo", repo_root=str(repo)
+    )
+    rec.add_source(str(src), str(tmp_path / "never_drawn.png"))
+    out = rec.publish()
+
+    record = json.loads(open(os.path.join(out, "run.json"), encoding="utf-8").read())
+    withheld = {os.path.basename(w["path"]): w["reason"] for w in record["withheld"]}
+    assert "not a publishable file type" in withheld["model_best.pth"]
+    assert "not a publishable file type" in withheld["embeddings.pt"]
+    assert "results_max_mb" in withheld["huge_plot.png"]
+    assert "not on disk" in withheld["never_drawn.png"]
+    # The checkpoint's size is recorded too, so "how big was it" needs no node.
+    sizes = {os.path.basename(w["path"]): w.get("megabytes") for w in record["withheld"]}
+    assert sizes["huge_plot.png"] == pytest.approx(2.0, abs=0.1)
+
+    printed = capsys.readouterr().out
+    assert "not published" in printed
+    assert "model_best.pth" in printed and "huge_plot.png" in printed
+
+
+def test_withheld_files_are_listed_in_the_readme(repo, tmp_path):
+    src = make_run_outputs(tmp_path / "run")
+    rec = ResultsRecorder(make_args(tmp_path), "demo", repo_root=str(repo))
+    rec.add_source(str(src))
+    text = open(os.path.join(rec.publish(), "README.md"), encoding="utf-8").read()
+    assert "not in this commit" in text
+    assert "model_best.pth" in text
+
+
+def test_a_gitignored_result_does_not_sink_the_whole_publish(repo, tmp_path):
+    """One ignored file used to abort the commit and lose every other result."""
+    (repo / ".gitignore").write_text("*.csv\n", encoding="utf-8")
+    git("add", ".gitignore", cwd=repo)
+    git("commit", "-m", "ignore csv", cwd=repo)
+
+    rec = ResultsRecorder(make_args(tmp_path), "demo", repo_root=str(repo))
+    rec.add_source(str(make_run_outputs(tmp_path / "run")))
+    out = rec.publish()
+
+    committed = git("show", "--name-only", "--format=", "HEAD", cwd=repo).stdout
+    committed = committed.replace("\\", "/")
+    assert "results/runs/demo/run.json" in committed
+    assert "results/runs/demo/run_training_curve.png" in committed
+    assert "metrics.csv" not in committed
+    # The file is still on disk, and the record says why it is not in git.
+    assert os.path.exists(os.path.join(out, "metrics.csv"))
+    record = json.loads(open(os.path.join(out, "run.json"), encoding="utf-8").read())
+    ignored = [w for w in record["withheld"] if "metrics.csv" in w["path"]]
+    assert ignored and "ignored by" in ignored[0]["reason"]
+    assert ".gitignore" in ignored[0]["reason"]
+
+
+def test_everything_ignored_is_reported_not_crashed(repo, tmp_path, capsys):
+    (repo / ".gitignore").write_text("results/\n", encoding="utf-8")
+    git("add", ".gitignore", cwd=repo)
+    git("commit", "-m", "ignore results", cwd=repo)
+
+    rec = ResultsRecorder(make_args(tmp_path), "demo", repo_root=str(repo))
+    rec.add_source(str(make_run_outputs(tmp_path / "run")))
+    out = rec.publish()
+
+    assert out and os.path.exists(os.path.join(out, "run.json"))
+    assert "nothing left to commit" in capsys.readouterr().out
+    assert "results: demo" not in git("log", "--oneline", cwd=repo).stdout
+
+
+# --------------------------------------------------------------------------- #
 # The run record
 # --------------------------------------------------------------------------- #
 
