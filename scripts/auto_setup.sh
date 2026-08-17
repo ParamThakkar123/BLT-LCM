@@ -15,6 +15,31 @@
 # finished instead of redoing the whole pipeline. Inside a step, the python
 # scripts' own `--resume auto` checkpointing picks up mid-epoch.
 #
+# Resume is decided from the RESULTS, not only from the driver's own markers.
+# Before a step runs, its outputs are inspected: if they are complete -- every
+# requested epoch trained, and every expected artifact (checkpoint, metrics CSV,
+# published run record) present -- the step is marked done and the pipeline
+# continues from the first step that is genuinely unfinished. That covers a
+# wiped runs/auto_setup state directory, steps that were run by hand outside the
+# driver, and a kill between a step finishing and its marker being written. A
+# step whose results are only partial is re-run, and its `--resume auto` picks
+# up from the last checkpoint instead of restarting the epochs already paid for.
+#
+# Results already PUSHED count too. Every step publishes its record to
+# results/runs/<run>/run.json, so the driver fetches the results refs once and
+# reads them straight out of git -- no clone, no pull, no checkout -- to see
+# which cells of the grid another machine has already finished. A step whose
+# published record matches this step's configuration and ran all its epochs is
+# not run again.
+#
+# With one deliberate exception: checkpoints and embedding caches are never
+# published (they are large and regenerable), so a pushed record proves a step
+# RAN, not that its outputs are on this machine. Steps whose files later stages
+# consume -- the decoder/pooler and the Stage 1 encode -- are therefore only
+# skipped on remote evidence when those files are also here. Everything else
+# (the MT grid, the baselines) exists to produce the published result, and a
+# published result is the whole job.
+#
 # Ctrl-C stops the pipeline, not just the running step: the interrupted step is
 # left unmarked (so a re-run resumes it) and nothing further is started.
 #
@@ -38,6 +63,18 @@
 #   UV_RUN_OVERRIDE  replace the `uv run` launcher entirely (apptainer, srun, tests)
 #   STOP_ON_FAIL=1  abort on the first failing experiment step
 #   MAX_OOM_RETRIES  halve the batch size and retry this many times (default 3)
+#   ADOPT_COMPLETE=0  do not adopt already-complete results; only the driver's
+#                     own markers decide what to skip
+#   RESULTS_RUNS_DIR  where the python steps publish their run records
+#                     (default: results/runs -- match --results_dir if changed)
+#   REMOTE_RESULTS=0  ignore results pushed by other machines (local only)
+#   RESULTS_REFS      refs to read published records from
+#                     (default: origin/<current branch> and origin/main)
+#   RESULTS_FETCH=0   use the refs already in this clone; skip the git fetch
+#   REMOTE_STRICT=1   only trust a published record whose recorded commit is an
+#                     ancestor of HEAD (i.e. not produced by divergent code)
+#   TRUST_REMOTE_PRODUCERS=1  skip the decoder/encode steps on remote evidence
+#                     even when their (unpublished) checkpoints are missing here
 #
 # NOTE on cu130: pyproject.toml pins `torch==2.5.1` from the cu121 index, and
 # `uv run` re-syncs the venv on every invocation. The requested
@@ -58,9 +95,20 @@ ENTROPY_MODEL=${ENTROPY_MODEL:-patching_scratch/entropy_model_marathi.pt}
 COMET_MODEL=${COMET_MODEL:-Unbabel/wmt22-comet-da}
 FRACTIONS=(0.25 0.50 0.80)
 SEEDS=(42 43 44)
+NOISE_LEVELS=(0.0 0.1 0.2)
+BENCH_MODELS=(bpe_transformer bpe_lcm sonar_lcm)
 DATA_SEED=${DATA_SEED:-42}
 MAX_OOM_RETRIES=${MAX_OOM_RETRIES:-3}
 STOP_ON_FAIL=${STOP_ON_FAIL:-0}
+
+# Epoch counts live here rather than inline in the builders: the completion
+# probe below has to ask for the same number the step is launched with, and two
+# copies of "10" would drift the moment one of them was edited.
+DECODER_EPOCHS=${DECODER_EPOCHS:-10}
+DECODER_SENTENCES=${DECODER_SENTENCES:-50000}
+MT_EPOCHS=${MT_EPOCHS:-3}
+BENCH_EPOCHS=${BENCH_EPOCHS:-1}
+LLAMA_EPOCHS=${LLAMA_EPOCHS:-1}
 
 ONLY_PAT=""
 SKIP_PAT=""
@@ -75,7 +123,9 @@ while [[ $# -gt 0 ]]; do
         --force)   FORCE=1; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
         --list)    LIST_ONLY=1; shift ;;
-        -h|--help) sed -n '2,60p' "$0"; exit 0 ;;
+        # The whole leading comment block, however long it grows: everything
+        # from line 2 up to the first line that is not a comment.
+        -h|--help) sed -n '2,/^[^#]/p' "$0" | sed '$d'; exit 0 ;;
         *) echo "unknown flag: $1 (try --help)" >&2; exit 2 ;;
     esac
 done
@@ -346,11 +396,369 @@ if (( ! DRY_RUN )); then
 fi
 
 # --------------------------------------------------------------------------- #
+# results-based completion probe
+# --------------------------------------------------------------------------- #
+#
+# The driver's `.done` markers live under $STATE_DIR, so anything that loses
+# them -- a cleared runs/auto_setup, a step run by hand, a kill in the window
+# between a step finishing and its marker being written -- made the pipeline
+# redo finished work from scratch. So before running a step, ask the results
+# themselves whether it is already done: every requested epoch trained and every
+# expected output present. A step that passes is adopted (marked done, skipped),
+# and the pipeline resumes from the first step whose results are NOT complete --
+# where the python script's own `--resume auto` continues from its checkpoint.
+#
+# Two independent records answer "how many epochs ran", and either is enough:
+#
+#   <plot_dir>/<run>_history.json   TrainingHistory -- one row per epoch, written
+#                                   at the end of every epoch and carried across
+#                                   resumes
+#   results/runs/<run>/run.json     ResultsRecorder -- `metrics.epochs_run`, and
+#                                   only written when a script reaches its end
+#
+# The probe reads JSON and CSV only. It needs a plain python 3, never torch, so
+# it costs milliseconds per step and does not touch the GPU or re-sync the venv.
+
+ADOPT_COMPLETE=${ADOPT_COMPLETE:-1}
+RESULTS_RUNS_DIR=${RESULTS_RUNS_DIR:-results/runs}
+
+PROBE_PY=()
+find_probe_python() {
+    (( ${#PROBE_PY[@]} )) && return 0
+    local c
+    for c in "$REPO_DIR/.venv/Scripts/python.exe" "$REPO_DIR/.venv/bin/python" \
+             python3 python; do
+        command -v "$c" >/dev/null 2>&1 || continue
+        # A name on PATH is not necessarily a working interpreter (Windows ships
+        # a `python` stub that only opens the store), so prove it runs.
+        "$c" -c 'import csv, json, os, sys' >/dev/null 2>&1 || continue
+        PROBE_PY=("$c")
+        return 0
+    done
+    # Nothing standalone (fresh checkout, venv not built yet): fall back to the
+    # launcher the steps themselves use. Slower, but always available.
+    PROBE_PY=("${UV_RUN[@]}" python)
+}
+
+# Resolved once, here: every probe below runs inside a command substitution --
+# a subshell -- so a lazy lookup would re-discover the interpreter per step and
+# the cache would never survive.
+find_probe_python
+info "results probe: ${PROBE_PY[*]}"
+
+# results_complete <spec...> -- exit 0 when this step's results are complete.
+# Prints one line either way: the evidence, or what is still missing.
+#
+#   --epochs N      epochs the step is asked to train (0: not a training step)
+#   --history PATH  TrainingHistory sidecar to count finished epochs in
+#   --run-json PATH published run record to count finished epochs in
+#   --file PATH     an output that must exist and be non-empty (repeatable)
+#   --csv PATH      a metrics CSV that must exist ...
+#   --csv-rows N    ... and carry at least N data rows
+#   --expect K=V    a hyperparameter the record must carry (repeatable). A
+#                   record that disagrees describes a different run and is not
+#                   counted as evidence -- which is what makes a PUBLISHED
+#                   record safe to trust: same name, same settings, or nothing.
+results_complete() {
+    find_probe_python
+    "${PROBE_PY[@]}" - "$@" <<'PY' 2>/dev/null
+import csv, json, os, sys
+
+need_epochs = 0
+histories, records, files = [], [], []
+csv_path, csv_rows = None, 0
+expect = []
+
+argv = sys.argv[1:]
+i = 0
+while i < len(argv):
+    flag, value = argv[i], argv[i + 1] if i + 1 < len(argv) else ""
+    if flag == "--epochs":
+        need_epochs = int(value or 0)
+    elif flag == "--history":
+        histories.append(value)
+    elif flag == "--run-json":
+        records.append(value)
+    elif flag == "--file":
+        files.append(value)
+    elif flag == "--csv":
+        csv_path = value
+    elif flag == "--csv-rows":
+        csv_rows = int(value or 0)
+    elif flag == "--expect":
+        key, _, want = value.partition("=")
+        expect.append((key, want))
+    else:
+        print("unknown probe flag %s" % flag)
+        sys.exit(2)
+    i += 2
+
+
+def incomplete(message):
+    print(message)
+    sys.exit(1)
+
+
+def load_json(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return None
+
+
+def same(want, got):
+    """Compare a command-line value with a hyperparameter from a record.
+
+    Everything arrives from bash as text, so 0.5 has to match 0.50 and the
+    noise levels have to match [0.0, 0.1, 0.2] -- string equality alone would
+    reject records that describe exactly this run.
+    """
+    if isinstance(got, (list, tuple)):
+        parts = [p for p in str(want).replace(",", " ").split() if p]
+        if len(parts) != len(got):
+            return False
+        return all(same(p, g) for p, g in zip(parts, got))
+    try:
+        return abs(float(want) - float(got)) < 1e-9
+    except (TypeError, ValueError):
+        return str(want) == str(got)
+
+
+def config_mismatch(blob):
+    """The first expectation this record does not meet, if any."""
+    hyper = blob.get("hyperparameters") or {}
+    for key, want in expect:
+        if key not in hyper:
+            continue          # older records predate the flag; not a conflict
+        if not same(want, hyper[key]):
+            return "%s=%s (expected %s)" % (key, hyper[key], want)
+    return None
+
+
+# Epochs actually trained, taking the best evidence available. `epochs_run` and
+# the history both count across resumes, so a run that was stopped and continued
+# reports the total rather than what its final process happened to do. Checked
+# before the artifacts, because "2/3 epochs trained" says more about what a
+# re-run will do than the name of the file that is not there yet.
+done = 0
+plateaued = False
+mismatch = None
+for path in histories:
+    for record in (load_json(path) or {}).get("epochs") or []:
+        try:
+            done = max(done, int(record.get("epoch", 0)))
+        except (TypeError, ValueError):
+            pass
+for path in records:
+    blob = load_json(path)
+    if not blob:
+        continue
+    reason = config_mismatch(blob)
+    if reason:
+        # Same run name, different settings. Counting its epochs would let one
+        # configuration's results stand in for another's.
+        mismatch = mismatch or reason
+        continue
+    metrics = blob.get("metrics") or {}
+    info = blob.get("info") or {}
+    for value in (metrics.get("epochs_run"), info.get("epochs_observed")):
+        try:
+            done = max(done, int(value))
+        except (TypeError, ValueError):
+            pass
+    # --train_until_plateau ends a run below its epoch cap on purpose. That is a
+    # finished run, not a truncated one, so it must not be restarted forever.
+    if info.get("mode") == "plateau" and str(info.get("stop_reason", "")).startswith(
+        "plateau"
+    ):
+        plateaued = True
+
+if need_epochs > 0 and done < need_epochs and not plateaued:
+    if mismatch:
+        incomplete("record is for a different configuration: %s" % mismatch)
+    incomplete("%d/%d epochs trained" % (done, need_epochs))
+
+# All the epochs ran; the outputs of those epochs have to be there too. A
+# training step that trained but was killed before writing its metrics is not a
+# result, and a re-run of it is cheap -- the checkpoint carries every epoch.
+for path in files:
+    if not os.path.exists(path):
+        incomplete("missing %s" % path)
+    if os.path.isdir(path):
+        if not os.listdir(path):
+            incomplete("empty directory %s" % path)
+    elif os.path.getsize(path) == 0:
+        incomplete("empty %s" % path)
+
+if csv_path:
+    if not os.path.exists(csv_path):
+        incomplete("missing %s" % csv_path)
+    try:
+        with open(csv_path, newline="", encoding="utf-8") as fh:
+            rows = [r for r in csv.reader(fh) if any(c.strip() for c in r)]
+    except Exception as exc:
+        incomplete("unreadable %s: %s" % (csv_path, exc))
+    have = max(len(rows) - 1, 0)          # minus the header row
+    if have < csv_rows:
+        incomplete("%s has %d/%d result rows" % (csv_path, have, csv_rows))
+
+if need_epochs <= 0:
+    print("expected outputs present")
+elif plateaued:
+    print("%d epochs trained (stopped at plateau); outputs present" % done)
+else:
+    print("%d/%d epochs trained; outputs present" % (done, need_epochs))
+PY
+}
+
+# --------------------------------------------------------------------------- #
+# results already pushed by another machine
+# --------------------------------------------------------------------------- #
+#
+# Every step publishes results/runs/<run>/run.json, so a grid cell somebody else
+# already finished is knowable without running anything: fetch the results refs
+# once, then read the records straight out of git. `git show <ref>:<path>` reads
+# a blob from a ref -- no clone, no pull, no checkout, nothing touched in the
+# working tree, so this is safe to do while other jobs are running.
+#
+# A published record is trusted only when it describes THIS step: the run name
+# carries the grid coordinates (lcm_blt_mt_fraction0.5_s43), and --expect checks
+# the hyperparameters that the name does not cover. Anything else is ignored
+# rather than believed.
+#
+# What a published record does NOT prove is that the step's files are here.
+# Checkpoints and embedding caches are never published, so `decoder` finishing
+# on another machine leaves this one without lcm_models/blt_decoder.pth -- which
+# Stage 2 needs. Those steps are marked "producer" below and are only skipped on
+# remote evidence when their outputs are also on this disk.
+
+REMOTE_RESULTS=${REMOTE_RESULTS:-1}
+RESULTS_FETCH=${RESULTS_FETCH:-1}
+REMOTE_STRICT=${REMOTE_STRICT:-0}
+TRUST_REMOTE_PRODUCERS=${TRUST_REMOTE_PRODUCERS:-0}
+REMOTE_DIR="$STATE_DIR/remote"
+RESULTS_REFS_LIST=()
+
+init_remote_results() {
+    (( REMOTE_RESULTS )) || return 0
+    if ! git -C "$REPO_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+        REMOTE_RESULTS=0
+        info "published results: not a git checkout; using local results only"
+        return 0
+    fi
+
+    local branch refs=() ref
+    branch=$(git -C "$REPO_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null)
+    if [[ -n "${RESULTS_REFS:-}" ]]; then
+        read -r -a refs <<< "$RESULTS_REFS"
+    else
+        refs=("origin/${branch:-main}" "origin/main")
+    fi
+
+    # One fetch for the whole pipeline. GIT_TERMINAL_PROMPT=0 so a missing
+    # credential fails in seconds instead of blocking the driver on a prompt
+    # that a batch job has no terminal to answer.
+    if (( RESULTS_FETCH )); then
+        local remote_branches=() b have seen
+        for ref in "${refs[@]}"; do
+            [[ "$ref" == origin/* ]] || continue
+            b="${ref#origin/}"
+            seen=0
+            for have in "${remote_branches[@]:-}"; do
+                [[ "$have" == "$b" ]] && seen=1
+            done
+            (( seen )) || remote_branches+=("$b")
+        done
+        if (( ${#remote_branches[@]} )); then
+            if GIT_TERMINAL_PROMPT=0 git -C "$REPO_DIR" fetch --quiet origin \
+                   "${remote_branches[@]}" 2>/dev/null; then
+                info "published results: fetched ${remote_branches[*]} from origin"
+            else
+                warn "could not fetch from origin; reading the refs already in this clone"
+            fi
+        fi
+    fi
+
+    for ref in "${refs[@]}"; do
+        git -C "$REPO_DIR" rev-parse --verify --quiet "$ref^{commit}" >/dev/null 2>&1 \
+            || continue
+        # De-duplicate: origin/main is in the default list twice on main.
+        local seen=0 have
+        for have in "${RESULTS_REFS_LIST[@]:-}"; do
+            [[ "$have" == "$ref" ]] && seen=1
+        done
+        (( seen )) || RESULTS_REFS_LIST+=("$ref")
+    done
+
+    if (( ${#RESULTS_REFS_LIST[@]} )); then
+        say "published results: reading ${RESULTS_REFS_LIST[*]}"
+    else
+        info "published results: no usable refs; using local results only"
+        REMOTE_RESULTS=0
+    fi
+}
+
+# json_field <file> <key> -- one scalar string field out of a run record.
+# Deliberately not a JSON parse: this runs before the probe and only ever reads
+# two flat, quoted fields the recorder writes itself.
+json_field() {
+    sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$1" 2>/dev/null | head -1
+}
+
+# remote_record <run_name> <dest_dir> [published_csv]
+# Extracts the newest published record for <run_name> into <dest_dir> and
+# prints the ref it came from. Empty output means nothing is published.
+remote_record() {
+    local run="$1" dest="$2" csv="${3:-}"
+    local ref tmp finished best_ref="" best_time="" best_file=""
+    mkdir -p "$dest" 2>/dev/null
+    for ref in "${RESULTS_REFS_LIST[@]:-}"; do
+        tmp="$dest/run.$(slug "$ref").json"
+        git -C "$REPO_DIR" show "$ref:$RESULTS_RUNS_DIR/$run/run.json" > "$tmp" 2>/dev/null \
+            || { rm -f "$tmp"; continue; }
+        # ISO-8601 UTC, so the newest record is the lexicographic maximum.
+        finished=$(json_field "$tmp" finished_utc)
+        if [[ -z "$best_time" || "$finished" > "$best_time" ]]; then
+            best_time="$finished"; best_ref="$ref"; best_file="$tmp"
+        fi
+    done
+    [[ -n "$best_file" ]] || return 1
+
+    cp -f "$best_file" "$dest/run.json" 2>/dev/null || return 1
+    [[ -n "$csv" ]] && \
+        git -C "$REPO_DIR" show "$best_ref:$RESULTS_RUNS_DIR/$run/$csv" > "$dest/$csv" 2>/dev/null
+    printf '%s' "$best_ref"
+}
+
+# A record produced by code that this checkout does not contain describes a
+# different program. Off by default -- results are usually pushed from a branch
+# this machine has not merged -- and REMOTE_STRICT=1 turns it into a rule.
+remote_code_is_ours() {
+    local record="$1" commit
+    (( REMOTE_STRICT )) || return 0
+    commit=$(json_field "$record" git_commit)
+    [[ -n "$commit" ]] || return 1
+    git -C "$REPO_DIR" merge-base --is-ancestor "$commit" HEAD 2>/dev/null
+}
+
+# One fetch and one ref list for the whole pipeline, resolved here so the plan
+# printed by --list already reflects what other machines have published.
+init_remote_results
+
+# --------------------------------------------------------------------------- #
 # step runner: logging, resume markers, artifact capture, OOM backoff
 # --------------------------------------------------------------------------- #
 
 CMD=()               # set by each step's builder function
 STEP_ARTIFACTS=()    # paths a step is expected to produce
+STEP_PROBE=()        # results_complete spec; empty = no results probe
+STEP_REMOTE_RUN=""   # published run name; empty = no published evidence
+STEP_REMOTE_CSV=""   # metrics CSV the run publishes into its results directory
+STEP_REMOTE_SPEC=()  # results_complete spec applied to the published record
+STEP_KIND="terminal" # "producer": later steps consume files it does not publish
+REMOTE_WHY=""        # set by remote_complete, for the log line
+REMOTE_REF=""
 FAILED_STEPS=()
 DONE_STEPS=()
 SKIPPED_STEPS=()
@@ -390,6 +798,81 @@ record_artifacts() {
     printf '%s' "$out"
 }
 
+# Every file this step is expected to leave on THIS machine.
+artifacts_present() {
+    local p
+    for p in "${STEP_ARTIFACTS[@]:-}"; do
+        [[ -z "$p" ]] && continue
+        [[ -e "$p" ]] || return 1
+    done
+    return 0
+}
+
+# remote_complete <id> -- 0 when a pushed record shows this step already ran to
+# completion. Sets REMOTE_REF (where the record came from) and REMOTE_WHY (the
+# evidence, or why the record could not be used).
+remote_complete() {
+    local id="$1" dest ref why spec=()
+    REMOTE_WHY=""; REMOTE_REF=""
+    (( REMOTE_RESULTS )) || return 1
+    [[ -n "$STEP_REMOTE_RUN" ]] || return 1
+
+    dest="$REMOTE_DIR/$(slug "$id")"
+    rm -rf "$dest" 2>/dev/null
+    ref=$(remote_record "$STEP_REMOTE_RUN" "$dest" "$STEP_REMOTE_CSV") || return 1
+    [[ -n "$ref" ]] || return 1
+    REMOTE_REF="$ref"
+
+    if ! remote_code_is_ours "$dest/run.json"; then
+        REMOTE_WHY="REMOTE_STRICT=1 and its commit is not an ancestor of HEAD"
+        return 1
+    fi
+
+    spec=(--run-json "$dest/run.json")
+    (( ${#STEP_REMOTE_SPEC[@]} )) && spec+=("${STEP_REMOTE_SPEC[@]}")
+    if [[ -n "$STEP_REMOTE_CSV" ]]; then
+        # The metrics CSV is published alongside the record, so its absence
+        # means the run ended before it wrote one.
+        if [[ -s "$dest/$STEP_REMOTE_CSV" ]]; then
+            spec+=(--csv "$dest/$STEP_REMOTE_CSV")
+        else
+            REMOTE_WHY="the published record carries no $STEP_REMOTE_CSV"
+            return 1
+        fi
+    fi
+
+    why=$(results_complete "${spec[@]}") || { REMOTE_WHY="$why"; return 1; }
+    REMOTE_WHY="$why"
+    return 0
+}
+
+# adopt_step <id> <desc> <bs> <marker> <log> <headline> <detail>
+# Record a step as done without running it, because its results already exist.
+# Shared by the on-disk and the published evidence paths so both leave the same
+# marker, the same manifest line and the same --list output.
+adopt_step() {
+    local id="$1" desc="$2" bs="$3" marker="$4" log="$5" headline="$6" detail="$7"
+    if (( LIST_ONLY )); then
+        printf '  %-28s %s\n' "$id" "$desc"
+        printf '      %s\n' "SKIP -- $headline ($detail)"
+        return 0
+    fi
+    say "${C_GRN}complete${C_OFF} $id -- $headline ($detail)"
+    SKIPPED_STEPS+=("$id ($headline)")
+    (( DRY_RUN )) && return 0
+    local arts
+    arts=$(record_artifacts "$id")
+    {
+        echo "adopted $(now): $headline ($detail)"
+        echo "cmd: ${CMD[*]}"
+        echo "artifacts:"
+        printf '%s' "$arts" | sed 's/^/  /'
+    } > "$marker"
+    printf '{"id":"%s","desc":"%s","status":"already_complete","evidence":"%s","detail":"%s","exit_code":0,"batch_size":"%s","elapsed_s":0,"finished":"%s","log":"%s"}\n' \
+        "$(json_escape "$id")" "$(json_escape "$desc")" "$(json_escape "$headline")" \
+        "$(json_escape "$detail")" "${bs:-}" "$(now)" "$(json_escape "$log")" >> "$MANIFEST"
+}
+
 run_step() {
     # run_step <id> <description> <builder-fn> [batch-size]
     local id="$1" desc="$2" builder="$3" bs="${4:-}"
@@ -413,7 +896,52 @@ run_step() {
         return 0
     fi
 
+    # Cleared before every builder call: a builder that sets none of these must
+    # not inherit the previous step's artifacts, probe or published run name.
+    STEP_ARTIFACTS=()
+    STEP_PROBE=()
+    STEP_REMOTE_RUN=""
+    STEP_REMOTE_CSV=""
+    STEP_REMOTE_SPEC=()
+    STEP_KIND="terminal"
     "$builder" "$bs"
+
+    # No marker, but the results may still be complete -- from a run whose state
+    # directory is gone, a step run by hand, or a kill between a step finishing
+    # and its marker landing. Adopt those instead of recomputing them; anything
+    # partial falls through and is re-run from its own checkpoint.
+    local why=""
+    if (( ADOPT_COMPLETE )) && (( FORCE == 0 )) && (( ${#STEP_PROBE[@]} )); then
+        if why=$(results_complete "${STEP_PROBE[@]}"); then
+            adopt_step "$id" "$desc" "$bs" "$marker" "$log" \
+                       "results already on disk" "$why"
+            return 0
+        fi
+        [[ -n "$why" ]] && info "$id -- results incomplete here ($why)"
+    fi
+
+    # Nothing usable on this disk -- but another machine may have finished this
+    # exact cell and pushed it.
+    if (( ADOPT_COMPLETE )) && (( FORCE == 0 )) && [[ -n "$STEP_REMOTE_RUN" ]]; then
+        if remote_complete "$id"; then
+            if [[ "$STEP_KIND" == "producer" ]] && (( ! TRUST_REMOTE_PRODUCERS )) \
+               && ! artifacts_present; then
+                # The record proves the step ran, not that its outputs are here:
+                # checkpoints and caches are never published. Later stages read
+                # those files, so this one has to run anyway.
+                info "$id -- $REMOTE_REF has it ($REMOTE_WHY), but its checkpoints are"
+                info "     never published and are missing here; running it so the"
+                info "     later stages have them (TRUST_REMOTE_PRODUCERS=1 to skip)"
+            else
+                adopt_step "$id" "$desc" "$bs" "$marker" "$log" \
+                           "published on $REMOTE_REF" "$REMOTE_WHY"
+                return 0
+            fi
+        elif [[ -n "$REMOTE_WHY" ]]; then
+            info "$id -- published record on ${REMOTE_REF:-origin} is not usable" \
+                 "($REMOTE_WHY)"
+        fi
+    fi
 
     if (( LIST_ONLY )); then
         printf '  %-28s %s\n' "$id" "$desc"
@@ -538,8 +1066,9 @@ print_summary() {
         printf '  %s\n' "${FAILED_STEPS[@]}"
     fi
     echo
-    say "re-run this script to continue: completed steps are skipped, and an"
-    say "interrupted or failed one resumes from its own checkpoint."
+    say "re-run this script to continue: steps whose results are already complete"
+    say "are skipped, and an interrupted or failed one resumes from its own"
+    say "checkpoint at the epoch it reached."
 }
 
 # --------------------------------------------------------------------------- #
@@ -555,11 +1084,27 @@ build_decoder() {
     local bs="$1"
     CMD=("${UV_RUN[@]}" lcm_scripts/blt_decoder.py
          --entropy_model "$ENTROPY_MODEL"
-         --num_sentences 50000 --epochs 10 --batch_size "$bs" --amp
+         --num_sentences "$DECODER_SENTENCES" --epochs "$DECODER_EPOCHS"
+         --batch_size "$bs" --amp
          --pooler_save_path lcm_models/blt_pooler.pth
          --save_path lcm_models/blt_decoder.pth
          --resume auto)
     STEP_ARTIFACTS=(lcm_models/blt_decoder.pth lcm_models/blt_pooler.pth)
+    # blt_decoder.py names its history and its published run after the save
+    # path's basename, and writes both beside the checkpoints.
+    STEP_PROBE=(--epochs "$DECODER_EPOCHS"
+                --history lcm_models/blt_decoder_history.json
+                --run-json "$RESULTS_RUNS_DIR/blt_decoder/run.json"
+                --file lcm_models/blt_decoder.pth
+                --file lcm_models/blt_pooler.pth)
+    # Stage 2 loads blt_decoder.pth and blt_pooler.pth, and neither is ever
+    # published, so someone else's finished decoder run does not spare this
+    # machine the training unless the checkpoints are already here.
+    STEP_KIND="producer"
+    STEP_REMOTE_RUN="blt_decoder"
+    STEP_REMOTE_SPEC=(--epochs "$DECODER_EPOCHS"
+                      --expect "num_sentences=$DECODER_SENTENCES"
+                      --expect "entropy_model=$ENTROPY_MODEL")
 }
 
 ENCODE_FRACTION=""
@@ -583,19 +1128,34 @@ build_encode() {
     # AMP_ENCODE=1 is set explicitly.
     [[ "${AMP_ENCODE:-0}" == "1" ]] && CMD+=(--amp)
     STEP_ARTIFACTS=("$cache" "$model_dir")
+    # --epochs 0: this step encodes, it does not train, so the cache IS the
+    # result. It is written whole (staged, then renamed) by cached_torch, so its
+    # presence means the encode pass finished.
+    STEP_PROBE=(--epochs 0
+                --run-json "$RESULTS_RUNS_DIR/lcm_blt_base_fraction$(frac_num "$f")/run.json"
+                --file "$cache")
+    # Same as the decoder: the whole point of this step is the embedding cache,
+    # which is far too large to publish. A published record means the encode
+    # happened somewhere, not that this machine has the cache Stage 2 reads.
+    STEP_KIND="producer"
+    STEP_REMOTE_RUN="lcm_blt_base_fraction$(frac_num "$f")"
+    STEP_REMOTE_SPEC=(--epochs 0
+                      --expect "fraction=$f"
+                      --expect "entropy_model=$ENTROPY_MODEL")
 }
 
 MT_FRACTION=""; MT_SEED=""
 build_mt() {
-    local bs="$1" f="$MT_FRACTION" s="$MT_SEED" csv
+    local bs="$1" f="$MT_FRACTION" s="$MT_SEED" csv run
     csv="results/blt_lcm_mt_${f}_s${s}.csv"
+    run="lcm_blt_mt_fraction$(frac_num "$f")_s${s}"
     CMD=("${UV_RUN[@]}" lcm_scripts/train_lcm_blt_mt.py
          --entropy_model "$ENTROPY_MODEL"
          --pooler lcm_models/blt_pooler.pth
          --decoder lcm_models/blt_decoder.pth
-         --fraction "$f" --epochs 3 --batch_size "$bs"
+         --fraction "$f" --epochs "$MT_EPOCHS" --batch_size "$bs"
          --seed "$s" --data_seed "$DATA_SEED"
-         --noise_levels 0.0 0.1 0.2
+         --noise_levels "${NOISE_LEVELS[@]}"
          --comet_model "$COMET_MODEL"
          --out_csv "$csv"
          --embed_cache "embeddings/blt_mt_concepts_frac$(frac_tag "$f").pth"
@@ -609,34 +1169,84 @@ build_mt() {
     # The checkpoint carries the fraction as well as the seed -- the whole grid
     # writes into one --model_dir, and a seed-only name had every fraction
     # landing on the same file (which is what made this step fail).
-    STEP_ARTIFACTS=(
-        "$csv"
-        "lcm_models/lcm_blt_mt_fraction$(frac_num "$f")_s${s}_best.pth"
-    )
+    STEP_ARTIFACTS=("$csv" "lcm_models/${run}_best.pth")
+    # A cell of the grid is only complete when the training ran its full
+    # --epochs AND the evaluation produced a row for every noise level: the CSV
+    # is written once, at the very end, after the last noise level is scored.
+    STEP_PROBE=(--epochs "$MT_EPOCHS"
+                --history "lcm_models/${run}_history.json"
+                --run-json "$RESULTS_RUNS_DIR/${run}/run.json"
+                --file "lcm_models/${run}_best.pth"
+                --csv "$csv" --csv-rows "${#NOISE_LEVELS[@]}")
+    # The headline grid. A cell exists to produce this CSV, and the CSV is
+    # published alongside the record -- so a cell another machine has already
+    # pushed is finished work, and nothing downstream needs its checkpoint.
+    # The run name pins fraction and seed; --expect pins the rest of the cell.
+    STEP_REMOTE_RUN="$run"
+    STEP_REMOTE_CSV="$(basename "$csv")"
+    STEP_REMOTE_SPEC=(--epochs "$MT_EPOCHS"
+                      --csv-rows "${#NOISE_LEVELS[@]}"
+                      --expect "fraction=$f"
+                      --expect "seed=$s"
+                      --expect "data_seed=$DATA_SEED"
+                      --expect "noise_levels=${NOISE_LEVELS[*]}"
+                      --expect "entropy_model=$ENTROPY_MODEL")
 }
 
 build_baselines() {
     CMD=("${UV_RUN[@]}" lcm_scripts/benchmark_bhashasetu_models.py
-         --models bpe_transformer bpe_lcm sonar_lcm
-         --fractions 0.25 0.50 0.80 --noise_levels 0.0 0.1 0.2
-         --eval_docs 100 --epochs 1
+         --models "${BENCH_MODELS[@]}"
+         --fractions "${FRACTIONS[@]}" --noise_levels "${NOISE_LEVELS[@]}"
+         --eval_docs 100 --epochs "$BENCH_EPOCHS"
          --out_dir runs/bhashasetu_benchmarks)
     STEP_ARTIFACTS=(runs/bhashasetu_benchmarks)
+    # The orchestrator concatenates one row per (model, fraction, noise) into
+    # summary_metrics.csv after the last sub-job returns, so a full-length
+    # summary is exactly the statement "every cell of the grid ran". Epoch
+    # counting belongs to the sub-jobs, which resume themselves.
+    STEP_PROBE=(--epochs 0
+                --csv runs/bhashasetu_benchmarks/summary_metrics.csv
+                --csv-rows "$(( ${#BENCH_MODELS[@]} * ${#FRACTIONS[@]} * ${#NOISE_LEVELS[@]} ))")
+    # benchmark_bhashasetu_models.py publishes the summary CSV with its record,
+    # so a full-length published summary is the whole deliverable of this step.
+    STEP_REMOTE_RUN="bhashasetu_benchmark"
+    STEP_REMOTE_CSV="summary_metrics.csv"
+    STEP_REMOTE_SPEC=(--epochs 0
+                      --csv-rows "$(( ${#BENCH_MODELS[@]} * ${#FRACTIONS[@]} * ${#NOISE_LEVELS[@]} ))"
+                      --expect "epochs=$BENCH_EPOCHS"
+                      --expect "noise_levels=${NOISE_LEVELS[*]}")
 }
 
 build_llama() {
     CMD=("${UV_RUN[@]}" lcm_scripts/train_bpe_llama8b.py
-         --fraction 0.25 --epochs 1 --batch_size 1 --grad_accum 16
-         --qlora --noise_levels 0.0 0.1 0.2
+         --fraction 0.25 --epochs "$LLAMA_EPOCHS" --batch_size 1 --grad_accum 16
+         --qlora --noise_levels "${NOISE_LEVELS[@]}"
          --out_dir runs/bpe_llama8b_25_qlora
          --resume auto)
     STEP_ARTIFACTS=(runs/bpe_llama8b_25_qlora)
+    STEP_PROBE=(--epochs "$LLAMA_EPOCHS"
+                --history runs/bpe_llama8b_25_qlora/bpe_llama8b_fraction0.25_history.json
+                --run-json "$RESULTS_RUNS_DIR/bpe_llama8b_fraction0.25/run.json"
+                --csv runs/bpe_llama8b_25_qlora/metrics_fraction0.25.csv
+                --csv-rows "${#NOISE_LEVELS[@]}")
+    STEP_REMOTE_RUN="bpe_llama8b_fraction0.25"
+    STEP_REMOTE_CSV="metrics_fraction0.25.csv"
+    STEP_REMOTE_SPEC=(--epochs "$LLAMA_EPOCHS"
+                      --csv-rows "${#NOISE_LEVELS[@]}"
+                      --expect "fraction=0.25"
+                      --expect "noise_levels=${NOISE_LEVELS[*]}")
 }
 
 ANALYSIS_SCRIPT=""
 build_analysis() {
     CMD=("${UV_RUN[@]}" "$ANALYSIS_SCRIPT")
     STEP_ARTIFACTS=()
+    # The corpus analyses have no epochs and no single result file to key on;
+    # each one resumes per record through its own ResumableJsonl output, so
+    # re-running a finished analysis is cheap and there is nothing to adopt.
+    # They do not publish a run record either, so there is nothing to read from
+    # the results refs for them.
+    STEP_PROBE=()
 }
 
 # --------------------------------------------------------------------------- #
@@ -676,7 +1286,8 @@ else
 fi
 
 # --- decoder + pooler ------------------------------------------------------- #
-run_step "decoder" "BLT byte decoder + pooler (50k sentences, 10 epochs)" \
+run_step "decoder" \
+         "BLT byte decoder + pooler ($DECODER_SENTENCES sentences, $DECODER_EPOCHS epochs)" \
          build_decoder "$BS_DECODER"
 
 # --- Stage 1: pre-encode BLT embeddings ------------------------------------- #
@@ -697,7 +1308,7 @@ else
         for f in "${FRACTIONS[@]}"; do
             MT_FRACTION="$f"; MT_SEED="$s"
             run_step "mt:f${f}_s${s}" \
-                     "Stage 2 -- EN->MR MT (fraction $f, seed $s, noise 0/0.1/0.2)" \
+                     "Stage 2 -- EN->MR MT (fraction $f, seed $s, $MT_EPOCHS epochs, noise ${NOISE_LEVELS[*]})" \
                      build_mt "$BS_MT"
         done
     done
