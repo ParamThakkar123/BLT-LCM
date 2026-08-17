@@ -2,9 +2,9 @@
   "run_name": "blt_decoder",
   "script": "blt_decoder.py",
   "fingerprint": "83b848bed347b2bf",
-  "started_utc": "2026-08-16T09:59:49Z",
-  "finished_utc": "2026-08-16T10:16:03Z",
-  "wall_clock_seconds": 973.8,
+  "started_utc": "2026-08-17T04:30:06Z",
+  "finished_utc": "2026-08-17T04:47:42Z",
+  "wall_clock_seconds": 1056.8,
   "hyperparameters": {
     "amp": true,
     "batch_size": 256,
@@ -55,10 +55,10 @@
     "train_until_plateau": false
   },
   "metrics": {
-    "best_byte_cross_entropy": 0.5840969350264997,
+    "best_byte_cross_entropy": 0.5834021835911031,
     "best_epoch": 10,
     "epochs_run": 10,
-    "byte_perplexity": 1.7933707238639627
+    "byte_perplexity": 1.7921252096908382
   },
   "info": {
     "sentences": 50000,
@@ -71,15 +71,16 @@
     "min_delta": 0.0,
     "min_epochs": 1,
     "epochs_observed": 10,
-    "best": 0.5840969350264997,
+    "best": 0.5834021835911031,
     "best_epoch": 10,
     "epochs_since_improvement": 0,
     "stop_reason": "reached the --epochs cap of 10"
   },
+  "withheld": [],
   "environment": {
     "python": "3.13.11",
     "platform": "Linux-4.4.0-x86_64-with-glibc2.41",
-    "hostname": "00054d30-e3a4-4726-8963-a3dff4bca0bd-jqk82",
+    "hostname": "5bb8f24e-2359-4951-a8ce-a706caaaaed6-79s2k",
     "argv": [
       "lcm_scripts/blt_decoder.py",
       "--entropy_model",
@@ -99,7 +100,7 @@
       "auto"
     ],
     "cwd": "/marimo/BLT-LCM",
-    "git_commit": "282ccc8",
+    "git_commit": "1fbad41",
     "git_branch": "main",
     "git_dirty": true,
     "torch": "2.13.0+cu130",
