@@ -51,11 +51,25 @@ The container itself contains only system packages and Python libraries — the 
 | Variable | Default | Description |
 |---|---|---|
 | `APPTAINER_IMAGE` | `$REPO_DIR/lcm-sonar.sif` | Path to the `.sif` container image |
+| `MKSQUASHFS_ARGS` | `-processors 4 -mem 2048M` | Passed to `apptainer build --mksquashfs-args`; caps build-time CPU/memory use (see below) |
 
 Set `APPTAINER_IMAGE` in `.env` to point to a shared filesystem location:
 
 ```bash
 APPTAINER_IMAGE=/shared/containers/lcm-sonar.sif
+```
+
+### Build killed with exit 137 / "mksquashfs command failed"
+
+`mksquashfs` (the last step of `build`) defaults to one compression thread per
+detected CPU thread. On a high-core-count login node (Ferranti's are 64c/128t)
+that can exceed a per-user memory cap and get SIGKILL'd well before the
+node's total RAM is exhausted -- exit 137 is the OOM killer, not a broken
+build. `build_apptainer.sh` already caps this via `MKSQUASHFS_ARGS`
+(`-processors 4 -mem 2048M`); if it still fails, lower it further in `.env`:
+
+```bash
+MKSQUASHFS_ARGS="-processors 2 -mem 1024M"
 ```
 
 ## Caching Directories
