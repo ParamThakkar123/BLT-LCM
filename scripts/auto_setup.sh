@@ -43,6 +43,24 @@
 # Ctrl-C stops the pipeline, not just the running step: the interrupted step is
 # left unmarked (so a re-run resumes it) and nothing further is started.
 #
+# The driver's own state -- every step's log, its completion marker, the
+# artifacts it copied, the manifest -- is published too. runs/auto_setup is
+# gitignored (it sits next to multi-GB scratch), so at the end of every run the
+# whole directory is mirrored into results/auto_setup/<machine>/ and committed,
+# and pushed when BLT_LCM_PUSH_RESULTS=1. Oversized logs go in as their tail,
+# credential-shaped strings are masked first, and whatever is left out is named
+# in WITHHELD.txt. See lcm_scripts/publish_state.py.
+#
+# A step that is already done -- because this machine finished it earlier, or
+# because another machine ran it and pushed the result -- has its published
+# files pulled back BEFORE that mirror is taken: the metrics CSV, the figures,
+# the loss history and the record itself are extracted from the results refs
+# into results/runs/<run>/ (whatever this checkout is missing) and into the
+# step's artifacts directory. So the published state directory carries the
+# evidence for every step of the pipeline, not only for the steps that happened
+# to run here. `--publish-state` does exactly that and nothing else: restore
+# everything published, mirror it, push, run no experiments.
+#
 # Usage (from anywhere -- the script finds its own repo root):
 #   bash scripts/auto_setup.sh                  # everything, resuming as needed
 #   bash scripts/auto_setup.sh --list           # show the plan + chosen batch sizes
@@ -50,6 +68,7 @@
 #   bash scripts/auto_setup.sh --only 'mt:*'    # only the Stage 2 MT grid
 #   bash scripts/auto_setup.sh --skip 'bench:*' # everything except the baselines
 #   bash scripts/auto_setup.sh --force --only decoder
+#   bash scripts/auto_setup.sh --publish-state  # collect + push the state dir only
 #
 # Environment knobs (all optional):
 #   REPO_DIR      repository root  (default: the parent of this script)
@@ -75,6 +94,12 @@
 #                     ancestor of HEAD (i.e. not produced by divergent code)
 #   TRUST_REMOTE_PRODUCERS=1  skip the decoder/encode steps on remote evidence
 #                     even when their (unpublished) checkpoints are missing here
+#   PUBLISH_STATE=0   do not mirror/commit runs/auto_setup at the end of the run
+#   PUSH_STATE=1      push that mirror (default: follow BLT_LCM_PUSH_RESULTS)
+#   STATE_PUBLISH_DIR where the mirror is written (default: results/auto_setup)
+#   STATE_PUBLISH_ID  its per-machine subdirectory (default: this hostname)
+#   STATE_MAX_MB      a log bigger than this is published as its tail (default 5)
+#   RESTORE_PUBLISHED=0  do not pull a finished step's published files back here
 #
 # NOTE on cu130: pyproject.toml pins `torch==2.5.1` from the cu121 index, and
 # `uv run` re-syncs the venv on every invocation. The requested
@@ -115,6 +140,7 @@ SKIP_PAT=""
 FORCE=0
 DRY_RUN=0
 LIST_ONLY=0
+PUBLISH_STATE_ONLY=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -123,6 +149,10 @@ while [[ $# -gt 0 ]]; do
         --force)   FORCE=1; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
         --list)    LIST_ONLY=1; shift ;;
+        # Restore what every finished step published, mirror the state
+        # directory, push it -- and run no experiments. The repair path for a
+        # machine whose pipeline ran before any of this was published.
+        --publish-state) PUBLISH_STATE_ONLY=1; shift ;;
         # The whole leading comment block, however long it grows: everything
         # from line 2 up to the first line that is not a comment.
         -h|--help) sed -n '2,/^[^#]/p' "$0" | sed '$d'; exit 0 ;;
@@ -298,6 +328,10 @@ probe_vram() {
     if [[ -n "${VRAM_MB:-}" ]]; then
         echo "$VRAM_MB"; return
     fi
+    # --publish-state runs nothing, so there is no batch size to choose -- and
+    # the torch fallback below would re-sync the venv to answer a question this
+    # invocation does not ask.
+    if (( PUBLISH_STATE_ONLY )); then echo 0; return; fi
     if command -v nvidia-smi >/dev/null 2>&1; then
         # Smallest GPU wins: a batch size that fits every visible device.
         mb=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null \
@@ -376,18 +410,26 @@ BS_ENCODE=${BS_ENCODE:-$(bs_encode_for "$VRAM")}
 BS_MT=${BS_MT:-$(bs_mt_for "$VRAM")}
 
 rule
-say "GPU allocation:"
-gpu_report
-if (( VRAM == 0 )); then
-    warn "no CUDA GPU visible -- everything below will run on CPU and be far too"
-    warn "slow for the training stages. Only Stage 4 is genuinely CPU-friendly."
+if (( PUBLISH_STATE_ONLY )); then
+    say "--publish-state: restore what is published, mirror $STATE_DIR, push it"
+    say "no experiment runs, and no GPU is touched"
 else
-    say "usable VRAM: ${VRAM} MiB (smallest visible device)"
+    say "GPU allocation:"
+    gpu_report
+    if (( VRAM == 0 )); then
+        warn "no CUDA GPU visible -- everything below will run on CPU and be far too"
+        warn "slow for the training stages. Only Stage 4 is genuinely CPU-friendly."
+    else
+        say "usable VRAM: ${VRAM} MiB (smallest visible device)"
+    fi
+    say "batch sizes: decoder=${BS_DECODER}  encode=${BS_ENCODE}  mt=${BS_MT}"
 fi
-say "batch sizes: decoder=${BS_DECODER}  encode=${BS_ENCODE}  mt=${BS_MT}"
 rule
 
-if (( ! DRY_RUN )); then
+# The probe record describes a run that is about to train something. A
+# --publish-state invocation is not one, and would overwrite the record of the
+# run whose state it is publishing with an empty one.
+if (( ! DRY_RUN )) && (( ! PUBLISH_STATE_ONLY )); then
     {
         printf '{"timestamp":"%s","vram_mb":%s,"bs_decoder":%s,"bs_encode":%s,"bs_mt":%s}\n' \
             "$(now)" "$VRAM" "$BS_DECODER" "$BS_ENCODE" "$BS_MT"
@@ -747,6 +789,131 @@ remote_code_is_ours() {
 init_remote_results
 
 # --------------------------------------------------------------------------- #
+# pulling a finished step's published files back onto this machine
+# --------------------------------------------------------------------------- #
+#
+# A step can be finished without leaving anything here: another machine ran the
+# cell and pushed it, and this driver skipped it on that evidence. The record
+# proving that lives in the results refs, and so do the files it was published
+# with -- the metrics CSV, the loss history, the figures, the README. Reading
+# them back costs one `git show` per file and no network round-trip beyond the
+# fetch that already happened, so a step that is done anywhere becomes a step
+# whose results are HERE:
+#
+#   results/runs/<run>/       whatever this checkout does not already have, so
+#                             Stage 4 and the paper figures can read it
+#   $ART_DIR/<step>/          the same files as that step's artifacts, so the
+#                             state directory this driver publishes carries the
+#                             evidence for the whole pipeline and not just for
+#                             the steps that happened to run on this machine
+#
+# Files this machine produced itself are never overwritten: the working tree
+# wins, and only the gaps are filled.
+
+RESTORE_PUBLISHED=${RESTORE_PUBLISHED:-1}
+
+restore_published() {
+    local id="$1" run="$2" ref="${3:-}"
+    (( RESTORE_PUBLISHED )) || return 0
+    (( REMOTE_RESULTS ))    || return 0
+    [[ -n "$run" ]]         || return 0
+    (( DRY_RUN || LIST_ONLY )) && return 0
+
+    local dest stamp
+    dest="$ART_DIR/$(slug "$id")"
+    stamp="$dest/published_from.txt"
+    # Once per (step, run): re-extracting the same blobs on every invocation
+    # would cost a git process per published file per step, for nothing.
+    if [[ -f "$stamp" ]] && grep -qx "run $run" "$stamp" 2>/dev/null && (( ! FORCE )); then
+        return 0
+    fi
+
+    if [[ -z "$ref" ]]; then
+        ref=$(remote_record "$run" "$REMOTE_DIR/$(slug "$id")") || return 0
+        [[ -n "$ref" ]] || return 0
+    fi
+
+    local prefix="$RESULTS_RUNS_DIR/$run"
+    local file name got=0 filled=0 names=()
+    mkdir -p "$dest" 2>/dev/null
+    # -z, read straight from the pipe: ls-tree quotes unusual names in its
+    # default output, and a NUL-separated list cannot be held in a variable at
+    # all -- bash drops the separators in a command substitution.
+    while IFS= read -r -d '' file; do
+        [[ -n "$file" ]] || continue
+        name="${file#"$prefix"/}"
+        # The run directories are flat. A nested path would be a run inside a
+        # run, and writing it under $dest by basename would collide.
+        [[ "$name" == */* ]] && continue
+        if git -C "$REPO_DIR" show "$ref:$file" > "$dest/$name" 2>/dev/null; then
+            got=$(( got + 1 )); names+=("$name")
+        else
+            rm -f "$dest/$name" 2>/dev/null
+            continue
+        fi
+        if [[ ! -e "$REPO_DIR/$file" ]]; then
+            mkdir -p "$REPO_DIR/$prefix" 2>/dev/null
+            git -C "$REPO_DIR" show "$ref:$file" > "$REPO_DIR/$file" 2>/dev/null \
+                && filled=$(( filled + 1 )) || rm -f "$REPO_DIR/$file" 2>/dev/null
+        fi
+    done < <(git -C "$REPO_DIR" ls-tree -r -z --name-only "$ref" -- "$prefix/" 2>/dev/null)
+
+    (( got )) || return 0
+    {
+        echo "run $run"
+        echo "ref $ref"
+        echo "restored $(now)"
+        printf '  %s\n' "${names[@]}"
+    } > "$stamp"
+    info "$id -- restored $got published file(s) from $ref"
+    (( filled )) && \
+        info "     $filled of them into $prefix/ (this checkout did not have them)"
+    return 0
+}
+
+# --------------------------------------------------------------------------- #
+# publishing this driver's own state directory
+# --------------------------------------------------------------------------- #
+#
+# runs/auto_setup holds the only record of HOW the pipeline ran -- the logs, the
+# markers, the artifact lists, the manifest -- and `runs/` is gitignored, so all
+# of it has always died with the machine. lcm_scripts/publish_state.py mirrors
+# it into results/auto_setup/<machine>/ and commits it; pushing follows
+# BLT_LCM_PUSH_RESULTS, the same switch every training job publishes under.
+#
+# The mirror is per-machine and is deliberately NOT the live directory: a
+# `.done` marker pulled in from somebody else's run would make this driver skip
+# a step whose checkpoints do not exist here.
+
+PUBLISH_STATE=${PUBLISH_STATE:-1}
+PUSH_STATE=${PUSH_STATE:-${BLT_LCM_PUSH_RESULTS:-0}}
+STATE_PUBLISH_DIR=${STATE_PUBLISH_DIR:-results/auto_setup}
+STATE_MAX_MB=${STATE_MAX_MB:-5}
+
+publish_state() {
+    (( PUBLISH_STATE )) || return 0
+    (( DRY_RUN || LIST_ONLY )) && return 0
+    local script="$REPO_DIR/lcm_scripts/publish_state.py"
+    if [[ ! -f "$script" ]]; then
+        info "state publishing: $script not in this checkout; skipping"
+        return 0
+    fi
+
+    local cmd=("${PROBE_PY[@]}" "$script"
+               --state_dir "$STATE_DIR" --repo_root "$REPO_DIR"
+               --dest "$STATE_PUBLISH_DIR" --max_mb "$STATE_MAX_MB")
+    [[ -n "${STATE_PUBLISH_ID:-}" ]] && cmd+=(--name "$STATE_PUBLISH_ID")
+    [[ "$PUSH_STATE" == "1" ]] && cmd+=(--push)
+
+    rule
+    say "publishing the driver state directory"
+    # Never fatal: a pipeline that finished its experiments must not report
+    # failure because a bookkeeping commit could not be made.
+    "${cmd[@]}" || warn "state publishing failed (exit $?) -- $STATE_DIR is still on disk"
+    return 0
+}
+
+# --------------------------------------------------------------------------- #
 # step runner: logging, resume markers, artifact capture, OOM backoff
 # --------------------------------------------------------------------------- #
 
@@ -890,14 +1057,12 @@ run_step() {
         SKIPPED_STEPS+=("$id (filtered)")
         return 0
     fi
-    if [[ -f "$marker" && $FORCE -eq 0 ]]; then
-        info "skip ${C_BOLD}$id${C_OFF} -- already done ($(head -1 "$marker" 2>/dev/null))"
-        SKIPPED_STEPS+=("$id (done)")
-        return 0
-    fi
 
     # Cleared before every builder call: a builder that sets none of these must
     # not inherit the previous step's artifacts, probe or published run name.
+    # The builder only assigns variables, so it is called before the marker
+    # check too -- a step that is already done still has to name the run it
+    # published under for its files to be restored.
     STEP_ARTIFACTS=()
     STEP_PROBE=()
     STEP_REMOTE_RUN=""
@@ -905,6 +1070,24 @@ run_step() {
     STEP_REMOTE_SPEC=()
     STEP_KIND="terminal"
     "$builder" "$bs"
+
+    if [[ -f "$marker" && $FORCE -eq 0 ]]; then
+        info "skip ${C_BOLD}$id${C_OFF} -- already done ($(head -1 "$marker" 2>/dev/null))"
+        # Done is not the same as "its files are here": a step adopted from a
+        # published record left a marker and nothing else. Fill in what the
+        # results refs have, so the state directory published below carries it.
+        restore_published "$id" "$STEP_REMOTE_RUN"
+        SKIPPED_STEPS+=("$id (done)")
+        return 0
+    fi
+
+    if (( PUBLISH_STATE_ONLY )); then
+        # --publish-state: collect the evidence, run nothing. A step nobody has
+        # finished yet simply has nothing to restore.
+        restore_published "$id" "$STEP_REMOTE_RUN"
+        SKIPPED_STEPS+=("$id (--publish-state)")
+        return 0
+    fi
 
     # No marker, but the results may still be complete -- from a run whose state
     # directory is gone, a step run by hand, or a kill between a step finishing
@@ -924,6 +1107,9 @@ run_step() {
     # exact cell and pushed it.
     if (( ADOPT_COMPLETE )) && (( FORCE == 0 )) && [[ -n "$STEP_REMOTE_RUN" ]]; then
         if remote_complete "$id"; then
+            # Whatever it was published with belongs here now, whether or not
+            # the step below still has to run for its checkpoints.
+            restore_published "$id" "$STEP_REMOTE_RUN" "$REMOTE_REF"
             if [[ "$STEP_KIND" == "producer" ]] && (( ! TRUST_REMOTE_PRODUCERS )) \
                && ! artifacts_present; then
                 # The record proves the step ran, not that its outputs are here:
@@ -1065,6 +1251,12 @@ print_summary() {
         echo "${C_RED}failed (${#FAILED_STEPS[@]}):${C_OFF}"
         printf '  %s\n' "${FAILED_STEPS[@]}"
     fi
+    echo
+
+    # Last thing every exit path does, the interrupted one included: the logs of
+    # a run that was killed are exactly the ones somebody wants to read later.
+    publish_state
+
     echo
     say "re-run this script to continue: steps whose results are already complete"
     say "are skipped, and an interrupted or failed one resumes from its own"
@@ -1262,7 +1454,10 @@ fi
 
 # --- install ---------------------------------------------------------------- #
 INSTALL_MARK="$MARK_DIR/setup_deps.done"
-if selected "setup:deps"; then
+if (( PUBLISH_STATE_ONLY )); then
+    # Publishing a state directory does not need the venv the experiments run in.
+    SKIPPED_STEPS+=("setup:deps (--publish-state)")
+elif selected "setup:deps"; then
     if [[ -f "$INSTALL_MARK" && $FORCE -eq 0 ]]; then
         info "skip ${C_BOLD}setup:deps${C_OFF} -- already done"
     elif (( LIST_ONLY )); then
@@ -1299,7 +1494,7 @@ done
 
 # --- Stage 2: EN->MR translation grid (headline result) --------------------- #
 if [[ ! -f lcm_models/blt_decoder.pth || ! -f lcm_models/blt_pooler.pth ]] \
-   && (( ! DRY_RUN )) && (( ! LIST_ONLY )); then
+   && (( ! DRY_RUN )) && (( ! LIST_ONLY )) && (( ! PUBLISH_STATE_ONLY )); then
     warn "lcm_models/blt_decoder.pth or blt_pooler.pth missing -- Stage 2 needs both."
     warn "Skipping the MT grid; fix the 'decoder' step and re-run."
     SKIPPED_STEPS+=("mt:* (decoder/pooler missing)")
@@ -1368,4 +1563,8 @@ print_summary
 if (( ${#FAILED_STEPS[@]} )); then
     exit 1
 fi
-say "all selected steps completed."
+if (( PUBLISH_STATE_ONLY )); then
+    say "--publish-state finished: nothing was run, and the state directory is published."
+else
+    say "all selected steps completed."
+fi

@@ -377,6 +377,59 @@ Deliberate limits, because this runs unattended at the end of every job:
 > directory looking for negations. Removing those two lines silently disables
 > all publishing.
 
+### The driver's own state directory
+
+`scripts/auto_setup.sh` keeps its record of a pipeline run — one log and one
+completion marker per step, the artifacts each step was expected to produce, and
+`manifest.jsonl` — under `runs/auto_setup`, which is gitignored. At the end of
+every run (including an interrupted one) that whole directory is mirrored into
+the repository and committed by `lcm_scripts/publish_state.py`:
+
+```
+results/auto_setup/<machine>/
+  README.md                 # step table: status, elapsed, batch size, finish time
+  state.json                # the same, machine-readable, plus what was withheld
+  manifest.jsonl            # the driver's own manifest, verbatim
+  logs/<step>.log           # one per step (oversized logs: the tail, marked as such)
+  state/<step>.done         # the completion markers
+  artifacts/<step>/         # each step's artifacts, and what it restored (below)
+  WITHHELD.txt              # what did not go in, and why
+```
+
+* **One directory per machine** (`STATE_PUBLISH_ID`, default the hostname), and
+  deliberately *not* the live `runs/auto_setup`: a `.done` marker arriving from
+  another machine's run would make this driver skip a step whose checkpoints do
+  not exist here.
+* **Oversized text is truncated, not dropped** — anything over `STATE_MAX_MB`
+  (default 5) is published as its last 2000 lines with a header saying so.
+  Oversized binaries are withheld; `.pth` and friends never go in.
+* **Credentials are masked** before anything is committed — a token that reached
+  a log line is redacted, because these logs are pushed.
+* Pushing follows `BLT_LCM_PUSH_RESULTS`, like every other publish, and can be
+  forced either way with `PUSH_STATE=1` / `PUBLISH_STATE=0`.
+
+**Steps that finished somewhere else are pulled back first.** A cell another
+machine ran and pushed is skipped by the driver on that published evidence — so
+before the mirror is taken, everything published with that record (the metrics
+CSV, the loss history, the figures, `README.md`, `run.json`) is extracted from
+the results refs into `results/runs/<run>/` (only where this checkout is
+missing it; local files always win) and into that step's artifacts directory.
+The published state directory therefore describes the whole pipeline, not just
+the parts that ran on this node.
+
+```bash
+bash scripts/auto_setup.sh --publish-state   # restore + mirror + push, run nothing
+```
+
+That is the repair path for a machine whose pipeline ran before any of this
+existed: it restores what every finished step published, publishes the state
+directory, and starts no experiments. `RESTORE_PUBLISHED=0` turns the restore
+off; `tests/test_publish_state.py` and `tests/test_auto_setup_resume.py` cover
+both halves.
+
+> **`.gitignore` note.** `results/auto_setup/` needs the same re-include dance as
+> `results/runs/`, for the same `runs/`, `*.json` and `*.jsonl` rules.
+
 ### On a GPU cluster
 
 Slurm/PBS/LSF is auto-detected (via `SLURM_JOB_ID` and friends) and switches the

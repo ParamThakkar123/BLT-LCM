@@ -281,61 +281,53 @@ def _authenticated_url(url: str) -> Optional[str]:
 
 
 # --------------------------------------------------------------------------- #
-# Recorder
+# Publisher -- commit an explicit list of paths, and optionally push them
 # --------------------------------------------------------------------------- #
 
 
-class ResultsRecorder:
-    """Collects one run's artifacts under ``results/runs/<run_name>/``."""
+class GitPublisher:
+    """Commits a named list of repository paths and (optionally) pushes them.
+
+    Everything about getting a commit onto the remote from an unattended job
+    lives here: the non-interactive git wrapper, the identity fallback for
+    nodes with no git config, the shared-checkout-safe isolated commit, and the
+    retry/backoff around the push. :class:`ResultsRecorder` adds one run's
+    result collection on top of it, and ``publish_state.py`` -- which publishes
+    the auto_setup driver's state directory -- reuses it directly: a tree of
+    logs and markers needs exactly this push and none of that collection.
+
+    Never fatal and never interactive, for the same reasons documented at the
+    top of this module.
+    """
 
     def __init__(
         self,
-        args: Any,
-        run_name: str,
         *,
-        script: Optional[str] = None,
-        fingerprint: Optional[str] = None,
-        repo_root: Optional[str] = None,
+        repo_root: Optional[str],
+        label: str,
+        remote: str = "origin",
+        branch: Optional[str] = None,
+        push: bool = False,
+        isolated: bool = False,
+        retries: int = 5,
+        timeout: float = DEFAULT_GIT_TIMEOUT,
+        prefix: str = "[results]",
     ):
-        self.run_name = run_name
-        self.script = script or os.path.basename(sys.argv[0] or "unknown")
-        self.fingerprint = fingerprint
-        self.args = args
-        self.enabled = not getattr(args, "no_results", False)
-        self.push = bool(getattr(args, "push_results", False))
-        self.remote = getattr(args, "results_remote", "origin")
-        self.branch = getattr(args, "results_branch", None)
-        self.max_bytes = float(getattr(args, "results_max_mb", 25.0)) * 1024 * 1024
-        self.retries = max(int(getattr(args, "results_retries", 5)), 1)
-        self.timeout = float(getattr(args, "results_timeout", DEFAULT_GIT_TIMEOUT))
-        self.started = time.time()
-        self.metrics: dict[str, Any] = {}
-        self.extra: dict[str, Any] = {}
-        self._sources: list[str] = []
-        # Files the run produced (or was expected to produce) that this commit
-        # will not carry, each with the reason. See _withhold.
-        self._withheld: list[dict] = []
+        self.repo_root = repo_root
+        self.label = label
+        self.remote = remote
+        self.branch = branch
+        self.push = push
+        self.isolated = isolated
+        self.retries = max(int(retries), 1)
+        self.timeout = timeout
+        self.prefix = prefix
 
-        self.repo_root = repo_root or _repo_root(os.getcwd())
-        if self.enabled and not self.repo_root:
-            print("[results] not inside a git repository; results will not be committed")
-            self.enabled = False
+    def say(self, message: str) -> None:
+        """One line of publishing output, tagged with this publisher's prefix."""
+        print(f"{self.prefix} {message}")
 
-        mode = getattr(args, "results_commit_mode", "auto")
-        job = on_scheduler()
-        self.isolated = mode == "isolated" or (mode == "auto" and job is not None)
-        if self.enabled and self.isolated and job:
-            print(
-                f"[results] scheduler detected ({job}); using an isolated commit "
-                "so parallel jobs sharing this checkout do not race on the index"
-            )
-
-        rel = getattr(args, "results_dir", "results/runs") or "results/runs"
-        self.out_dir = (
-            os.path.join(self.repo_root, rel, run_name) if self.repo_root else None
-        )
-
-    # -- small git wrapper bound to this run's settings ---------------------- #
+    # -- small git wrapper bound to this publisher's settings --------------- #
 
     def _git(self, *args: str, extra_env: Optional[dict] = None):
         assert self.repo_root
@@ -352,6 +344,262 @@ class ResultsRecorder:
             cwd=self.repo_root,
             timeout=self.timeout,
             extra_env=extra_env,
+        )
+
+    # -- entry point -------------------------------------------------------- #
+
+    def commit_and_push(self, rel_paths: Sequence[str], message: str) -> None:
+        """Commit these repo-relative paths, and push them if pushing is on."""
+        if not rel_paths or not self.repo_root:
+            return
+        if self.isolated:
+            self._publish_isolated(list(rel_paths), message)
+        else:
+            self._publish_worktree(list(rel_paths), message)
+
+    # -- ordinary path: stage, commit, push --------------------------------- #
+
+    def _publish_worktree(self, rel_paths: list[str], msg: str) -> None:
+        add = self._git_id("add", "--", *rel_paths)
+        if add.returncode != 0:
+            # Ignored paths were filtered out before this point (see _ignored),
+            # so what is left is a real failure -- permissions, a locked index.
+            self.say(f"git add failed: {add.stderr.strip()}")
+            return
+
+        staged = self._git("diff", "--cached", "--name-only", "--", *rel_paths)
+        if not staged.stdout.strip():
+            self.say(f"{self.label} unchanged since the last commit; nothing to do")
+            return
+
+        # Only the explicitly staged result paths are committed. Anything else
+        # the user happens to have staged is left alone.
+        commit = self._git_id("commit", "-m", msg, "--only", "--", *rel_paths)
+        if commit.returncode != 0:
+            self.say(
+                f"git commit failed: "
+                f"{commit.stderr.strip() or commit.stdout.strip()}"
+            )
+            return
+        self.say(f"committed {len(rel_paths)} file(s) for {self.label}")
+
+        if not self._should_push():
+            return
+        branch = self._target_branch()
+        if not branch:
+            return
+        for attempt in range(1, self.retries + 1):
+            push = self._push(f"HEAD:{branch}", branch)
+            if push is True:
+                return
+            if attempt == self.retries:
+                break
+            self._backoff(attempt)
+            pull = self._git_id("pull", "--rebase", self.remote, branch)
+            if pull.returncode != 0:
+                self.say(f"rebase failed: {pull.stderr.strip()}")
+                self._git("rebase", "--abort")
+                return
+        self.say("giving up on push; the commit is still here locally")
+
+    # -- cluster path: temporary index, no working-tree mutation ------------ #
+
+    def _publish_isolated(self, rel_paths: list[str], msg: str) -> None:
+        """Build and push a commit without touching the shared checkout.
+
+        Several array jobs run out of one clone. ``git add`` there takes
+        ``.git/index.lock``, so concurrent jobs either fail or serialize badly,
+        and a job that moved HEAD would move it under every other job still
+        running. Instead the commit is assembled in a private index file with
+        plumbing (read-tree / add / write-tree / commit-tree) and pushed
+        directly, so the only shared state touched is the remote ref.
+        """
+        if not self._should_push():
+            # Without a push there is nowhere for an isolated commit to go, so
+            # fall back to the ordinary path and let it land locally.
+            self.say(
+                "isolated mode needs --push_results to be useful; "
+                "committing into the checkout instead"
+            )
+            self._publish_worktree(rel_paths, msg)
+            return
+
+        branch = self._target_branch()
+        if not branch:
+            return
+
+        with tempfile.TemporaryDirectory(prefix="blt-lcm-results-") as tmp:
+            index_file = os.path.join(tmp, "index")
+            for attempt in range(1, self.retries + 1):
+                env = {"GIT_INDEX_FILE": index_file}
+                if os.path.exists(index_file):
+                    os.remove(index_file)
+
+                base = self._remote_tip(branch) or self._git(
+                    "rev-parse", "HEAD"
+                ).stdout.strip()
+                if not base:
+                    self.say("no base commit to build on; skipping push")
+                    return
+
+                read = self._git("read-tree", base, extra_env=env)
+                if read.returncode != 0:
+                    self.say(f"read-tree failed: {read.stderr.strip()}")
+                    return
+                add = self._git_id("add", "--", *rel_paths, extra_env=env)
+                if add.returncode != 0:
+                    self.say(f"git add failed: {add.stderr.strip()}")
+                    return
+                tree = self._git("write-tree", extra_env=env).stdout.strip()
+                if not tree:
+                    self.say("write-tree produced nothing; skipping push")
+                    return
+                # Nothing changed relative to the base: don't push an empty commit.
+                base_tree = self._git("rev-parse", f"{base}^{{tree}}").stdout.strip()
+                if tree == base_tree:
+                    self.say("results identical to the remote; nothing to push")
+                    return
+
+                commit = self._git_id("commit-tree", tree, "-p", base, "-m", msg)
+                sha = commit.stdout.strip()
+                if commit.returncode != 0 or not sha:
+                    self.say(f"commit-tree failed: {commit.stderr.strip()}")
+                    return
+
+                if self._push(f"{sha}:refs/heads/{branch}", branch) is True:
+                    self.say(
+                        f"published {self.label} as {sha[:8]} (checkout untouched)"
+                    )
+                    return
+                if attempt < self.retries:
+                    self._backoff(attempt)
+        self.say("giving up on push; results remain on disk in the run directory")
+
+    # -- shared push mechanics ---------------------------------------------- #
+
+    def _should_push(self) -> bool:
+        if not self.push:
+            self.say(
+                "not pushing (pass --push_results or set "
+                "BLT_LCM_PUSH_RESULTS=1 to push automatically)"
+            )
+            return False
+        remotes = self._git("remote").stdout.split()
+        if self.remote not in remotes:
+            self.say(f"no remote named '{self.remote}'; skipping push")
+            return False
+        return True
+
+    def _target_branch(self) -> Optional[str]:
+        branch = self.branch or _current_branch(self.repo_root or ".")
+        if not branch:
+            self.say(
+                "detached HEAD and no --results_branch; cannot decide where to push"
+            )
+        return branch
+
+    def _remote_url(self) -> str:
+        return self._git("remote", "get-url", self.remote).stdout.strip()
+
+    def _remote_tip(self, branch: str) -> Optional[str]:
+        """Fetch the remote branch tip, so the new commit stacks on it."""
+        url = self._remote_url()
+        auth = _authenticated_url(url)
+        target = auth or self.remote
+        fetch = self._git("fetch", "--quiet", target, branch)
+        if fetch.returncode != 0:
+            return None
+        return self._git("rev-parse", "FETCH_HEAD").stdout.strip() or None
+
+    def _push(self, refspec: str, branch: str) -> bool:
+        """One push attempt. Returns True on success; never raises."""
+        url = self._remote_url()
+        auth = _authenticated_url(url)
+        target = auth or self.remote
+        push = self._git("push", target, refspec)
+        if push.returncode == 0:
+            self.say(f"pushed {self.label} to {self.remote}/{branch}")
+            return True
+        # The token must never reach a log file.
+        err = (push.stderr or push.stdout).strip()
+        if auth:
+            err = err.replace(auth, f"{self.remote} (authenticated)")
+        if push.returncode == 124:
+            self.say(f"push timed out after {self.timeout:g}s")
+        elif "Authentication" in err or "could not read Username" in err:
+            self.say(
+                "push failed: no usable credentials on this node. "
+                "Set GITHUB_TOKEN (or GIT_TOKEN) in the job environment, or use "
+                "an ssh remote with a key the compute nodes can read."
+            )
+        else:
+            self.say(f"push failed: {err}")
+        return False
+
+    def _backoff(self, attempt: int) -> None:
+        """Randomized backoff, so an array of jobs does not retry in lockstep."""
+        delay = min(2.0**attempt, 30.0) * (0.5 + random.random())
+        self.say(f"retrying push in {delay:.1f}s (attempt {attempt})")
+        time.sleep(delay)
+
+
+# --------------------------------------------------------------------------- #
+# Recorder
+# --------------------------------------------------------------------------- #
+
+
+class ResultsRecorder(GitPublisher):
+    """Collects one run's artifacts under ``results/runs/<run_name>/``."""
+
+    def __init__(
+        self,
+        args: Any,
+        run_name: str,
+        *,
+        script: Optional[str] = None,
+        fingerprint: Optional[str] = None,
+        repo_root: Optional[str] = None,
+    ):
+        self.run_name = run_name
+        self.script = script or os.path.basename(sys.argv[0] or "unknown")
+        self.fingerprint = fingerprint
+        self.args = args
+        self.enabled = not getattr(args, "no_results", False)
+        self.max_bytes = float(getattr(args, "results_max_mb", 25.0)) * 1024 * 1024
+        self.started = time.time()
+        self.metrics: dict[str, Any] = {}
+        self.extra: dict[str, Any] = {}
+        self._sources: list[str] = []
+        # Files the run produced (or was expected to produce) that this commit
+        # will not carry, each with the reason. See _withhold.
+        self._withheld: list[dict] = []
+
+        mode = getattr(args, "results_commit_mode", "auto")
+        job = on_scheduler()
+        super().__init__(
+            repo_root=repo_root or _repo_root(os.getcwd()),
+            label=run_name,
+            remote=getattr(args, "results_remote", "origin"),
+            branch=getattr(args, "results_branch", None),
+            push=bool(getattr(args, "push_results", False)),
+            isolated=mode == "isolated" or (mode == "auto" and job is not None),
+            retries=int(getattr(args, "results_retries", 5)),
+            timeout=float(getattr(args, "results_timeout", DEFAULT_GIT_TIMEOUT)),
+        )
+
+        if self.enabled and not self.repo_root:
+            print("[results] not inside a git repository; results will not be committed")
+            self.enabled = False
+
+        if self.enabled and self.isolated and job:
+            print(
+                f"[results] scheduler detected ({job}); using an isolated commit "
+                "so parallel jobs sharing this checkout do not race on the index"
+            )
+
+        rel = getattr(args, "results_dir", "results/runs") or "results/runs"
+        self.out_dir = (
+            os.path.join(self.repo_root, rel, run_name) if self.repo_root else None
         )
 
     # -- collection --------------------------------------------------------- #
@@ -675,195 +923,5 @@ class ResultsRecorder:
             + "\n".join(f"{k}: {v}" for k, v in list(self.metrics.items())[:12])
         )
 
-        if self.isolated:
-            self._publish_isolated(rel_paths, msg)
-        else:
-            self._publish_worktree(rel_paths, msg)
+        self.commit_and_push(rel_paths, msg)
         return self.out_dir
-
-    # -- ordinary path: stage, commit, push --------------------------------- #
-
-    def _publish_worktree(self, rel_paths: list[str], msg: str) -> None:
-        add = self._git_id("add", "--", *rel_paths)
-        if add.returncode != 0:
-            # Ignored paths were filtered out before this point (see _ignored),
-            # so what is left is a real failure -- permissions, a locked index.
-            print(f"[results] git add failed: {add.stderr.strip()}")
-            return
-
-        staged = self._git("diff", "--cached", "--name-only", "--", *rel_paths)
-        if not staged.stdout.strip():
-            print("[results] results unchanged since the last run; nothing to commit")
-            return
-
-        # Only the explicitly staged result paths are committed. Anything else
-        # the user happens to have staged is left alone.
-        commit = self._git_id("commit", "-m", msg, "--only", "--", *rel_paths)
-        if commit.returncode != 0:
-            print(
-                f"[results] git commit failed: "
-                f"{commit.stderr.strip() or commit.stdout.strip()}"
-            )
-            return
-        print(f"[results] committed {len(rel_paths)} file(s) for {self.run_name}")
-
-        if not self._should_push():
-            return
-        branch = self._target_branch()
-        if not branch:
-            return
-        for attempt in range(1, self.retries + 1):
-            push = self._push(f"HEAD:{branch}", branch)
-            if push is True:
-                return
-            if attempt == self.retries:
-                break
-            self._backoff(attempt)
-            pull = self._git_id("pull", "--rebase", self.remote, branch)
-            if pull.returncode != 0:
-                print(f"[results] rebase failed: {pull.stderr.strip()}")
-                self._git("rebase", "--abort")
-                return
-        print("[results] giving up on push; the commit is still here locally")
-
-    # -- cluster path: temporary index, no working-tree mutation ------------ #
-
-    def _publish_isolated(self, rel_paths: list[str], msg: str) -> None:
-        """Build and push a commit without touching the shared checkout.
-
-        Several array jobs run out of one clone. ``git add`` there takes
-        ``.git/index.lock``, so concurrent jobs either fail or serialize badly,
-        and a job that moved HEAD would move it under every other job still
-        running. Instead the commit is assembled in a private index file with
-        plumbing (read-tree / add / write-tree / commit-tree) and pushed
-        directly, so the only shared state touched is the remote ref.
-        """
-        if not self._should_push():
-            # Without a push there is nowhere for an isolated commit to go, so
-            # fall back to the ordinary path and let it land locally.
-            print(
-                "[results] isolated mode needs --push_results to be useful; "
-                "committing into the checkout instead"
-            )
-            self._publish_worktree(rel_paths, msg)
-            return
-
-        branch = self._target_branch()
-        if not branch:
-            return
-
-        with tempfile.TemporaryDirectory(prefix="blt-lcm-results-") as tmp:
-            index_file = os.path.join(tmp, "index")
-            for attempt in range(1, self.retries + 1):
-                env = {"GIT_INDEX_FILE": index_file}
-                if os.path.exists(index_file):
-                    os.remove(index_file)
-
-                base = self._remote_tip(branch) or self._git(
-                    "rev-parse", "HEAD"
-                ).stdout.strip()
-                if not base:
-                    print("[results] no base commit to build on; skipping push")
-                    return
-
-                read = self._git("read-tree", base, extra_env=env)
-                if read.returncode != 0:
-                    print(f"[results] read-tree failed: {read.stderr.strip()}")
-                    return
-                add = self._git_id("add", "--", *rel_paths, extra_env=env)
-                if add.returncode != 0:
-                    print(f"[results] git add failed: {add.stderr.strip()}")
-                    return
-                tree = self._git("write-tree", extra_env=env).stdout.strip()
-                if not tree:
-                    print("[results] write-tree produced nothing; skipping push")
-                    return
-                # Nothing changed relative to the base: don't push an empty commit.
-                base_tree = self._git("rev-parse", f"{base}^{{tree}}").stdout.strip()
-                if tree == base_tree:
-                    print("[results] results identical to the remote; nothing to push")
-                    return
-
-                commit = self._git_id("commit-tree", tree, "-p", base, "-m", msg)
-                sha = commit.stdout.strip()
-                if commit.returncode != 0 or not sha:
-                    print(f"[results] commit-tree failed: {commit.stderr.strip()}")
-                    return
-
-                if self._push(f"{sha}:refs/heads/{branch}", branch) is True:
-                    print(
-                        f"[results] published {self.run_name} as {sha[:8]} "
-                        "(checkout untouched)"
-                    )
-                    return
-                if attempt < self.retries:
-                    self._backoff(attempt)
-        print("[results] giving up on push; results remain on disk in the run directory")
-
-    # -- shared push mechanics ---------------------------------------------- #
-
-    def _should_push(self) -> bool:
-        if not self.push:
-            print(
-                "[results] not pushing (pass --push_results or set "
-                "BLT_LCM_PUSH_RESULTS=1 to push automatically)"
-            )
-            return False
-        remotes = self._git("remote").stdout.split()
-        if self.remote not in remotes:
-            print(f"[results] no remote named '{self.remote}'; skipping push")
-            return False
-        return True
-
-    def _target_branch(self) -> Optional[str]:
-        branch = self.branch or _current_branch(self.repo_root or ".")
-        if not branch:
-            print(
-                "[results] detached HEAD and no --results_branch; "
-                "cannot decide where to push"
-            )
-        return branch
-
-    def _remote_url(self) -> str:
-        return self._git("remote", "get-url", self.remote).stdout.strip()
-
-    def _remote_tip(self, branch: str) -> Optional[str]:
-        """Fetch the remote branch tip, so the new commit stacks on it."""
-        url = self._remote_url()
-        auth = _authenticated_url(url)
-        target = auth or self.remote
-        fetch = self._git("fetch", "--quiet", target, branch)
-        if fetch.returncode != 0:
-            return None
-        return self._git("rev-parse", "FETCH_HEAD").stdout.strip() or None
-
-    def _push(self, refspec: str, branch: str) -> bool:
-        """One push attempt. Returns True on success; never raises."""
-        url = self._remote_url()
-        auth = _authenticated_url(url)
-        target = auth or self.remote
-        push = self._git("push", target, refspec)
-        if push.returncode == 0:
-            print(f"[results] pushed {self.run_name} to {self.remote}/{branch}")
-            return True
-        # The token must never reach a log file.
-        err = (push.stderr or push.stdout).strip()
-        if auth:
-            err = err.replace(auth, f"{self.remote} (authenticated)")
-        if push.returncode == 124:
-            print(f"[results] push timed out after {self.timeout:g}s")
-        elif "Authentication" in err or "could not read Username" in err:
-            print(
-                "[results] push failed: no usable credentials on this node. "
-                "Set GITHUB_TOKEN (or GIT_TOKEN) in the job environment, or use "
-                "an ssh remote with a key the compute nodes can read."
-            )
-        else:
-            print(f"[results] push failed: {err}")
-        return False
-
-    def _backoff(self, attempt: int) -> None:
-        """Randomized backoff, so an array of jobs does not retry in lockstep."""
-        delay = min(2.0**attempt, 30.0) * (0.5 + random.random())
-        print(f"[results] retrying push in {delay:.1f}s (attempt {attempt})")
-        time.sleep(delay)

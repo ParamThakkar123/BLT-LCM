@@ -42,6 +42,16 @@ tokenization_statistics/patch_compression_by_morpheme_class.png
 !results/runs/
 !results/runs/**
 
+# The auto_setup driver's own state -- its per-step logs, completion markers,
+# copied artifacts and manifest -- is mirrored here by lcm_scripts/publish_state.py
+# so a pipeline's record survives the machine that ran it. The live state
+# directory itself stays ignored under runs/auto_setup, deliberately: pulling
+# another machine's `.done` markers into it would make this driver skip steps
+# whose checkpoints do not exist here. Same re-include dance as above, for the
+# same `runs/`, `*.json` and `*.jsonl` rules.
+!results/auto_setup/
+!results/auto_setup/**
+
 # Vendored/third-party tooling and downloaded archives (do not commit — they
 # bloat the repo). Singularity is a container runtime pulled in for HPC builds.
 singularity/

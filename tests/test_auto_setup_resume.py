@@ -28,6 +28,11 @@ MT_STEP = "mt:f0.25_s42"
 MT_RUN = "lcm_blt_mt_fraction0.25_s42"
 MT_CSV = "blt_lcm_mt_0.25_s42.csv"
 
+# The driver names the published state directory after the machine; these tests
+# pin it so the assertions have a path to look at. `slug()` in the driver.
+HOST = "testnode"
+MT_SLUG = "mt_f0.25_s42"
+
 
 def git(*args, cwd):
     return subprocess.run(
@@ -69,6 +74,13 @@ def checkout(tmp_path):
     (repo / "pyproject.toml").write_text("[project]\nname='blt-lcm'\n", encoding="utf-8")
     (repo / "scripts").mkdir()
     shutil.copy(DRIVER, repo / "scripts" / "auto_setup.sh")
+    # The driver publishes its state directory through these two, so the
+    # checkout under test has to carry them like the real one does.
+    for name in ("publish_state.py", "results_sync.py"):
+        shutil.copy(
+            os.path.join(os.path.dirname(__file__), "..", "lcm_scripts", name),
+            repo / "lcm_scripts" / name,
+        )
 
     git("init", "-b", "main", cwd=repo)
     git("config", "user.email", "test@example.com", cwd=repo)
@@ -131,6 +143,12 @@ def drive(repo, *args, **env):
             "VRAM_MB": "8000",
             # Local bare remote, so the fetch is real but offline.
             "RESULTS_FETCH": "1",
+            # A fixed name for the published state directory: the default is
+            # the hostname, which no assertion can predict.
+            "STATE_PUBLISH_ID": HOST,
+            # Committing the mirror is part of what these tests check; pushing
+            # it is opted into per test.
+            "BLT_LCM_PUSH_RESULTS": "0",
         }
     )
     environment.update({k: str(v) for k, v in env.items()})
@@ -316,6 +334,116 @@ def test_a_published_cell_is_only_looked_up_once(checkout):
 
     assert "already done" in out
     assert not ran(out)
+
+
+# --------------------------------------------------------------------------- #
+# The driver's own state directory is published, and finished steps are
+# restored into it from what they published
+# --------------------------------------------------------------------------- #
+
+
+def published_state(repo, *parts):
+    return repo.joinpath("results", "auto_setup", HOST, *parts)
+
+
+def test_the_state_directory_is_published_and_committed(checkout):
+    publish(checkout, MT_RUN, mt_record(), {MT_CSV: NOISE_CSV})
+    out = drive(checkout, "--only", MT_STEP)
+
+    assert "publishing the driver state directory" in out
+    # The marker and the manifest -- the record of what this machine did.
+    assert published_state(checkout, "state", f"{MT_SLUG}.done").exists()
+    assert "already_complete" in published_state(
+        checkout, "manifest.jsonl"
+    ).read_text(encoding="utf-8")
+    assert published_state(checkout, "README.md").exists()
+
+    committed = git("show", "--name-only", "--format=", "HEAD", cwd=checkout).stdout
+    assert f"results/auto_setup/{HOST}/state/{MT_SLUG}.done" in committed
+    assert "state: auto_setup" in git("log", "-1", "--format=%s", cwd=checkout).stdout
+
+
+def test_a_published_cell_s_files_are_restored_and_republished(checkout):
+    """The step ran somewhere else; its results end up here all the same."""
+    publish(checkout, MT_RUN, mt_record(), {MT_CSV: NOISE_CSV})
+    out = drive(checkout, "--only", MT_STEP)
+
+    assert "restored" in out and "published file(s) from origin/main" in out
+    # Into the checkout, which did not have this run's results at all ...
+    restored = checkout / "results" / "runs" / MT_RUN / MT_CSV
+    assert restored.exists()
+    assert restored.read_text(encoding="utf-8") == NOISE_CSV
+    # ... into the step's artifacts ...
+    state = checkout.parent / "state" / "artifacts" / MT_SLUG
+    assert (state / MT_CSV).exists()
+    assert (state / "run.json").exists()
+    # ... and out again with the published state directory.
+    assert published_state(checkout, "artifacts", MT_SLUG, MT_CSV).exists()
+
+
+def test_restoring_does_not_overwrite_this_machine_s_own_results(checkout):
+    mine = checkout / "results" / "runs" / MT_RUN
+    mine.mkdir(parents=True)
+    (mine / MT_CSV).write_text("mine,not,theirs\n", encoding="utf-8")
+    publish(checkout, MT_RUN, mt_record(), {MT_CSV: NOISE_CSV})
+    drive(checkout, "--only", MT_STEP)
+
+    assert (mine / MT_CSV).read_text(encoding="utf-8") == "mine,not,theirs\n"
+
+
+def test_restoring_can_be_switched_off(checkout):
+    publish(checkout, MT_RUN, mt_record(), {MT_CSV: NOISE_CSV})
+    drive(checkout, "--only", MT_STEP, RESTORE_PUBLISHED=0)
+
+    assert not (checkout / "results" / "runs" / MT_RUN / MT_CSV).exists()
+
+
+def test_a_step_finished_on_an_earlier_run_is_restored_too(checkout):
+    """The marker short-circuits the step, but its files still get pulled back."""
+    publish(checkout, MT_RUN, mt_record(), {MT_CSV: NOISE_CSV})
+    drive(checkout, "--only", MT_STEP)
+    # Wipe what the first run restored, and the note saying it did.
+    shutil.rmtree(checkout / "results" / "runs" / MT_RUN)
+    shutil.rmtree(checkout.parent / "state" / "artifacts" / MT_SLUG)
+
+    out = drive(checkout, "--only", MT_STEP)
+
+    assert "already done" in out
+    assert (checkout / "results" / "runs" / MT_RUN / MT_CSV).exists()
+
+
+def test_publish_state_runs_nothing(checkout):
+    publish(checkout, MT_RUN, mt_record(), {MT_CSV: NOISE_CSV})
+    out = drive(checkout, "--publish-state")
+
+    assert not ran(out)
+    assert "blt_decoder.py" not in out
+    assert (checkout / "results" / "runs" / MT_RUN / MT_CSV).exists()
+    assert published_state(checkout, "artifacts", MT_SLUG, MT_CSV).exists()
+    assert "--publish-state finished" in out
+
+
+def test_the_published_state_can_be_pushed(checkout):
+    out = drive(checkout, "--only", "nothing-matches-this", BLT_LCM_PUSH_RESULTS=1)
+
+    assert "pushed auto_setup state" in out
+    remote = checkout.parent / "remote.git"
+    listing = git("ls-tree", "-r", "--name-only", "main", cwd=remote).stdout
+    assert f"results/auto_setup/{HOST}/README.md" in listing
+
+
+def test_publishing_the_state_can_be_switched_off(checkout):
+    out = drive(checkout, "--only", "nothing-matches-this", PUBLISH_STATE=0)
+
+    assert "publishing the driver state directory" not in out
+    assert not (checkout / "results" / "auto_setup").exists()
+
+
+def test_a_dry_run_publishes_nothing(checkout):
+    out = drive(checkout, "--dry-run")
+
+    assert not (checkout / "results" / "auto_setup").exists()
+    assert "publishing the driver state directory" not in out
 
 
 if __name__ == "__main__":  # pragma: no cover
