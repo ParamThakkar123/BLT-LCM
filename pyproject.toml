@@ -7,7 +7,12 @@ build-backend = "setuptools.build_meta"
     version = "0.1.0"
     description = "BLT-LCM for Marathi Machine Translation Concept Extraction"
     authors = [{name = "Your Name"}]
-    requires-python = ">=3.13"
+    # Capped, not just >=3.13: torch==2.5.1+cu121 (below) only ships a cp313 wheel.
+    # An uncapped lower bound lets uv pick up whatever Python 3.14+ happens to be on
+    # a node's PATH, which then fails with "doesn't have a source distribution or
+    # wheel for the current platform" -- hit for real on a Galvani compute node
+    # handing out CPython 3.14. Paired with the .python-version pin below.
+    requires-python = ">=3.13,<3.14"
     dependencies = [
     # CUDA build, pulled from the pytorch-cu121 index below. The PyPI Windows
     # torch wheels are CPU-only, and `uv run` re-syncs the venv on every
