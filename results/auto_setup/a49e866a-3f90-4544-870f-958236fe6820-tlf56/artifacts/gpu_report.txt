@@ -1,0 +1,2 @@
+  0, NVIDIA RTX PRO 6000 Blackwell Server Edition, 97887 MiB, 580.126.20
+  CUDA_VISIBLE_DEVICES=(unset)

@@ -1,0 +1,1 @@
+truncated  logs/mt_f0.80_s42.log  (6318173 bytes on disk)

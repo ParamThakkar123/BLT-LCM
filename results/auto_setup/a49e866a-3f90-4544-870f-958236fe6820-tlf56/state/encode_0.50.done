@@ -1,0 +1,5 @@
+finished 2026-08-17T18:55:49+0000 in 25s (batch_size=48)
+cmd: uv run lcm_scripts/train_lcm_blt.py --entropy_model patching_scratch/entropy_model_marathi.pt --fraction 0.50 --epochs 0 --batch_size 48 --model_dir lcm_models/blt_lcm_050 --embed_cache embeddings/blt_embeddings_frac050.pth --resume auto
+artifacts:
+  embeddings/blt_embeddings_frac050.pth (41109231 bytes)
+  lcm_models/blt_lcm_050 (0 bytes)

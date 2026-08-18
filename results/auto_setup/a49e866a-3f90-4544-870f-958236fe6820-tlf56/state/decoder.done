@@ -1,0 +1,5 @@
+finished 2026-08-17T18:52:58+0000 in 936s (batch_size=256)
+cmd: uv run lcm_scripts/blt_decoder.py --entropy_model patching_scratch/entropy_model_marathi.pt --num_sentences 50000 --epochs 10 --batch_size 256 --amp --pooler_save_path lcm_models/blt_pooler.pth --save_path lcm_models/blt_decoder.pth --resume auto
+artifacts:
+  lcm_models/blt_decoder.pth (690423571 bytes)
+  lcm_models/blt_pooler.pth (584206069 bytes)

@@ -1,0 +1,119 @@
+### 2026-08-17T18:37:22+0000  attempt=0  batch_size=256
+### cmd: uv run lcm_scripts/blt_decoder.py --entropy_model patching_scratch/entropy_model_marathi.pt --num_sentences 50000 --epochs 10 --batch_size 256 --amp --pooler_save_path lcm_models/blt_pooler.pth --save_path lcm_models/blt_decoder.pth --resume auto
+warning: `VIRTUAL_ENV=/tmp/uv-venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+[device] cuda:0 | NVIDIA RTX PRO 6000 Blackwell Server Edition | 95.0 GiB | capability 12.0 | torch 2.13.0+cu130 | CUDA 13.0
+[device] TF32 enabled for matmul and cuDNN (Ampere+)
+Loading BhashaSetu dataset...
+Loading:   0%|          | 0/50000 [00:00<?, ?it/s]Loading:   0%|          | 1/50000 [00:02<35:27:59,  2.55s/it]Loading:  15%|█▌        | 7591/50000 [00:02<00:10, 4021.28it/s]Loading:  24%|██▍       | 12053/50000 [00:04<00:13, 2896.34it/s]Loading:  39%|███▉      | 19501/50000 [00:04<00:05, 5802.95it/s]Loading:  48%|████▊     | 23966/50000 [00:13<00:19, 1329.62it/s]Loading:  60%|██████    | 30001/50000 [00:18<00:15, 1286.54it/s]Loading:  75%|███████▍  | 37461/50000 [00:19<00:05, 2110.81it/s]Loading:  82%|████████▏ | 41202/50000 [00:21<00:04, 2022.89it/s]Loading:  98%|█████████▊| 48941/50000 [00:21<00:00, 3291.22it/s]Loading: 100%|█████████▉| 49999/50000 [00:21<00:00, 2353.34it/s]
+Loaded 50000 sentences
+[device] BLTLoader: cuda:0 | NVIDIA RTX PRO 6000 Blackwell Server Edition | 95.0 GiB | capability 12.0 | torch 2.13.0+cu130 | CUDA 13.0
+[device] TF32 enabled for matmul and cuDNN (Ampere+)
+[BLTLoader] trainable byte-side parameters: 146,044,928
+[BLTLoader] hash n-grams n=[3, 4, 5] x 100,000 @ dim 256: 0.29 GiB params, ~1.14 GiB with AdamW state
+Decoder parameters: 26,543,364
+Precomputing patch boundaries for 50000 sentences...
+  done in 8.1s
+Training on 50000 sentences (pooler ON)
+[resume] no checkpoint at lcm_models/blt_decoder_last.pth; starting fresh
+  Epoch 1/10 | Step 50/196 | Loss: 1.5548 | LR: 3.00e-04
+  Epoch 1/10 | Step 100/196 | Loss: 1.4188 | LR: 2.98e-04
+  Epoch 1/10 | Step 150/196 | Loss: 1.3695 | LR: 2.96e-04
+  Epoch 1/10 DONE | Avg Loss: 1.3436 | Time: 85.6s
+  [checkpoint] epoch 1 -> lcm_models/blt_decoder_last.pth
+  Saved best decoder to lcm_models/blt_decoder.pth
+  Saved learned pooler to lcm_models/blt_pooler.pth
+  [checkpoint] step 200 -> lcm_models/blt_decoder_last.pth
+  Epoch 2/10 | Step 50/196 | Loss: 1.2359 | LR: 2.88e-04
+  Epoch 2/10 | Step 100/196 | Loss: 1.2127 | LR: 2.83e-04
+  Epoch 2/10 | Step 150/196 | Loss: 1.1710 | LR: 2.78e-04
+  Epoch 2/10 DONE | Avg Loss: 1.1311 | Time: 84.8s
+  [checkpoint] epoch 2 -> lcm_models/blt_decoder_last.pth
+  Saved best decoder to lcm_models/blt_decoder.pth
+  Saved learned pooler to lcm_models/blt_pooler.pth
+  [checkpoint] step 400 -> lcm_models/blt_decoder_last.pth
+  Epoch 3/10 | Step 50/196 | Loss: 0.9525 | LR: 2.64e-04
+  Epoch 3/10 | Step 100/196 | Loss: 0.9354 | LR: 2.56e-04
+  Epoch 3/10 | Step 150/196 | Loss: 0.9187 | LR: 2.47e-04
+  Epoch 3/10 DONE | Avg Loss: 0.9040 | Time: 84.6s
+  [checkpoint] epoch 3 -> lcm_models/blt_decoder_last.pth
+  Saved best decoder to lcm_models/blt_decoder.pth
+  Saved learned pooler to lcm_models/blt_pooler.pth
+  [checkpoint] step 600 -> lcm_models/blt_decoder_last.pth
+  Epoch 4/10 | Step 50/196 | Loss: 0.8271 | LR: 2.28e-04
+  Epoch 4/10 | Step 100/196 | Loss: 0.8131 | LR: 2.18e-04
+  Epoch 4/10 | Step 150/196 | Loss: 0.8007 | LR: 2.07e-04
+  Epoch 4/10 DONE | Avg Loss: 0.7901 | Time: 84.3s
+  [checkpoint] epoch 4 -> lcm_models/blt_decoder_last.pth
+  Saved best decoder to lcm_models/blt_decoder.pth
+  Saved learned pooler to lcm_models/blt_pooler.pth
+  [checkpoint] step 800 -> lcm_models/blt_decoder_last.pth
+  Epoch 5/10 | Step 50/196 | Loss: 0.7359 | LR: 1.85e-04
+  Epoch 5/10 | Step 100/196 | Loss: 0.7274 | LR: 1.73e-04
+  Epoch 5/10 | Step 150/196 | Loss: 0.7196 | LR: 1.61e-04
+  Epoch 5/10 DONE | Avg Loss: 0.7131 | Time: 84.2s
+  [checkpoint] epoch 5 -> lcm_models/blt_decoder_last.pth
+  Saved best decoder to lcm_models/blt_decoder.pth
+  Saved learned pooler to lcm_models/blt_pooler.pth
+  [checkpoint] step 1000 -> lcm_models/blt_decoder_last.pth
+  Epoch 6/10 | Step 50/196 | Loss: 0.6774 | LR: 1.38e-04
+  Epoch 6/10 | Step 100/196 | Loss: 0.6719 | LR: 1.26e-04
+  Epoch 6/10 | Step 150/196 | Loss: 0.6662 | LR: 1.14e-04
+  Epoch 6/10 DONE | Avg Loss: 0.6622 | Time: 84.7s
+  [checkpoint] epoch 6 -> lcm_models/blt_decoder_last.pth
+  Saved best decoder to lcm_models/blt_decoder.pth
+  Saved learned pooler to lcm_models/blt_pooler.pth
+  [checkpoint] step 1200 -> lcm_models/blt_decoder_last.pth
+  Epoch 7/10 | Step 50/196 | Loss: 0.6364 | LR: 9.24e-05
+  Epoch 7/10 | Step 100/196 | Loss: 0.6329 | LR: 8.15e-05
+  Epoch 7/10 | Step 150/196 | Loss: 0.6298 | LR: 7.10e-05
+  Epoch 7/10 DONE | Avg Loss: 0.6272 | Time: 84.1s
+  [checkpoint] epoch 7 -> lcm_models/blt_decoder_last.pth
+  Saved best decoder to lcm_models/blt_decoder.pth
+  Saved learned pooler to lcm_models/blt_pooler.pth
+  [checkpoint] step 1400 -> lcm_models/blt_decoder_last.pth
+  Epoch 8/10 | Step 50/196 | Loss: 0.6101 | LR: 5.24e-05
+  Epoch 8/10 | Step 100/196 | Loss: 0.6070 | LR: 4.36e-05
+  Epoch 8/10 | Step 150/196 | Loss: 0.6053 | LR: 3.55e-05
+  Epoch 8/10 DONE | Avg Loss: 0.6036 | Time: 84.4s
+  [checkpoint] epoch 8 -> lcm_models/blt_decoder_last.pth
+  Saved best decoder to lcm_models/blt_decoder.pth
+  Saved learned pooler to lcm_models/blt_pooler.pth
+  [checkpoint] step 1600 -> lcm_models/blt_decoder_last.pth
+  Epoch 9/10 | Step 50/196 | Loss: 0.5918 | LR: 2.20e-05
+  Epoch 9/10 | Step 100/196 | Loss: 0.5912 | LR: 1.61e-05
+  Epoch 9/10 | Step 150/196 | Loss: 0.5902 | LR: 1.11e-05
+  Epoch 9/10 DONE | Avg Loss: 0.5899 | Time: 85.1s
+  [checkpoint] epoch 9 -> lcm_models/blt_decoder_last.pth
+  Saved best decoder to lcm_models/blt_decoder.pth
+  Saved learned pooler to lcm_models/blt_pooler.pth
+  [checkpoint] step 1800 -> lcm_models/blt_decoder_last.pth
+  Epoch 10/10 | Step 50/196 | Loss: 0.5846 | LR: 4.09e-06
+  Epoch 10/10 | Step 100/196 | Loss: 0.5849 | LR: 1.77e-06
+  Epoch 10/10 | Step 150/196 | Loss: 0.5845 | LR: 4.08e-07
+  Epoch 10/10 DONE | Avg Loss: 0.5846 | Time: 84.9s
+  [checkpoint] epoch 10 -> lcm_models/blt_decoder_last.pth
+  Saved best decoder to lcm_models/blt_decoder.pth
+  Saved learned pooler to lcm_models/blt_pooler.pth
+[epochs] ran 10 epoch(s); best byte cross-entropy 0.584644 at epoch 10; stopped because reached the --epochs cap of 10
+[plot] wrote lcm_models/blt_decoder_training_curve.png
+[plot] wrote lcm_models/blt_decoder_training_dashboard.png
+[results] collected 5 file(s) into /marimo/BLT-LCM/results/runs/blt_decoder
+[results] committed 5 file(s) for blt_decoder
+[results] pushed blt_decoder to origin/main
+
+Testing reconstruction on sample sentences...
+  Original: दिवाळीच्या मुहुर्तावर प्रेक्षकांच्या भेटीला येणाऱ्या या चित्रपटामध्ये आमिर खान आ
+  Decoded:  भारताच्या प्रकरणी संघटनेच्या भारतीय सिनेमात आहे त्यांच्या भारताची भारताची विधान 
+
+  Original: या चित्रपटात आपल्याला एक वेगळाच रणबीर कपूर पाहायला मिळणार आहे 21 व्या शतकातल्या 
+  Decoded:  या कारण मार्गाची आणि कार्यक्रमांनी बाबत केले आहे त्यांच्या बायबलमधील पुरवार करण्
+
+  Original: आज माता अन्नपूर्णा धाम इथे प्राणप्रतिष्ठा समयी समाजाला नवी दिशा देण्याचा विचार द
+  Decoded:  या सरकारची आम्ही सामन्याने असलेल्या प्रकारची सामन्यात कार्यकरणी देशात आली असे त्
+
+  Original: तरीसुद्धा बऱ्‍याच लोकांना दंतवैद्याकडे जायला भीती वाटते राज्य विधानसभेत भाजपला 
+  Decoded:  त्याच्या सर्वात माजी बनवण्यासाठी बाबतीत केली जाते महत्त्वाचे संबंध निर्मित केले 
+
+  Original: आर भाषेची क्षमता पॅकेजेस छोटे प्रोग्रॅम लिहून आणि ती इम्पोर्ट करून वाढवता येते उ
+  Decoded:  आपण असे म्हणजे प्रकरणी यांच्या प्रकरणी असे आपल्या मोठ्या विषयीत काही असे ते म्हण
+

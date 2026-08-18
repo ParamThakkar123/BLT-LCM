@@ -1,0 +1,27 @@
+### 2026-08-17T18:55:24+0000  attempt=0  batch_size=48
+### cmd: uv run lcm_scripts/train_lcm_blt.py --entropy_model patching_scratch/entropy_model_marathi.pt --fraction 0.50 --epochs 0 --batch_size 48 --model_dir lcm_models/blt_lcm_050 --embed_cache embeddings/blt_embeddings_frac050.pth --resume auto
+warning: `VIRTUAL_ENV=/tmp/uv-venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+[device] cuda:0 | NVIDIA RTX PRO 6000 Blackwell Server Edition | 95.0 GiB | capability 12.0 | torch 2.13.0+cu130 | CUDA 13.0
+[device] TF32 enabled for matmul and cuDNN (Ampere+)
+Preparing data list...
+Loading docs:   0%|          | 0/1398039 [00:00<?, ?it/s]Loading docs:   0%|          | 446/1398039 [00:00<05:13, 4457.16it/s]Loading docs:   0%|          | 908/1398039 [00:00<05:07, 4547.89it/s]Loading docs:   0%|          | 1376/1398039 [00:00<05:03, 4607.07it/s]Loading docs:   0%|          | 1850/1398039 [00:00<04:59, 4656.10it/s]Loading docs:   0%|          | 2345/1398039 [00:00<04:53, 4760.38it/s]Loading docs:   0%|          | 2850/1398039 [00:00<04:47, 4855.36it/s]Loading docs:   0%|          | 3367/1398039 [00:00<04:41, 4956.66it/s]Loading docs:   0%|          | 3894/1398039 [00:00<04:35, 5054.86it/s]Loading docs:   0%|          | 4435/1398039 [00:00<04:29, 5163.37it/s]Loading docs:   0%|          | 4998/1398039 [00:01<04:22, 5306.17it/s]Loading docs:   0%|          | 5567/1398039 [00:01<04:16, 5422.17it/s]Loading docs:   0%|          | 6110/1398039 [00:01<04:17, 5413.62it/s]Loading docs:   0%|          | 6652/1398039 [00:01<04:18, 5383.92it/s]Loading docs:   1%|          | 7191/1398039 [00:01<04:19, 5359.04it/s]Loading docs:   1%|          | 7727/1398039 [00:01<04:19, 5359.14it/s]Loading docs:   1%|          | 8281/1398039 [00:01<04:16, 5412.08it/s]Loading docs:   1%|          | 8844/1398039 [00:01<04:13, 5477.24it/s]Loading docs:   1%|          | 9405/1398039 [00:01<04:11, 5516.25it/s]Loading docs:   1%|          | 9981/1398039 [00:01<04:08, 5586.32it/s]Loading docs:   1%|          | 9994/1398039 [00:01<04:25, 5236.45it/s]
+Data loading: 2.8s  (500 docs)
+Loading BLT loader...
+[device] BLTLoader: cuda:0 | NVIDIA RTX PRO 6000 Blackwell Server Edition | 95.0 GiB | capability 12.0 | torch 2.13.0+cu130 | CUDA 13.0
+[device] TF32 enabled for matmul and cuDNN (Ampere+)
+[BLTLoader] trainable byte-side parameters: 146,044,928
+[BLTLoader] hash n-grams n=[3, 4, 5] x 100,000 @ dim 256: 0.29 GiB params, ~1.14 GiB with AdamW state
+Encoding with BLT (this may take a while)...
+Encoding 10000 sentences from 500 documents
+encoding batches:   0%|          | 0/72 [00:00<?, ?it/s]encoding batches:   1%|▏         | 1/72 [00:00<00:15,  4.73it/s]encoding batches:   6%|▌         | 4/72 [00:00<00:05, 12.80it/s]encoding batches:  10%|▉         | 7/72 [00:00<00:03, 16.59it/s]encoding batches:  14%|█▍        | 10/72 [00:00<00:03, 19.15it/s]encoding batches:  18%|█▊        | 13/72 [00:00<00:02, 20.95it/s]encoding batches:  22%|██▏       | 16/72 [00:00<00:02, 22.31it/s]encoding batches:  26%|██▋       | 19/72 [00:00<00:02, 22.26it/s]encoding batches:  31%|███       | 22/72 [00:01<00:02, 22.44it/s]encoding batches:  35%|███▍      | 25/72 [00:01<00:02, 22.24it/s]encoding batches:  39%|███▉      | 28/72 [00:01<00:01, 22.74it/s]encoding batches:  43%|████▎     | 31/72 [00:01<00:01, 22.92it/s]encoding batches:  47%|████▋     | 34/72 [00:01<00:01, 23.34it/s]encoding batches:  51%|█████▏    | 37/72 [00:01<00:01, 23.24it/s]encoding batches:  56%|█████▌    | 40/72 [00:01<00:01, 22.64it/s]encoding batches:  60%|█████▉    | 43/72 [00:02<00:01, 22.82it/s]encoding batches:  64%|██████▍   | 46/72 [00:02<00:01, 22.59it/s]encoding batches:  68%|██████▊   | 49/72 [00:02<00:01, 22.43it/s]encoding batches:  72%|███████▏  | 52/72 [00:02<00:00, 22.52it/s]encoding batches:  76%|███████▋  | 55/72 [00:02<00:00, 22.07it/s]encoding batches:  81%|████████  | 58/72 [00:02<00:00, 22.47it/s]encoding batches:  85%|████████▍ | 61/72 [00:02<00:00, 22.02it/s]encoding batches:  89%|████████▉ | 64/72 [00:02<00:00, 22.42it/s]encoding batches:  93%|█████████▎| 67/72 [00:03<00:00, 22.86it/s]encoding batches:  97%|█████████▋| 70/72 [00:03<00:00, 22.75it/s]encoding batches: 100%|██████████| 72/72 [00:03<00:00, 21.88it/s]
+Encoding: 8.6s
+Peak VRAM after encoding: 2.97 GB
+[cache] saved BLT embeddings to embeddings/blt_embeddings_frac050.pth
+LCM variant: base
+Fitted robust scaler on 10000 concept vectors
+[resume] no checkpoint at lcm_models/blt_lcm_050/lcm_blt_last.pth; starting fresh
+[epochs] ran 0 epoch(s); best MSE loss n/a at epoch None; stopped because reached the --epochs cap of 0
+[plot] no training scalars recorded; skipping training curve
+[results] collected 3 file(s) into /marimo/BLT-LCM/results/runs/lcm_blt_base_fraction0.5
+[results] committed 3 file(s) for lcm_blt_base_fraction0.5
+[results] pushed lcm_blt_base_fraction0.5 to origin/main

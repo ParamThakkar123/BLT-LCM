@@ -1,0 +1,5 @@
+adopted 2026-08-17T18:56:16+0000: published on origin/main (3/3 epochs trained; outputs present)
+cmd: uv run lcm_scripts/train_lcm_blt_mt.py --entropy_model patching_scratch/entropy_model_marathi.pt --pooler lcm_models/blt_pooler.pth --decoder lcm_models/blt_decoder.pth --fraction 0.25 --epochs 3 --batch_size 32 --seed 42 --data_seed 42 --noise_levels 0.0 0.1 0.2 --comet_model Unbabel/wmt22-comet-da --out_csv results/blt_lcm_mt_0.25_s42.csv --embed_cache embeddings/blt_mt_concepts_frac025.pth --resume auto
+artifacts:
+  results/blt_lcm_mt_0.25_s42.csv (MISSING)
+  lcm_models/lcm_blt_mt_fraction0.25_s42_best.pth (MISSING)
