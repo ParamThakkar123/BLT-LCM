@@ -6,8 +6,13 @@
 # (a100-galvani on Galvani, h100-ferranti on Ferranti).
 #
 # This only checks that each job starts and gets through its imports/setup --
-# it does not wait for training to finish. Cancel jobs once the log shows
-# progress past startup.
+# it does not need to run to completion. Jobs are capped at CLUSTER_TIME
+# (default 30 min) so a healthy-but-slow job gets cut off by Slurm instead of
+# burning its full multi-hour default allocation; override by exporting
+# CLUSTER_TIME (e.g. "01:00:00") before running this script.
+#
+# Job IDs are written to logs/smoke_test_<tag>.jobids for
+# scripts/check_smoke_test.sh to pick up afterwards.
 #
 # Usage:
 #   scripts/smoke_test.sh [tag]
@@ -21,6 +26,10 @@ cd "$REPO_DIR"
 
 TAG=${1:-smoketest}
 FRACTION=0.25
+export CLUSTER_TIME=${CLUSTER_TIME:-00:30:00}
+mkdir -p logs
+STATE_FILE="logs/smoke_test_${TAG}.jobids"
+: > "$STATE_FILE"
 
 echo "Submitting smoke-test jobs (tag=$TAG, fraction=$FRACTION) ..."
 echo ""
@@ -36,6 +45,7 @@ submit() {
     id=$(echo "$out" | awk '/Submitted batch job/{print $NF}')
     if [ -n "$id" ]; then
         JOB_IDS[$key]="$id"
+        echo "$key=$id" >> "$STATE_FILE"
         echo "  [$key] submitted: job $id"
     else
         echo "  [$key] FAILED to submit:"
@@ -57,4 +67,5 @@ if [ "${#JOB_IDS[@]}" -gt 0 ]; then
     ids="${JOB_IDS[@]}"
     echo "Tail all logs:  tail -f logs/*_{${ids// /,}}.out"
     echo "Cancel all:     scancel $ids"
+    echo "Check outcome:  scripts/check_smoke_test.sh $TAG   (once jobs finish, time out, or you cancel them)"
 fi
