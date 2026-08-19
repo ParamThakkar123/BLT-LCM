@@ -10,16 +10,23 @@
 #   scripts/check_smoke_test.sh galvani
 #   scripts/check_smoke_test.sh --jobs 2755739,2755740,2755741
 #
+# Writes the full table (plus a context excerpt per job) to
+# logs/smoke_test_<tag>_report.txt (logs/smoke_test_jobs_report.txt for
+# --jobs) in addition to stdout, so the whole result can be copied off the
+# cluster as one file, e.g.: scp <user>@<login-node>:BLT-LCM/logs/smoke_test_galvani_report.txt .
+#
 # Exit code is 0 if nothing was flagged FAIL, 1 otherwise.
 set -uo pipefail
 
 SCRIPT_DIR=$(realpath "$(dirname "$0")")
 REPO_DIR=$(realpath "$SCRIPT_DIR/..")
 cd "$REPO_DIR"
+mkdir -p logs
 
 declare -A JOB_IDS
 
 if [ "${1:-}" = "--jobs" ]; then
+    TAG="jobs"
     IFS=',' read -ra ids <<< "${2:-}"
     i=0
     for id in "${ids[@]}"; do
@@ -44,93 +51,130 @@ if [ "${#JOB_IDS[@]}" -eq 0 ]; then
     exit 1
 fi
 
+REPORT_FILE="logs/smoke_test_${TAG}_report.txt"
+
 # Generic Python/CUDA/Slurm error signatures -- not tied to any one script's
-# exact print statements, so this needs no upkeep as lcm_scripts/*.py change.
+# exact print statements, so this needs no upkeep as lcm_scripts/*.py changes.
 ERROR_PATTERN='Traceback \(most recent call last\)|CUDA error|CUDA out of memory|OutOfMemoryError|ModuleNotFoundError|ImportError|FATAL|srun: error|[Ee]rror:'
+# Slurm's own routine job-lifecycle messages -- stripped before matching
+# ERROR_PATTERN so e.g. a plain --time cutoff (which Slurm reports as
+# "error: *** JOB ... CANCELLED AT ... DUE TO TIME LIMIT ***") isn't mistaken
+# for a program error.
+SLURM_NOISE_PATTERN='slurmstepd:|\*\*\* JOB [0-9]+ ON|DUE TO TIME LIMIT|CANCELLED AT'
 
-overall_fail=0
-printf "%-16s %-10s %-14s %-14s %s\n" "JOB" "ID" "SLURM_STATE" "VERDICT" "NOTE"
+# Prints up to one ERROR_PATTERN match plus ~100 trailing chars of context,
+# after converting embedded \r (used by tqdm to overwrite progress bars in
+# place) to real newlines first -- otherwise a whole progress bar's worth of
+# updates is one giant "line" to grep, and slicing from the start of it shows
+# stale tqdm noise instead of the actual match.
+find_hit() {
+    local file="$1"
+    [ -f "$file" ] || return 0
+    grep -a -v -E "$SLURM_NOISE_PATTERN" "$file" 2>/dev/null \
+        | tr '\r' '\n' \
+        | grep -a -m1 -E -o "($ERROR_PATTERN).{0,100}"
+}
 
-for key in "${!JOB_IDS[@]}"; do
-    id="${JOB_IDS[$key]}"
-    state=$(sacct -j "$id" --format=State --noheader -P 2>/dev/null | head -1 | tr -d ' ')
-    [ -z "$state" ] && state="PENDING"
+main() {
+    echo "Report generated $(date -u +%Y-%m-%dT%H:%M:%SZ) on $(hostname)"
+    echo ""
 
-    logfile=$(ls logs/*_"${id}".out 2>/dev/null | head -1)
-    errfile=$(ls logs/*_"${id}".err 2>/dev/null | head -1)
+    local overall_fail=0
+    printf "%-16s %-10s %-14s %-14s %s\n" "JOB" "ID" "SLURM_STATE" "VERDICT" "NOTE"
 
-    hit=""
-    for f in "$logfile" "$errfile"; do
-        [ -n "$f" ] && [ -f "$f" ] || continue
-        m=$(grep -E -m1 "$ERROR_PATTERN" "$f" 2>/dev/null)
-        [ -n "$m" ] && { hit="$m"; break; }
+    for key in "${!JOB_IDS[@]}"; do
+        local id="${JOB_IDS[$key]}"
+        local state
+        state=$(sacct -j "$id" --format=State --noheader -P 2>/dev/null | head -1 | tr -d ' ')
+        [ -z "$state" ] && state="PENDING"
+
+        local logfile errfile
+        logfile=$(ls logs/*_"${id}".out 2>/dev/null | head -1)
+        errfile=$(ls logs/*_"${id}".err 2>/dev/null | head -1)
+
+        local hit="" f m
+        for f in "$logfile" "$errfile"; do
+            [ -n "$f" ] || continue
+            m=$(find_hit "$f")
+            [ -n "$m" ] && { hit="$m"; break; }
+        done
+
+        local verdict="UNKNOWN" note=""
+
+        if [ -z "$logfile" ] && [ -z "$errfile" ]; then
+            verdict="PENDING"
+            note="no log file yet"
+        else
+            case "$state" in
+                FAILED|NODE_FAIL|OUT_OF_MEMORY)
+                    verdict="FAIL"
+                    note="slurm=$state${hit:+; log: $hit}"
+                    ;;
+                TIMEOUT)
+                    if [ -n "$hit" ]; then
+                        verdict="FAIL"
+                        note="errored before hitting the time cutoff; log: $hit"
+                    else
+                        verdict="PASS?"
+                        note="hit the --time cutoff with no error -- looks like it was training fine"
+                    fi
+                    ;;
+                CANCELLED)
+                    if [ -n "$hit" ]; then
+                        verdict="FAIL"
+                        note="errored before being cancelled; log: $hit"
+                    else
+                        verdict="PASS? (cancelled)"
+                        note="no error before cancellation -- fine if you cancelled this on purpose"
+                    fi
+                    ;;
+                COMPLETED)
+                    if [ -n "$hit" ]; then
+                        verdict="FAIL"
+                        note="completed but log has an error line: $hit"
+                    else
+                        verdict="PASS"
+                        note="completed cleanly"
+                    fi
+                    ;;
+                RUNNING|PENDING|CONFIGURING|"")
+                    if [ -n "$hit" ]; then
+                        verdict="FAIL"
+                        note="log already shows an error: $hit"
+                    else
+                        verdict="OK-SO-FAR"
+                        note="slurm=$state, no error yet"
+                    fi
+                    ;;
+                *)
+                    verdict="UNKNOWN"
+                    note="unrecognized slurm state: $state${hit:+; log: $hit}"
+                    ;;
+            esac
+        fi
+
+        [ "$verdict" = "FAIL" ] && overall_fail=1
+
+        printf "%-16s %-10s %-14s %-14s %s\n" "$key" "$id" "$state" "$verdict" "$note"
     done
 
-    verdict="UNKNOWN"
-    note=""
-
-    if [ -z "$logfile" ] && [ -z "$errfile" ]; then
-        verdict="PENDING"
-        note="no log file yet"
+    echo ""
+    if [ "$overall_fail" -eq 1 ]; then
+        echo "At least one job FAILED -- see the NOTE column, then check its full log."
     else
-        case "$state" in
-            FAILED|NODE_FAIL|OUT_OF_MEMORY)
-                verdict="FAIL"
-                note="slurm=$state${hit:+; log: ${hit:0:60}}"
-                ;;
-            TIMEOUT)
-                if [ -n "$hit" ]; then
-                    verdict="FAIL"
-                    note="errored before hitting the time cutoff; log: ${hit:0:60}"
-                else
-                    verdict="PASS?"
-                    note="hit the --time cutoff with no error -- looks like it was training fine"
-                fi
-                ;;
-            CANCELLED)
-                if [ -n "$hit" ]; then
-                    verdict="FAIL"
-                    note="errored before being cancelled; log: ${hit:0:60}"
-                else
-                    verdict="PASS? (cancelled)"
-                    note="no error before cancellation -- fine if you cancelled this on purpose"
-                fi
-                ;;
-            COMPLETED)
-                if [ -n "$hit" ]; then
-                    verdict="FAIL"
-                    note="completed but log has an error line: ${hit:0:60}"
-                else
-                    verdict="PASS"
-                    note="completed cleanly"
-                fi
-                ;;
-            RUNNING|PENDING|CONFIGURING|"")
-                if [ -n "$hit" ]; then
-                    verdict="FAIL"
-                    note="log already shows an error: ${hit:0:60}"
-                else
-                    verdict="OK-SO-FAR"
-                    note="slurm=$state, no error yet"
-                fi
-                ;;
-            *)
-                verdict="UNKNOWN"
-                note="unrecognized slurm state: $state${hit:+; log: ${hit:0:60}}"
-                ;;
-        esac
+        echo "No hard failures detected. TIMEOUT/CANCELLED with no error is expected and fine for a smoke test."
     fi
 
-    [ "$verdict" = "FAIL" ] && overall_fail=1
+    exit "$overall_fail"
+}
 
-    printf "%-16s %-10s %-14s %-14s %s\n" "$key" "$id" "$state" "$verdict" "$note"
-done
+# Run through a pipe (not `exec > >(tee ...)`) so the exit code is captured
+# via PIPESTATUS without racing tee's subshell for the last bit of output.
+main | tee "$REPORT_FILE"
+result=${PIPESTATUS[0]}
 
 echo ""
-if [ "$overall_fail" -eq 1 ]; then
-    echo "At least one job FAILED -- see the NOTE column, then check its full log."
-else
-    echo "No hard failures detected. TIMEOUT/CANCELLED with no error is expected and fine for a smoke test."
-fi
+echo "Full report written to: $REPORT_FILE"
+echo "Copy it off the cluster with, e.g.: scp <user>@<login-node>:$(pwd)/$REPORT_FILE ."
 
-exit "$overall_fail"
+exit "$result"
