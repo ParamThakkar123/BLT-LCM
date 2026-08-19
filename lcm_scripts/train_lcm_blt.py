@@ -330,10 +330,21 @@ def main():
         return seqs
 
     def _cache_is_usable(seqs):
-        """A cache is only useful if it holds at least one trainable sequence."""
-        return bool(seqs) and any(
-            getattr(s, "shape", (0,))[0] >= 2 for s in seqs if hasattr(s, "shape")
-        )
+        """A cache is only useful if it holds at least one trainable sequence
+        whose embedding dimension matches this run's blt.dim.
+
+        A dimension check is needed in addition to the fingerprint check above:
+        legacy caches written before fingerprinting was added carry no
+        fingerprint at all, so a stale cache from before a concept_dim change
+        (e.g. blt_loader.py's default moving to 1024 to match SONAR) would
+        otherwise be accepted as-is and only fail later, deep inside training,
+        with a confusing raw tensor-shape RuntimeError instead of a clear one
+        here.
+        """
+        shaped = [s for s in seqs if hasattr(s, "shape") and getattr(s, "shape", (0,))[0] >= 2]
+        if not shaped:
+            return False
+        return all(s.shape[-1] == blt.dim for s in shaped)
 
     # Encoding the corpus can dominate a short run and is fully determined by the
     # config, so a resumed run reloads it instead of paying for it again.

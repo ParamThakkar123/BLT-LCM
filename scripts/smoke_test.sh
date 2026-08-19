@@ -28,7 +28,13 @@ TAG=${1:-smoketest}
 FRACTION=0.25
 export CLUSTER_TIME=${CLUSTER_TIME:-00:30:00}
 mkdir -p logs
-STATE_FILE="logs/smoke_test_${TAG}.jobids"
+# Only suffix the state/report filenames with the tag if one was actually
+# passed -- otherwise they'd redundantly read "smoke_test_smoketest.*".
+if [ -n "${1:-}" ]; then
+    STATE_FILE="logs/smoke_test_${TAG}.jobids"
+else
+    STATE_FILE="logs/smoke_test.jobids"
+fi
 : > "$STATE_FILE"
 
 echo "Submitting smoke-test jobs (tag=$TAG, fraction=$FRACTION) ..."
@@ -67,5 +73,5 @@ if [ "${#JOB_IDS[@]}" -gt 0 ]; then
     ids="${JOB_IDS[@]}"
     echo "Tail all logs:  tail -f logs/*_{${ids// /,}}.out"
     echo "Cancel all:     scancel $ids"
-    echo "Check outcome:  scripts/check_smoke_test.sh $TAG   (once jobs finish, time out, or you cancel them)"
+    echo "Check outcome:  scripts/check_smoke_test.sh ${1:-}   (once jobs finish, time out, or you cancel them)"
 fi
