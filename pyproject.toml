@@ -7,13 +7,23 @@ build-backend = "setuptools.build_meta"
     version = "0.1.0"
     description = "BLT-LCM for Marathi Machine Translation Concept Extraction"
     authors = [{name = "Your Name"}]
-    requires-python = ">=3.13"
+    # 3.12 is a hard ceiling, not a preference: `unbabel-comet` (below) pins
+    # `numpy<2.0.0`, and 1.26.4 -- the last numpy release under 2.0 -- ships no
+    # cp313 wheels. On 3.13 uv therefore builds numpy 1.26.4 from source and the
+    # build fails (no BLAS in the image, and 1.26.x predates 3.13 support).
+    # Do not raise this without first dropping or overriding the comet numpy cap.
+    requires-python = ">=3.12,<3.13"
     dependencies = [
-    # CUDA build, pulled from the pytorch-cu121 index below. The PyPI Windows
-    # torch wheels are CPU-only, and `uv run` re-syncs the venv on every
-    # invocation -- so without this pin a manually installed CUDA torch gets
-    # silently reverted before the script runs.
-    "torch==2.5.1",
+    # CUDA 13.0 build, pulled from the pytorch-cu130 index below. `uv run`
+    # re-syncs the venv on every invocation, so this pin -- not the manual
+    # `uv pip install ... /cu130` in scripts/auto_setup.sh -- is what decides
+    # which torch actually runs. It must stay on a cu13x index: the Blackwell
+    # RTX PRO 6000 is sm_120, and the older cu121 wheels carry no sm_120
+    # kernels, so every CUDA op there fails with "no kernel image is available
+    # for execution on the device". torchvision is pinned alongside it because
+    # torchvision wheels require an exact torch version.
+    "torch==2.13.0",
+    "torchvision==0.28.0",
     "transformers>=4.0.0",
     "huggingface-hub>=0.34.0",
     "sentencepiece",
@@ -70,12 +80,13 @@ environments = [
 # `explicit = true` keeps this index from shadowing PyPI for everything else;
 # only the packages mapped in [tool.uv.sources] are fetched from it.
 [[tool.uv.index]]
-name = "pytorch-cu121"
-url = "https://download.pytorch.org/whl/cu121"
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
 [tool.uv.sources]
-torch = { index = "pytorch-cu121" }
+torch = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }
 
 [tool.setuptools]
 packages = { find = { where = ["."], include = ["*"] } }
