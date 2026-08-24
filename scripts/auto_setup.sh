@@ -291,8 +291,8 @@ install_deps() {
         echo "  + uv sync"
         return 0
     fi
-    # A .venv built for a different interpreter (e.g. the 3.13 one uv picked
-    # before .python-version pinned 3.12) silently takes the cu130 pip install
+    # A .venv built for a different interpreter (e.g. a leftover 3.12 one from
+    # before .python-version moved to 3.13) silently takes the cu130 pip install
     # below, and `uv sync` then throws that whole environment away. Recreate it
     # up front instead.
     local want have vpy
