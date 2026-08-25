@@ -7,24 +7,33 @@ build-backend = "setuptools.build_meta"
     version = "0.1.0"
     description = "BLT-LCM for Marathi Machine Translation Concept Extraction"
     authors = [{name = "Your Name"}]
-    # Capped, not just >=3.13: torch==2.5.1+cu121 (below) only ships a cp313 wheel.
-    # An uncapped lower bound lets uv pick up whatever Python 3.14+ happens to be on
-    # a node's PATH, which then fails with "doesn't have a source distribution or
-    # wheel for the current platform" -- hit for real on a Galvani compute node
-    # handing out CPython 3.14. Paired with the .python-version pin below.
-    requires-python = ">=3.13,<3.14"
+    # 3.13 is supported. It used to be excluded because `unbabel-comet` (below)
+    # pins `numpy<2.0.0`, and 1.26.4 -- the last numpy release under 2.0 -- ships
+    # no cp313 wheels, so on 3.13 uv fell back to building numpy 1.26.4 from
+    # source and that build fails (no BLAS in the image, and 1.26.x predates 3.13
+    # support). That cap is now overridden in [tool.uv] override-dependencies, so
+    # numpy resolves to a 2.x release that has real cp313 wheels. If you ever drop
+    # that override, this ceiling has to come back.
+    requires-python = ">=3.12"
     dependencies = [
-    # CUDA build, pulled from the pytorch-cu121 index below. The PyPI Windows
-    # torch wheels are CPU-only, and `uv run` re-syncs the venv on every
-    # invocation -- so without this pin a manually installed CUDA torch gets
-    # silently reverted before the script runs.
-    "torch==2.5.1",
+    # CUDA 13.0 build, pulled from the pytorch-cu130 index below. `uv run`
+    # re-syncs the venv on every invocation, so this pin -- not the manual
+    # `uv pip install ... /cu130` in scripts/auto_setup.sh -- is what decides
+    # which torch actually runs. It must stay on a cu13x index: the Blackwell
+    # RTX PRO 6000 is sm_120, and the older cu121 wheels carry no sm_120
+    # kernels, so every CUDA op there fails with "no kernel image is available
+    # for execution on the device". torchvision is pinned alongside it because
+    # torchvision wheels require an exact torch version.
+    "torch==2.13.0",
+    "torchvision==0.28.0",
     "transformers>=4.0.0",
     "huggingface-hub>=0.34.0",
     "sentencepiece",
     "tiktoken",
     "datasets",
-    "numpy>=1.26.0,<2.0",
+    # 2.1 is the first numpy with cp313 wheels; see the override below for why
+    # this is allowed to cross the 2.0 line at all.
+    "numpy>=2.1,<3",
     "tqdm",
     "indic-nlp-library>=0.92",
     "sacrebleu>=2.5.1",
@@ -68,6 +77,14 @@ test = [
 # new platform -- macOS in particular is NOT covered.
 [tool.uv]
 index-strategy = "unsafe-best-match"
+# `unbabel-comet` 2.2.7 declares `numpy<2.0.0,>=1.20.0`. That cap is stale
+# defensive pinning, not a real incompatibility: comet ships a pure-Python
+# `py3-none-any` wheel and its sources use no API numpy 2 removed (checked
+# against the np.float_/np.NaN/np.in1d/np.trapz-style removals). Honouring it
+# forces numpy 1.26.4, which has no cp313 wheel and cannot be built from source
+# in the setup image -- i.e. it makes 3.13 unusable. Overriding it lets numpy
+# resolve to 2.x, which has wheels for both 3.12 and 3.13.
+override-dependencies = ["numpy>=2.1,<3"]
 environments = [
     "sys_platform == 'linux'"
 ]
@@ -75,12 +92,13 @@ environments = [
 # `explicit = true` keeps this index from shadowing PyPI for everything else;
 # only the packages mapped in [tool.uv.sources] are fetched from it.
 [[tool.uv.index]]
-name = "pytorch-cu121"
-url = "https://download.pytorch.org/whl/cu121"
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
 [tool.uv.sources]
-torch = { index = "pytorch-cu121" }
+torch = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }
 
 [tool.setuptools]
 packages = { find = { where = ["."], include = ["*"] } }

@@ -78,7 +78,7 @@
 #   MT_ALLOW_LARGER_BATCH=1   let Stage 2 exceed the script default of 32
 #   AMP_ENCODE=1  add --amp to the Stage 1 encode (off: cached embeddings stay fp32)
 #   RUN_LLAMA=1   also run the Llama-8B QLoRA baseline (needs >=20 GiB + HF auth)
-#   KEEP_CU130=1  pass --no-sync to `uv run` so the cu130 wheels survive (see NOTE)
+#   KEEP_CU130=1  pass --no-sync to `uv run` so an out-of-band torch survives (see NOTE)
 #   UV_RUN_OVERRIDE  replace the `uv run` launcher entirely (apptainer, srun, tests)
 #   STOP_ON_FAIL=1  abort on the first failing experiment step
 #   MAX_OOM_RETRIES  halve the batch size and retry this many times (default 3)
@@ -101,14 +101,16 @@
 #   STATE_MAX_MB      a log bigger than this is published as its tail (default 5)
 #   RESTORE_PUBLISHED=0  do not pull a finished step's published files back here
 #
-# NOTE on cu130: pyproject.toml pins `torch==2.5.1` from the cu121 index, and
-# `uv run` re-syncs the venv on every invocation. The requested
-# `uv pip install ... /cu130 && uv sync` therefore installs cu130 wheels that
-# `uv sync` -- and then every later `uv run` -- reverts to cu121 torch 2.5.1.
-# The script performs the requested install verbatim, reports the torch build
-# that actually ends up in the venv before and after the sync, and offers
-# KEEP_CU130=1 (adds `--no-sync` to `uv run`) if you want the cu130 install to
-# stick. The durable fix is to bump the pin/index in pyproject.toml.
+# NOTE on cu130: pyproject.toml now pins `torch==2.13.0` + `torchvision==0.28.0`
+# from the cu130 index, so `uv sync` -- and every later `uv run` re-sync --
+# keeps the CUDA 13.0 build rather than reverting it. This matters on Blackwell
+# (sm_120) parts like the RTX PRO 6000, which the old cu121 wheels have no
+# kernels for. The `uv pip install ... /cu130` below is therefore a no-op
+# whenever the index head still matches the pin; it stops being one once
+# upstream publishes a newer torch, and the before/after report plus the
+# warning at the end of install_deps will say so. Bump the pin in
+# pyproject.toml (and re-run `uv lock`) when that happens -- KEEP_CU130=1 only
+# masks the drift by skipping the sync entirely.
 
 set -uo pipefail
 
@@ -289,6 +291,21 @@ install_deps() {
         echo "  + uv sync"
         return 0
     fi
+    # A .venv built for a different interpreter (e.g. a leftover 3.12 one from
+    # before .python-version moved to 3.13) silently takes the cu130 pip install
+    # below, and `uv sync` then throws that whole environment away. Recreate it
+    # up front instead.
+    local want have vpy
+    want=$(head -n1 "$REPO_DIR/.python-version" 2>/dev/null | tr -d '[:space:]' || true)
+    if [[ -d "$REPO_DIR/.venv" && -n "$want" ]]; then
+        vpy="$REPO_DIR/.venv/bin/python"
+        [[ -x "$vpy" ]] || vpy="$REPO_DIR/.venv/Scripts/python.exe"
+        have=$("$vpy" -c 'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null || true)
+        if [[ "$have" != "$want" ]]; then
+            warn "existing .venv is Python ${have:-unknown}, project wants $want -- recreating"
+            rm -rf "$REPO_DIR/.venv"
+        fi
+    fi
     # `uv pip install` needs a venv to install into; `uv sync` would create one
     # later, but the pip step runs first, so make it explicit.
     [[ -d "$REPO_DIR/.venv" ]] || uv venv || die "uv venv failed"
@@ -301,9 +318,10 @@ install_deps() {
     after=$(torch_build)
     info "torch after uv sync:           $after"
     if [[ "$before" != "$after" ]]; then
-        warn "uv sync replaced the cu130 torch with the pyproject pin ($after)."
-        warn "Every 'uv run' re-syncs too. Set KEEP_CU130=1 to run with --no-sync,"
-        warn "or bump the torch pin / index in pyproject.toml for a durable fix."
+        warn "uv sync replaced the just-installed torch with the pyproject pin ($after)."
+        warn "The index head has moved past the pin. Bump torch/torchvision in"
+        warn "pyproject.toml and re-run 'uv lock', or set KEEP_CU130=1 to run with"
+        warn "--no-sync. Both builds are cu130, so this is drift, not a downgrade."
     fi
     printf '%s\n' "$after" > "$ART_DIR/torch_build.txt"
 }
