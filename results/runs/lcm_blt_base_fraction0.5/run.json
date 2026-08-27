@@ -2,8 +2,8 @@
   "run_name": "lcm_blt_base_fraction0.5",
   "script": "train_lcm_blt.py",
   "fingerprint": "7ccb427b76c2d837",
-  "started_utc": "2026-08-25T03:42:04Z",
-  "finished_utc": "2026-08-25T03:42:04Z",
+  "started_utc": "2026-08-27T03:02:42Z",
+  "finished_utc": "2026-08-27T03:02:42Z",
   "wall_clock_seconds": 0.0,
   "hyperparameters": {
     "amp": false,
@@ -85,7 +85,7 @@
   "environment": {
     "python": "3.13.11",
     "platform": "Linux-4.4.0-x86_64-with-glibc2.41",
-    "hostname": "21259fba-3b07-4730-9562-d6dafd5786b3-cnsgf",
+    "hostname": "f3f52777-a808-4fdb-a4e8-99197c667ae9-vk5wk",
     "argv": [
       "lcm_scripts/train_lcm_blt.py",
       "--entropy_model",
@@ -104,7 +104,7 @@
       "auto"
     ],
     "cwd": "/marimo/BLT-LCM",
-    "git_commit": "2dff98c",
+    "git_commit": "1b95c30",
     "git_branch": "main",
     "git_dirty": false,
     "torch": "2.13.0+cu130",
